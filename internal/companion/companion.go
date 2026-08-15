@@ -14,9 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -29,10 +27,11 @@ import (
 )
 
 const (
-	Version         = "0.1.0"
 	DefaultRelayURL = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
 	maxFrameBytes   = 32 * 1024
 )
+
+var Version = "0.1.0"
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -68,68 +67,6 @@ type Config struct {
 	ControllerLabel      string `json:"controllerLabel"`
 	ActivationPending    bool   `json:"activationPending,omitempty"`
 	LinkRevoked          bool   `json:"linkRevoked,omitempty"`
-}
-
-func DefaultConfigPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "companion.json"
-	}
-	return filepath.Join(home, "Library", "Application Support", "RemoteDavinci", "companion.json")
-}
-
-func LoadConfig(path string) (Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, err
-	}
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return Config{}, errors.New("invalid companion configuration")
-	}
-	if err := config.validate(); err != nil {
-		return Config{}, err
-	}
-	return config, nil
-}
-
-func SaveConfig(path string, config Config) error {
-	// ponytail: the unsigned CLI prototype uses a 0600 file; move the bearer
-	// secret and Noise private key to Keychain when the companion is packaged.
-	if err := config.validate(); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".companion-*.json")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(data); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	closeErr := temporary.Close()
-	if closeErr != nil {
-		return closeErr
-	}
-	return os.Rename(temporaryPath, path)
 }
 
 func (config Config) validate() error {
