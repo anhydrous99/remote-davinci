@@ -16,6 +16,49 @@ and a macOS DaVinci Resolve companion.
 The relay sees routing metadata and opaque ciphertext. It does not queue
 commands, terminate the peer-to-peer secure channel, or connect to Resolve.
 
+## AWS architecture
+
+```mermaid
+flowchart LR
+  IOS["iPhone / iPad<br/>controller"]
+  MAC["macOS<br/>Resolve companion"]
+
+  subgraph AWS["RemoteDavinci-{dev|prod} AWS stack"]
+    subgraph APIGW["API Gateway WebSocket API"]
+      STAGE["v1 stage<br/>auto-deploy"]
+      ROUTES["5 routes + 1 route response<br/>$connect · $disconnect · $default<br/>pair.frame · session.frame"]
+    end
+
+    WIRING["5 Lambda integrations<br/>5 invoke permissions"]
+    RELAY["RelayHandler Lambda<br/>Go · ARM64 · provided.al2023<br/>256 MiB · 10-second timeout"]
+    STATE[("DynamoDB State table<br/>on-demand · AWS-managed encryption<br/>pk + sk · expiresAt TTL")]
+    IAM["Lambda execution role/policy<br/>DynamoDB item operations<br/>execute-api:ManageConnections"]
+
+    RELAY_LOGS["CloudWatch RelayLogs"]
+    ACCESS_LOGS["CloudWatch AccessLogs<br/>optional; enabled for dev by default"]
+
+    LAMBDA_ALARMS["RelayErrors<br/>RelayThrottles"]
+    API_ALARM["ApiExecutionErrors"]
+    TABLE_ALARM["TableThrottles"]
+  end
+
+  IOS <-->|"WSS JSON"| STAGE
+  MAC <-->|"WSS JSON"| STAGE
+
+  STAGE --> ROUTES
+  ROUTES --> WIRING --> RELAY
+  RELAY <-->|"Get / Put / Update / Delete"| STATE
+  RELAY -->|"POST @connections<br/>opaque ciphertext"| STAGE
+
+  IAM -. "permissions" .-> RELAY
+  RELAY -. "JSON logs" .-> RELAY_LOGS
+  STAGE -. "request metadata" .-> ACCESS_LOGS
+
+  RELAY -. "metrics" .-> LAMBDA_ALARMS
+  STAGE -. "metrics" .-> API_ALARM
+  STATE -. "metrics" .-> TABLE_ALARM
+```
+
 ## Local validation
 
 ```sh
