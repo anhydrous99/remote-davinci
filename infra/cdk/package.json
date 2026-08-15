@@ -1,0 +1,22 @@
+{
+  "name": "@remote-davinci/infra",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "remote-davinci-infra": "dist/bin/remote-davinci.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "synth": "npm run build && cdk synth --app 'node dist/bin/remote-davinci.js'"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.265.0",
+    "constructs": "^10.4.2"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2.1136.0",
+    "esbuild": "^0.28.2"
+  }
+}

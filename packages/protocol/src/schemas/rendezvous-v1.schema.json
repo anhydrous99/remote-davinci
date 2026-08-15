@@ -1,0 +1,684 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remote-davinci.dev/schemas/rendezvous-v1.schema.json",
+  "title": "Remote DaVinci rendezvous and relay protocol v1",
+  "anyOf": [
+    { "$ref": "#/$defs/clientEnvelope" },
+    { "$ref": "#/$defs/serverEnvelope" }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 253402300799
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "base64url32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "names": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/name" }
+    },
+    "emptyBody": { "type": "object" },
+    "baseEnvelope": {
+      "type": "object",
+      "required": ["protocol", "v", "type", "id", "body"],
+      "properties": {
+        "protocol": { "const": "remote-davinci.rendezvous" },
+        "v": { "const": 1 },
+        "type": { "type": "string" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "body": { "type": "object" }
+      }
+    },
+    "responseBase": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "required": ["replyTo"],
+          "properties": { "replyTo": { "$ref": "#/$defs/uuid" } }
+        }
+      ]
+    },
+    "endpointCommit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpointId", "role", "credentialHash"],
+      "properties": {
+        "endpointId": { "$ref": "#/$defs/uuid" },
+        "role": { "enum": ["controller", "companion"] },
+        "credentialHash": { "$ref": "#/$defs/base64url32" }
+      }
+    },
+    "routingEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpointId", "role"],
+      "properties": {
+        "endpointId": { "$ref": "#/$defs/uuid" },
+        "role": { "enum": ["controller", "companion"] }
+      }
+    },
+    "relayBody": {
+      "type": "object",
+      "required": ["channel", "channelId", "seq", "payload"],
+      "properties": {
+        "channel": { "enum": ["pair", "session"] },
+        "channelId": { "$ref": "#/$defs/uuid" },
+        "seq": { "$ref": "#/$defs/sequence" },
+        "payload": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 21846,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        }
+      }
+    },
+    "systemHello": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "system.hello" },
+            "body": { "$ref": "#/$defs/emptyBody" }
+          }
+        }
+      ]
+    },
+    "systemPing": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "system.ping" },
+            "body": {
+              "type": "object",
+              "required": ["sentAt"],
+              "properties": { "sentAt": { "$ref": "#/$defs/timestamp" } }
+            }
+          }
+        }
+      ]
+    },
+    "pairCreate": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "pair.create" },
+            "body": { "$ref": "#/$defs/emptyBody" }
+          }
+        }
+      ]
+    },
+    "pairJoin": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "pair.join" },
+            "body": {
+              "type": "object",
+              "required": ["locator"],
+              "properties": {
+                "locator": { "type": "string", "pattern": "^[0-9]{6}$" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pairCommit": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "pair.commit" },
+            "body": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pairId", "sideId", "linkId", "self", "peer"],
+              "properties": {
+                "pairId": { "$ref": "#/$defs/uuid" },
+                "sideId": { "$ref": "#/$defs/uuid" },
+                "linkId": { "$ref": "#/$defs/uuid" },
+                "self": { "$ref": "#/$defs/endpointCommit" },
+                "peer": { "$ref": "#/$defs/routingEndpoint" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pairCancel": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "pair.cancel" },
+            "body": {
+              "type": "object",
+              "required": ["pairId"],
+              "properties": { "pairId": { "$ref": "#/$defs/uuid" } }
+            }
+          }
+        }
+      ]
+    },
+    "relayFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "relay.frame" },
+            "body": { "$ref": "#/$defs/relayBody" }
+          }
+        }
+      ]
+    },
+    "linkGet": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "link.get" },
+            "body": {
+              "type": "object",
+              "required": ["linkId"],
+              "properties": { "linkId": { "$ref": "#/$defs/uuid" } }
+            }
+          }
+        }
+      ]
+    },
+    "linkRevoke": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "link.revoke" },
+            "body": {
+              "type": "object",
+              "required": ["linkId"],
+              "properties": { "linkId": { "$ref": "#/$defs/uuid" } }
+            }
+          }
+        }
+      ]
+    },
+    "endpointRotate": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "endpoint.rotate" },
+            "body": {
+              "type": "object",
+              "required": ["credentialHash"],
+              "properties": { "credentialHash": { "$ref": "#/$defs/base64url32" } }
+            }
+          }
+        }
+      ]
+    },
+    "endpointRevoke": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "endpoint.revoke" },
+            "body": { "$ref": "#/$defs/emptyBody" }
+          }
+        }
+      ]
+    },
+    "sessionOpen": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "session.open" },
+            "body": {
+              "type": "object",
+              "required": ["linkId"],
+              "properties": { "linkId": { "$ref": "#/$defs/uuid" } }
+            }
+          }
+        }
+      ]
+    },
+    "sessionClose": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "session.close" },
+            "body": {
+              "type": "object",
+              "required": ["sessionId"],
+              "properties": { "sessionId": { "$ref": "#/$defs/uuid" } }
+            }
+          }
+        }
+      ]
+    },
+    "ok": {
+      "allOf": [
+        { "$ref": "#/$defs/responseBase" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "ok" },
+            "body": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "system.hello" },
+                    "result": {
+                      "type": "object",
+                      "required": ["serverTime", "protocolVersion"],
+                      "properties": {
+                        "serverTime": { "$ref": "#/$defs/timestamp" },
+                        "protocolVersion": { "const": 1 }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "system.ping" },
+                    "result": {
+                      "type": "object",
+                      "required": ["receivedAt"],
+                      "properties": { "receivedAt": { "$ref": "#/$defs/timestamp" } }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "pair.create" },
+                    "result": {
+                      "type": "object",
+                      "required": ["pairId", "sideId", "locator", "expiresAt"],
+                      "properties": {
+                        "pairId": { "$ref": "#/$defs/uuid" },
+                        "sideId": { "$ref": "#/$defs/uuid" },
+                        "locator": { "type": "string", "pattern": "^[0-9]{6}$" },
+                        "expiresAt": { "$ref": "#/$defs/timestamp" }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "pair.join" },
+                    "result": {
+                      "type": "object",
+                      "required": ["pairId", "sideId", "expiresAt"],
+                      "properties": {
+                        "pairId": { "$ref": "#/$defs/uuid" },
+                        "sideId": { "$ref": "#/$defs/uuid" },
+                        "expiresAt": { "$ref": "#/$defs/timestamp" }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "pair.commit" },
+                    "result": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": ["pending"],
+                          "properties": { "pending": { "const": true } }
+                        },
+                        {
+                          "type": "object",
+                          "required": ["linkId", "active"],
+                          "properties": {
+                            "linkId": { "$ref": "#/$defs/uuid" },
+                            "active": { "const": true }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "pair.cancel" },
+                    "result": {
+                      "type": "object",
+                      "required": ["cancelled"],
+                      "properties": { "cancelled": { "const": true } }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "relay.frame" },
+                    "result": {
+                      "type": "object",
+                      "required": ["delivered"],
+                      "properties": { "delivered": { "const": true } }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "link.get" },
+                    "result": {
+                      "type": "object",
+                      "required": ["linkId", "peerEndpointId", "peerRole", "status"],
+                      "properties": {
+                        "linkId": { "$ref": "#/$defs/uuid" },
+                        "peerEndpointId": { "$ref": "#/$defs/uuid" },
+                        "peerRole": { "enum": ["controller", "companion"] },
+                        "status": { "enum": ["active", "revoked"] },
+                        "revokedAt": { "$ref": "#/$defs/timestamp" }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "link.revoke" },
+                    "result": {
+                      "type": "object",
+                      "required": ["revoked"],
+                      "properties": { "revoked": { "const": true } }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "endpoint.rotate" },
+                    "result": {
+                      "type": "object",
+                      "required": ["rotated"],
+                      "properties": { "rotated": { "const": true } }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "endpoint.revoke" },
+                    "result": {
+                      "type": "object",
+                      "required": ["revoked", "linksRevoked"],
+                      "properties": {
+                        "revoked": { "const": true },
+                        "linksRevoked": { "type": "integer", "minimum": 0 }
+                      }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "session.open" },
+                    "result": {
+                      "type": "object",
+                      "required": ["sessionId"],
+                      "properties": { "sessionId": { "$ref": "#/$defs/uuid" } }
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["requestType", "result"],
+                  "properties": {
+                    "requestType": { "const": "session.close" },
+                    "result": {
+                      "type": "object",
+                      "required": ["closed"],
+                      "properties": { "closed": { "const": true } }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "allOf": [
+        { "$ref": "#/$defs/responseBase" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "error" },
+            "body": {
+              "type": "object",
+              "required": ["code", "retryable"],
+              "properties": {
+                "code": {
+                  "enum": [
+                    "INVALID_MESSAGE",
+                    "UNSUPPORTED_VERSION",
+                    "UNAUTHENTICATED",
+                    "FORBIDDEN",
+                    "PAIR_UNAVAILABLE",
+                    "PAIR_FULL",
+                    "PAIR_EXPIRED",
+                    "PEER_OFFLINE",
+                    "PEER_BUSY",
+                    "SESSION_NOT_FOUND",
+                    "PAYLOAD_TOO_LARGE",
+                    "RATE_LIMITED",
+                    "CONFLICT",
+                    "INTERNAL"
+                  ]
+                },
+                "retryable": { "type": "boolean" },
+                "retryAfterMs": { "type": "integer", "minimum": 0, "maximum": 3600000 }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pairReady": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "pair.ready" },
+            "body": {
+              "type": "object",
+              "required": ["pairId", "peerSideId", "expiresAt"],
+              "properties": {
+                "pairId": { "$ref": "#/$defs/uuid" },
+                "peerSideId": { "$ref": "#/$defs/uuid" },
+                "expiresAt": { "$ref": "#/$defs/timestamp" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pairCompleted": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "pair.completed" },
+            "body": {
+              "type": "object",
+              "required": ["pairId", "linkId", "peerEndpointId", "peerRole"],
+              "properties": {
+                "pairId": { "$ref": "#/$defs/uuid" },
+                "linkId": { "$ref": "#/$defs/uuid" },
+                "peerEndpointId": { "$ref": "#/$defs/uuid" },
+                "peerRole": { "enum": ["controller", "companion"] }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pairClosed": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "pair.closed" },
+            "body": {
+              "type": "object",
+              "required": ["pairId", "reason"],
+              "properties": {
+                "pairId": { "$ref": "#/$defs/uuid" },
+                "reason": { "enum": ["cancelled", "expired", "peer-disconnected", "failed"] }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sessionOpened": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "session.opened" },
+            "body": {
+              "type": "object",
+              "required": ["sessionId", "linkId", "peerEndpointId"],
+              "properties": {
+                "sessionId": { "$ref": "#/$defs/uuid" },
+                "linkId": { "$ref": "#/$defs/uuid" },
+                "peerEndpointId": { "$ref": "#/$defs/uuid" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sessionClosed": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "session.closed" },
+            "body": {
+              "type": "object",
+              "required": ["sessionId", "reason"],
+              "properties": {
+                "sessionId": { "$ref": "#/$defs/uuid" },
+                "reason": { "enum": ["requested", "peer-disconnected", "expired", "revoked", "replaced"] }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "linkRevoked": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "link.revoked" },
+            "body": {
+              "type": "object",
+              "required": ["linkId"],
+              "properties": { "linkId": { "$ref": "#/$defs/uuid" } }
+            }
+          }
+        }
+      ]
+    },
+    "clientEnvelope": {
+      "oneOf": [
+        { "$ref": "#/$defs/systemHello" },
+        { "$ref": "#/$defs/systemPing" },
+        { "$ref": "#/$defs/pairCreate" },
+        { "$ref": "#/$defs/pairJoin" },
+        { "$ref": "#/$defs/pairCommit" },
+        { "$ref": "#/$defs/pairCancel" },
+        { "$ref": "#/$defs/relayFrame" },
+        { "$ref": "#/$defs/linkGet" },
+        { "$ref": "#/$defs/linkRevoke" },
+        { "$ref": "#/$defs/endpointRotate" },
+        { "$ref": "#/$defs/endpointRevoke" },
+        { "$ref": "#/$defs/sessionOpen" },
+        { "$ref": "#/$defs/sessionClose" }
+      ]
+    },
+    "serverEnvelope": {
+      "oneOf": [
+        { "$ref": "#/$defs/ok" },
+        { "$ref": "#/$defs/error" },
+        { "$ref": "#/$defs/pairReady" },
+        { "$ref": "#/$defs/pairCompleted" },
+        { "$ref": "#/$defs/pairClosed" },
+        { "$ref": "#/$defs/relayFrame" },
+        { "$ref": "#/$defs/sessionOpened" },
+        { "$ref": "#/$defs/sessionClosed" },
+        { "$ref": "#/$defs/linkRevoked" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remote-davinci.dev/schemas/pairing-v1.schema.json",
+  "title": "Remote DaVinci encrypted pairing identity v1",
+  "type": "object",
+  "required": ["protocol", "v", "type", "id", "body"],
+  "properties": {
+    "protocol": { "const": "remote-davinci.pairing" },
+    "v": { "const": 1 },
+    "type": { "const": "identity" },
+    "id": { "$ref": "#/$defs/uuid" },
+    "body": {
+      "type": "object",
+      "required": [
+        "linkId",
+        "endpointId",
+        "role",
+        "noiseKey",
+        "noiseFingerprint",
+        "deviceLabel",
+        "permissions",
+        "capabilities"
+      ],
+      "properties": {
+        "linkId": { "$ref": "#/$defs/uuid" },
+        "endpointId": { "$ref": "#/$defs/uuid" },
+        "role": { "enum": ["controller", "companion"] },
+        "noiseKey": { "$ref": "#/$defs/base64url32" },
+        "noiseFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+        },
+        "deviceLabel": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "permissions": { "$ref": "#/$defs/names" },
+        "capabilities": { "$ref": "#/$defs/names" }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "base64url32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "names": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/name" }
+    },
+    "wormholeMessage": {
+      "type": "object",
+      "required": ["phase", "body"],
+      "properties": {
+        "phase": {
+          "oneOf": [
+            { "enum": ["pake", "version"] },
+            { "type": "string", "pattern": "^(?:0|[1-9][0-9]*)$" }
+          ]
+        },
+        "body": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32720,
+          "pattern": "^(?:[0-9a-f]{2})+$"
+        }
+      },
+      "oneOf": [
+        { "type": "object", "properties": { "phase": { "const": "pake" } } },
+        {
+          "type": "object",
+          "properties": {
+            "phase": { "const": "version" },
+            "body": { "type": "string", "minLength": 80 }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "phase": { "type": "string", "pattern": "^(?:0|[1-9][0-9]*)$" },
+            "body": { "type": "string", "minLength": 80 }
+          }
+        }
+      ]
+    }
+  }
+}

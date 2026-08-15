@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remote-davinci.dev/schemas/control-v1.schema.json",
+  "title": "Remote DaVinci encrypted control protocol v1",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "names": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/name" }
+    },
+    "base": {
+      "type": "object",
+      "required": ["protocol", "v", "type", "id", "body"],
+      "properties": {
+        "protocol": { "const": "remote-davinci.control" },
+        "v": { "const": 1 },
+        "type": { "type": "string" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "body": { "type": "object" }
+      }
+    },
+    "hello": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "hello" },
+            "body": {
+              "type": "object",
+              "required": ["role", "capabilities", "appVersion"],
+              "properties": {
+                "role": { "enum": ["controller", "companion"] },
+                "capabilities": { "$ref": "#/$defs/names" },
+                "appVersion": { "type": "string", "minLength": 1, "maxLength": 64 }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "request": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "request" },
+            "body": {
+              "type": "object",
+              "required": ["operation", "args", "sentAt", "expiresAt"],
+              "properties": {
+                "operation": { "$ref": "#/$defs/name" },
+                "args": { "type": "object" },
+                "sentAt": { "$ref": "#/$defs/timestamp" },
+                "expiresAt": { "$ref": "#/$defs/timestamp" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "response": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["replyTo"],
+          "properties": {
+            "type": { "const": "response" },
+            "replyTo": { "$ref": "#/$defs/uuid" },
+            "body": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["ok", "result"],
+                  "properties": {
+                    "ok": { "const": true },
+                    "result": {},
+                    "error": false
+                  }
+                },
+                {
+                  "type": "object",
+                  "required": ["ok", "error"],
+                  "properties": {
+                    "ok": { "const": false },
+                    "error": {
+                      "type": "object",
+                      "required": ["code"],
+                      "properties": {
+                        "code": { "$ref": "#/$defs/name" },
+                        "message": { "type": "string", "maxLength": 256 },
+                        "retryable": { "type": "boolean" }
+                      }
+                    },
+                    "result": false
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "event": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "event" },
+            "body": {
+              "type": "object",
+              "required": ["name", "data"],
+              "properties": {
+                "name": { "$ref": "#/$defs/name" },
+                "data": {}
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

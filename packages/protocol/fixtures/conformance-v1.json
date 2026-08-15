@@ -1,0 +1,343 @@
+{
+  "authorization": {
+    "pairing": "Pairing rd1",
+    "bearer": "Bearer rd1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "client": [
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "system.hello",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "body": {}
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "system.ping",
+      "id": "00000000-0000-4000-8000-000000000002",
+      "body": { "sentAt": 1786723200 }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "pair.create",
+      "id": "00000000-0000-4000-8000-000000000003",
+      "body": {}
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "pair.join",
+      "id": "00000000-0000-4000-8000-000000000004",
+      "body": { "locator": "482901" }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "pair.commit",
+      "id": "00000000-0000-4000-8000-000000000005",
+      "body": {
+        "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "sideId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "self": {
+          "endpointId": "11111111-1111-4111-8111-111111111111",
+          "role": "controller",
+          "credentialHash": "Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU"
+        },
+        "peer": {
+          "endpointId": "22222222-2222-4222-8222-222222222222",
+          "role": "companion"
+        }
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "pair.cancel",
+      "id": "00000000-0000-4000-8000-000000000006",
+      "body": { "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "relay.frame",
+      "id": "00000000-0000-4000-8000-000000000007",
+      "body": {
+        "channel": "pair",
+        "channelId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "seq": 1,
+        "payload": "AQ"
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "link.get",
+      "id": "00000000-0000-4000-8000-000000000008",
+      "body": { "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "link.revoke",
+      "id": "00000000-0000-4000-8000-000000000009",
+      "body": { "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "endpoint.rotate",
+      "id": "00000000-0000-4000-8000-000000000010",
+      "body": { "credentialHash": "Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU" }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "endpoint.revoke",
+      "id": "00000000-0000-4000-8000-000000000011",
+      "body": {}
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "session.open",
+      "id": "00000000-0000-4000-8000-000000000012",
+      "body": { "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "session.close",
+      "id": "00000000-0000-4000-8000-000000000013",
+      "body": { "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }
+    }
+  ],
+  "server": [
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "ok",
+      "id": "10000000-0000-4000-8000-000000000001",
+      "replyTo": "00000000-0000-4000-8000-000000000003",
+      "body": {
+        "requestType": "pair.create",
+        "result": {
+          "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "sideId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "locator": "482901",
+          "expiresAt": 1786723500
+        }
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "error",
+      "id": "10000000-0000-4000-8000-000000000002",
+      "replyTo": "00000000-0000-4000-8000-000000000004",
+      "body": { "code": "PAIR_EXPIRED", "retryable": false }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "pair.ready",
+      "id": "10000000-0000-4000-8000-000000000003",
+      "body": {
+        "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "peerSideId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "expiresAt": 1786723500
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "pair.completed",
+      "id": "10000000-0000-4000-8000-000000000004",
+      "body": {
+        "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "peerEndpointId": "22222222-2222-4222-8222-222222222222",
+        "peerRole": "companion"
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "pair.closed",
+      "id": "10000000-0000-4000-8000-000000000005",
+      "body": {
+        "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "reason": "expired"
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "relay.frame",
+      "id": "10000000-0000-4000-8000-000000000006",
+      "body": {
+        "channel": "session",
+        "channelId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "seq": 1,
+        "payload": "AQ"
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "session.opened",
+      "id": "10000000-0000-4000-8000-000000000007",
+      "body": {
+        "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "peerEndpointId": "22222222-2222-4222-8222-222222222222"
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "session.closed",
+      "id": "10000000-0000-4000-8000-000000000008",
+      "body": {
+        "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "reason": "peer-disconnected"
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "link.revoked",
+      "id": "10000000-0000-4000-8000-000000000009",
+      "body": { "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
+    }
+  ],
+  "pairingIdentity": {
+    "protocol": "remote-davinci.pairing",
+    "v": 1,
+    "type": "identity",
+    "id": "30000000-0000-4000-8000-000000000001",
+    "body": {
+      "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "endpointId": "11111111-1111-4111-8111-111111111111",
+      "role": "controller",
+      "noiseKey": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
+      "noiseFingerprint": "sha256:MAyclgO5Kks57TlYv5JAEUgE20_TcwEsDKR0MtY0Ja4",
+      "deviceLabel": "Alex's iPad",
+      "permissions": ["resolve.transport"],
+      "capabilities": ["resolve.transport.play"]
+    }
+  },
+  "wormhole": [
+    {
+      "phase": "pake",
+      "body": "7b2270616b655f7631223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030227d"
+    },
+    {
+      "phase": "version",
+      "body": "00000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "phase": "0",
+      "body": "00000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "control": [
+    {
+      "protocol": "remote-davinci.control",
+      "v": 1,
+      "type": "hello",
+      "id": "20000000-0000-4000-8000-000000000001",
+      "body": {
+        "role": "controller",
+        "capabilities": ["resolve.transport.play"],
+        "appVersion": "1.0.0"
+      }
+    },
+    {
+      "protocol": "remote-davinci.control",
+      "v": 1,
+      "type": "request",
+      "id": "20000000-0000-4000-8000-000000000002",
+      "body": {
+        "operation": "resolve.transport.play",
+        "args": {},
+        "sentAt": 1786723200000,
+        "expiresAt": 1786723205000
+      }
+    },
+    {
+      "protocol": "remote-davinci.control",
+      "v": 1,
+      "type": "response",
+      "id": "20000000-0000-4000-8000-000000000003",
+      "replyTo": "20000000-0000-4000-8000-000000000002",
+      "body": { "ok": true, "result": { "playing": true } }
+    },
+    {
+      "protocol": "remote-davinci.control",
+      "v": 1,
+      "type": "event",
+      "id": "20000000-0000-4000-8000-000000000004",
+      "body": { "name": "resolve.transport.changed", "data": { "playing": true } }
+    }
+  ],
+  "invalidClient": [
+    {
+      "name": "unknown message type",
+      "frame": {
+        "protocol": "remote-davinci.rendezvous",
+        "v": 1,
+        "type": "future.command",
+        "id": "00000000-0000-4000-8000-000000000001",
+        "body": {}
+      }
+    },
+    {
+      "name": "unsupported version",
+      "frame": {
+        "protocol": "remote-davinci.rendezvous",
+        "v": 2,
+        "type": "pair.create",
+        "id": "00000000-0000-4000-8000-000000000001",
+        "body": {}
+      }
+    },
+    {
+      "name": "non-canonical UUID",
+      "frame": {
+        "protocol": "remote-davinci.rendezvous",
+        "v": 1,
+        "type": "pair.create",
+        "id": "00000000-0000-4000-8000-00000000000A",
+        "body": {}
+      }
+    },
+    {
+      "name": "missing required body field",
+      "frame": {
+        "protocol": "remote-davinci.rendezvous",
+        "v": 1,
+        "type": "pair.join",
+        "id": "00000000-0000-4000-8000-000000000001",
+        "body": {}
+      }
+    },
+    {
+      "name": "padded relay payload",
+      "frame": {
+        "protocol": "remote-davinci.rendezvous",
+        "v": 1,
+        "type": "relay.frame",
+        "id": "00000000-0000-4000-8000-000000000001",
+        "body": {
+          "channel": "session",
+          "channelId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          "seq": 1,
+          "payload": "AQ=="
+        }
+      }
+    }
+  ]
+}
