@@ -23,16 +23,16 @@ var uiHTML []byte
 const uiTokenHeader = "X-Remote-Davinci-Token"
 
 type App struct {
-	ctx        context.Context
-	configPath string
-	relayURL   string
-	enrollMu   sync.Mutex
-	mu         sync.RWMutex
-	config     *Config
-	status     RelayStatus
-	cancel     context.CancelFunc
-	uiToken    string
-	revoke     func(context.Context, Config, func(Config) error) error
+	ctx      context.Context
+	store    ConfigStore
+	relayURL string
+	enrollMu sync.Mutex
+	mu       sync.RWMutex
+	config   *Config
+	status   RelayStatus
+	cancel   context.CancelFunc
+	uiToken  string
+	revoke   func(context.Context, Config, func(Config) error) error
 }
 
 type State struct {
@@ -47,6 +47,24 @@ type State struct {
 }
 
 func NewApp(ctx context.Context, configPath, relay string) (*App, error) {
+	return NewAppWithStore(ctx, FileConfigStore{Path: configPath}, relay)
+}
+
+func NewNativeApp(ctx context.Context, legacyPath, relay string) (*App, error) {
+	if _, err := relayURL(relay); err != nil {
+		return nil, err
+	}
+	keychain := NewKeychainConfigStore()
+	if err := MigrateConfigStore(FileConfigStore{Path: legacyPath}, keychain); err != nil {
+		return nil, err
+	}
+	return NewAppWithStore(ctx, keychain, relay)
+}
+
+func NewAppWithStore(ctx context.Context, store ConfigStore, relay string) (*App, error) {
+	if store == nil {
+		return nil, errors.New("configuration store is required")
+	}
 	if _, err := relayURL(relay); err != nil {
 		return nil, err
 	}
@@ -55,12 +73,15 @@ func NewApp(ctx context.Context, configPath, relay string) (*App, error) {
 		return nil, err
 	}
 	app := &App{
-		ctx: ctx, configPath: configPath, relayURL: relay,
+		ctx: ctx, store: store, relayURL: relay,
 		status:  RelayStatus{Message: "Not enrolled"},
 		uiToken: base64.RawURLEncoding.EncodeToString(token), revoke: RevokeEnrollment,
 	}
-	config, err := LoadConfig(configPath)
+	config, err := store.Load()
 	if err == nil {
+		if err := config.validate(); err != nil {
+			return nil, err
+		}
 		app.config = &config
 		app.relayURL = config.RelayURL
 		if config.LinkRevoked {
@@ -103,7 +124,7 @@ func (app *App) startRelay(config Config) {
 				if status.Connected && app.config.ActivationPending {
 					activated := *app.config
 					activated.ActivationPending = false
-					if SaveConfig(app.configPath, activated) == nil {
+					if app.store.Save(activated) == nil {
 						app.config = &activated
 					}
 				}
@@ -204,7 +225,7 @@ func (app *App) handleEnroll(response http.ResponseWriter, request *http.Request
 	ctx, cancel := context.WithTimeout(request.Context(), 45*time.Second)
 	defer cancel()
 	config, enrollmentResponse, err := Provision(ctx, app.relayURL, enrollment, func(config Config) error {
-		return SaveConfig(app.configPath, config)
+		return app.store.Save(config)
 	})
 	if err != nil {
 		if config.V == 1 {
@@ -270,7 +291,7 @@ func (app *App) handleReset(response http.ResponseWriter, request *http.Request)
 	ctx, cancel := context.WithTimeout(request.Context(), 30*time.Second)
 	defer cancel()
 	if err := app.revoke(ctx, config, func(checkpoint Config) error {
-		if err := SaveConfig(app.configPath, checkpoint); err != nil {
+		if err := app.store.Save(checkpoint); err != nil {
 			return err
 		}
 		config = checkpoint
@@ -289,9 +310,9 @@ func (app *App) handleReset(response http.ResponseWriter, request *http.Request)
 		return
 	}
 
-	removeErr := os.Remove(app.configPath)
+	removeErr := app.store.Delete()
 	app.mu.Lock()
-	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+	if removeErr != nil {
 		app.status = RelayStatus{Message: "Enrollment revoked; could not remove local credentials"}
 		app.mu.Unlock()
 		writeError(response, http.StatusInternalServerError, "enrollment revoked but local credentials could not be removed")
@@ -338,7 +359,7 @@ func (app *App) handleForget(response http.ResponseWriter, request *http.Request
 	app.status = RelayStatus{Message: "Removing local enrollment…"}
 	app.mu.Unlock()
 
-	if err := os.Remove(app.configPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := app.store.Delete(); err != nil {
 		app.mu.Lock()
 		app.status = RelayStatus{Message: "Could not remove local credentials; enrollment retained"}
 		app.mu.Unlock()

@@ -16,9 +16,11 @@ is not release readiness.
   replay, and failure-path tests. The live canary refuses to run without the
   disposable opt-in or an explicit dangerous production override.
 - Never copy enrollment JSON, bearer headers, Noise keys, ciphertext, or the
-  companion launch token into test evidence or shared logs. The CLI necessarily
-  prints its launch-scoped tokenized URL to the local console; capture it
-  privately and record only stable operation/error codes and pass/fail results.
+  companion launch token into test evidence or shared logs. The native app
+  captures the helper's launch record privately. The development CLI
+  necessarily prints its launch-scoped tokenized URL to the local console;
+  capture it privately and record only stable operation/error codes and
+  pass/fail results.
 - Give every test a timeout. Do not replay commands into a replacement session.
 - Use a uniquely named disposable Resolve project. Delete only that exact
   project after closing it.
@@ -33,6 +35,7 @@ is not release readiness.
 | --- | --- | --- |
 | Local Go/Node | contracts, relay, companion, CDK | supported Go and Node versions; clean test caches are optional |
 | Mac Catalyst | fast Swift/Noise regression | current Xcode |
+| Native macOS app | SwiftUI host, helper lifecycle, Keychain migration | macOS 14+; current Xcode; stable signing identity for release checks |
 | iPhone simulator | phone build, launch, layout | installed iOS runtime |
 | iPad simulator | tablet build, launch, layout | installed iOS runtime |
 | Disposable AWS stack | real API Gateway/Lambda/DynamoDB ordering and lifecycle | account credentials; stack tagged `Project=remote-davinci`, `Environment=dev` |
@@ -61,6 +64,7 @@ make check
 go test -count=1 ./...
 go test -race -count=1 ./...
 go vet ./...
+make companion-app-check
 make controller-check
 ```
 
@@ -79,6 +83,8 @@ Coverage required:
 - Full-jitter reconnect ceiling, randomized connection rotation, and no replay.
 - Config atomic write, mode `0600`, localhost token, Host/Origin/media-type
   checks, reset checkpoints, and stale callback protection.
+- Native readiness validation, terminal startup errors, parent-death shutdown,
+  bounded helper restart, and verified file-to-Keychain migration.
 - CDK synthesis assertions for routes, permissions, retention, TTL, alarms,
   throttles, tags, and production deletion protection.
 
@@ -153,13 +159,23 @@ The canary must prove:
 Pass: all assertions succeed, cleanup succeeds, and no secret appears in test,
 Lambda, API, or terminal output.
 
-## Phase 5: companion loopback boundary
+## Phase 5: native companion and loopback boundary
 
-Start a fresh companion process with a temporary config path and capture its
-launch URL privately.
+Build a signed native app with the same identity intended for release and cold
+launch it. Separately start the development CLI with a temporary config path
+when direct HTTP boundary probing is required, and capture its launch URL
+privately.
 
 Verify:
 
+- The native app opens no browser, its embedded helper uses an ephemeral
+  loopback port, and the tokenized readiness record is never logged or shown.
+- Normal Quit terminates the helper; forced parent death closes its stdin and
+  the helper exits without becoming an orphan. Unexpected helper exits use
+  bounded restart, while deterministic storage failures require manual retry.
+- A valid legacy mode-0600 configuration migrates only after Keychain readback
+  matches. Conflicts and Keychain failures preserve the legacy file and fail
+  closed before the API binds.
 - It binds only to an explicit loopback IP.
 - `/api/*` rejects a missing or wrong launch token.
 - Non-loopback/DNS-rebinding Host values, cross-origin POSTs, non-JSON POSTs,
@@ -173,9 +189,9 @@ Verify:
   best-effort and a lost endpoint acknowledgment cannot strand local cleanup.
 - Beyond the one local startup URL, the launch token does not enter application
   logs or error bodies; config secrets and enrollment material never do.
-- A corrupt temporary config fails closed before the GUI binds. For this
-  unsigned slice, recovery is an explicit move-aside of that exact file and a
-  fresh enrollment; record that the old remote identity may remain.
+- A corrupt temporary config fails closed before the GUI or native API binds.
+  Recovery is an explicit move-aside of that exact file and a fresh enrollment;
+  record that the old remote identity may remain.
 
 Pass: an unauthenticated browser or native localhost caller cannot read state or
 mutate the host, and every supported runtime failure leaves a recoverable state.

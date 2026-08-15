@@ -750,7 +750,7 @@ func TestResetRetainsCredentialsUntilRevocationSucceeds(t *testing.T) {
 	cancelled, allowRevoke := false, false
 	var app *App
 	app = &App{
-		ctx: parent, configPath: path, relayURL: config.RelayURL, uiToken: "test-token",
+		ctx: parent, store: FileConfigStore{Path: path}, relayURL: config.RelayURL, uiToken: "test-token",
 		config: &config, status: RelayStatus{Connected: true, Secure: true},
 		cancel: func() { cancelled = true },
 		revoke: func(_ context.Context, got Config, persist func(Config) error) error {
@@ -840,7 +840,7 @@ func TestForgetLocalEnrollmentRequiresExactConfirmationAndSuccessfulDeletion(t *
 	}
 	cancelled := false
 	app := &App{
-		configPath: path, config: &config, uiToken: "test-token",
+		store: FileConfigStore{Path: path}, config: &config, uiToken: "test-token",
 		cancel: func() { cancelled = true }, status: RelayStatus{Connected: true},
 	}
 	forget := func(confirmation string) *httptest.ResponseRecorder {
@@ -863,11 +863,11 @@ func TestForgetLocalEnrollmentRequiresExactConfirmationAndSuccessfulDeletion(t *
 	if err := os.WriteFile(filepath.Join(blocked, "keep"), []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	app.configPath = blocked
+	app.store = FileConfigStore{Path: blocked}
 	if response := forget(config.LinkID); response.Code != http.StatusInternalServerError || !cancelled || !app.state().Configured {
 		t.Fatalf("failed deletion status = %d, cancelled = %v, configured = %v", response.Code, cancelled, app.state().Configured)
 	}
-	app.configPath = path
+	app.store = FileConfigStore{Path: path}
 	response := forget(config.LinkID)
 	if response.Code != http.StatusOK || app.state().Configured || !strings.Contains(response.Body.String(), "may remain") {
 		t.Fatalf("successful local forget status = %d, configured = %v, body = %s", response.Code, app.state().Configured, response.Body.String())
