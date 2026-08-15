@@ -1,8 +1,8 @@
-# `@remote-davinci/protocol`
+# `protocol`
 
-Language-neutral v1 contracts and Node/TypeScript trust-boundary validators for the Remote DaVinci rendezvous, pairing, relay, and control protocols.
+Language-neutral v1 contracts and Go trust-boundary validators for the Remote DaVinci rendezvous, pairing, relay, and control protocols.
 
-The JSON Schemas in `src/schemas` are the wire-format source of truth. `src/index.ts` exports the corresponding TypeScript unions, constants, and parsers. Unknown fields on a known message are ignored for forward compatibility, except for the deliberately closed `pair.commit` identity objects. Unknown message types, missing fields, invalid field values, and unsupported protocol versions fail closed.
+The JSON Schemas in `schemas` are the wire-format source of truth. The public Go package exports the corresponding message types, constants, and parsers. Unknown fields on a known message are ignored for forward compatibility, except for the deliberately closed `pair.commit` identity objects. Unknown message types, missing fields, invalid field values, and unsupported protocol versions fail closed.
 
 ## Scope and trust boundary
 
@@ -159,16 +159,11 @@ Raw keystrokes, arbitrary scripts, and direct Resolve network access are not pro
 
 ## Runtime use
 
-```ts
-import {
-  ProtocolValidationError,
-  parseAuthorization,
-  parseClientEnvelope,
-  parseControlEnvelope,
-} from "@remote-davinci/protocol";
+```go
+import "github.com/anhydrous99/remote-davinci/protocol"
 
-const auth = parseAuthorization(request.headers.Authorization);
-const command = parseClientEnvelope(request.body);
+auth, err := protocol.ParseAuthorization(request.Headers["Authorization"])
+command, err := protocol.ParseClient(request.Body)
 ```
 
-The parsers throw `ProtocolValidationError` without embedding input values, credentials, or payloads in the message. Logs may include the stable error code and schema paths only.
+The parsers return `ValidationError` without embedding input values, credentials, or payloads in the message. Logs may include the stable error code and schema paths only.

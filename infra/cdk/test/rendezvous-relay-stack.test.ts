@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { App } from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
@@ -69,11 +71,67 @@ describe('RendezvousRelayStack', () => {
       ]),
     });
     stack.hasOutput('WebSocketUrl', { Value: Match.anyValue() });
+    for (const resource of Object.values(
+      stack.findResources('AWS::Lambda::Function'),
+    )) {
+      assert.deepEqual(resource.Properties.Architectures, ['arm64']);
+      assert.equal(resource.Properties.Handler, 'bootstrap');
+      assert.equal(resource.Properties.Runtime, 'provided.al2023');
+    }
     for (const log of Object.values(
       stack.findResources('AWS::Logs::LogGroup'),
     )) {
       assert.equal(log.Properties.RetentionInDays, 7);
     }
+  });
+
+  it('builds executable Linux ARM64 bootstrap assets', () => {
+    template();
+    for (const name of ['authorizer', 'relay']) {
+      const bootstrap = path.join(__dirname, '../../../../.build', name, 'bootstrap');
+      const bytes = fs.readFileSync(bootstrap);
+      assert.deepEqual([...bytes.subarray(0, 4)], [0x7f, 0x45, 0x4c, 0x46]);
+      assert.equal(bytes.readUInt16LE(18), 183);
+      assert.notEqual(fs.statSync(bootstrap).mode & 0o111, 0);
+    }
+  });
+
+  it('preserves the baseline resource logical IDs', () => {
+    assert.deepEqual(
+      Object.keys(template().toJSON().Resources).sort(),
+      [
+        'AccessLogs8B620ECA',
+        'AccessLogsPolicyResourcePolicyA1E3EF94',
+        'ApiConnectAuthorizerB9E9A2F0',
+        'ApiF70053CD',
+        'ApiServerErrorsDFE5B564',
+        'ApiTestdevApiConnectAuthorizer5D3D6032PermissionB5E8E2AC',
+        'ApiconnectRoute2B5B23F2',
+        'ApiconnectRouteConnectIntegration7BCE6281',
+        'ApiconnectRouteConnectIntegrationPermission18C9C2B7',
+        'ApidefaultRoute40D195EB',
+        'ApidefaultRouteDefaultIntegrationE3602C1B',
+        'ApidefaultRouteDefaultIntegrationPermission0A3AC89E',
+        'ApidisconnectRoute1C5CAB1B',
+        'ApidisconnectRouteDisconnectIntegration815E8937',
+        'ApidisconnectRouteDisconnectIntegrationPermission6F1ECF1B',
+        'AuthorizerErrorsF0468F50',
+        'AuthorizerHandler0112B303',
+        'AuthorizerHandlerServiceRole5F40A014',
+        'AuthorizerHandlerServiceRoleDefaultPolicy53DE31A6',
+        'AuthorizerLogsBA5DABC9',
+        'AuthorizerThrottlesB6216B06',
+        'RelayErrors28574ADF',
+        'RelayHandler744E9E85',
+        'RelayHandlerServiceRoleB2144F3C',
+        'RelayHandlerServiceRoleDefaultPolicy3D477D8A',
+        'RelayLogs019433A2',
+        'RelayThrottles80A74296',
+        'Stage0E8C2AF5',
+        'State1C20CC9A',
+        'TableThrottlesCD44955A',
+      ],
+    );
   });
 
   it('protects connect and scopes runtime permissions', () => {

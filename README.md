@@ -5,7 +5,7 @@ and a macOS DaVinci Resolve companion.
 
 ## What is here
 
-- `packages/protocol`: the versioned, language-neutral wire contract.
+- `protocol`: the versioned, language-neutral wire contract and Go validators.
 - `services/rendezvous-relay`: WebSocket authorization, pairing, routing, and
   live ciphertext forwarding.
 - `infra/cdk`: the TypeScript CDK stack for API Gateway, Lambda, DynamoDB, and
@@ -17,14 +17,14 @@ commands, terminate the peer-to-peer secure channel, or connect to Resolve.
 ## Local validation
 
 ```sh
-npm ci
-npm run check
+make bootstrap
+make check
 ```
 
-Synthesize the development stack with `npm run synth`. It targets `us-east-1`
-by default; pass CDK context `region` to the infrastructure workspace to select
-another region. Deployment requires an AWS account bootstrapped for CDK and is
-intentionally not performed by the test suite.
+Synthesize the development stack with `npm --prefix infra/cdk run synth`. It
+targets `us-east-1` by default; pass CDK context `region` to the infrastructure
+workspace to select another region. Deployment requires an AWS account
+bootstrapped for CDK and is intentionally not performed by the test suite.
 
 ## V1 boundary
 

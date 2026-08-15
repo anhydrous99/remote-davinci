@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
   CfnOutput,
@@ -13,7 +14,6 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import type { Construct } from 'constructs';
 
@@ -27,10 +27,36 @@ export class RendezvousRelayStack extends Stack {
 
     const production = props.environment === 'prod';
     const removalPolicy = production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
-    const serviceRoot = path.join(
-      __dirname,
-      '../../../../services/rendezvous-relay/src',
-    );
+    const repositoryRoot = path.join(__dirname, '../../../..');
+    const goCode = (name: string, command: string): lambda.Code => {
+      const output = path.join(repositoryRoot, '.build', name);
+      fs.mkdirSync(output, { recursive: true });
+      return lambda.Code.fromCustomCommand(
+        output,
+        [
+          'go',
+          'build',
+          '-trimpath',
+          '-tags',
+          'lambda.norpc',
+          '-ldflags=-s -w',
+          '-o',
+          path.join(output, 'bootstrap'),
+          command,
+        ],
+        {
+          commandOptions: {
+            cwd: repositoryRoot,
+            env: {
+              ...process.env,
+              CGO_ENABLED: '0',
+              GOARCH: 'arm64',
+              GOOS: 'linux',
+            },
+          },
+        },
+      );
+    };
 
     const table = new dynamodb.Table(this, 'State', {
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -50,9 +76,8 @@ export class RendezvousRelayStack extends Stack {
       environment: { TABLE_NAME: table.tableName },
       loggingFormat: lambda.LoggingFormat.JSON,
       memorySize: 256,
-      runtime: lambda.Runtime.NODEJS_24_X,
+      runtime: lambda.Runtime.PROVIDED_AL2023,
       timeout: Duration.seconds(10),
-      bundling: { minify: true, sourceMap: true, target: 'node24' },
     } as const;
     const lambdaLogProps = {
       removalPolicy,
@@ -61,16 +86,16 @@ export class RendezvousRelayStack extends Stack {
         : logs.RetentionDays.ONE_WEEK,
     } as const;
 
-    const authorizerHandler = new nodejs.NodejsFunction(this, 'AuthorizerHandler', {
+    const authorizerHandler = new lambda.Function(this, 'AuthorizerHandler', {
       ...lambdaDefaults,
-      entry: path.join(serviceRoot, 'authorizer.ts'),
-      handler: 'handler',
+      code: goCode('authorizer', './services/rendezvous-relay/cmd/authorizer'),
+      handler: 'bootstrap',
       logGroup: new logs.LogGroup(this, 'AuthorizerLogs', lambdaLogProps),
     });
-    const relayHandler = new nodejs.NodejsFunction(this, 'RelayHandler', {
+    const relayHandler = new lambda.Function(this, 'RelayHandler', {
       ...lambdaDefaults,
-      entry: path.join(serviceRoot, 'handler.ts'),
-      handler: 'handler',
+      code: goCode('relay', './services/rendezvous-relay/cmd/relay'),
+      handler: 'bootstrap',
       logGroup: new logs.LogGroup(this, 'RelayLogs', lambdaLogProps),
     });
 
