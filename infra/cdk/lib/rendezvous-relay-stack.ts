@@ -228,12 +228,14 @@ export class RendezvousRelayStack extends Stack {
       evaluationPeriods: 1,
       metric: relayHandler.metricErrors({ period: Duration.minutes(5) }),
       threshold: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     new cloudwatch.Alarm(this, 'RelayThrottles', {
       alarmDescription: 'Relay Lambda was throttled',
       evaluationPeriods: 1,
       metric: relayHandler.metricThrottles({ period: Duration.minutes(5) }),
       threshold: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
     new cloudwatch.Alarm(this, 'ApiExecutionErrors', {
@@ -247,6 +249,7 @@ export class RendezvousRelayStack extends Stack {
         statistic: 'Sum',
       }),
       threshold: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     new cloudwatch.Alarm(this, 'TableThrottles', {
       alarmDescription: 'DynamoDB throttled a rendezvous operation',
@@ -260,6 +263,7 @@ export class RendezvousRelayStack extends Stack {
         period: Duration.minutes(5),
       }),
       threshold: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
     new CfnOutput(this, 'WebSocketUrl', { value: stage.url });

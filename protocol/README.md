@@ -113,7 +113,7 @@ The compact phase-`0` wrapper plus SecretBox and hex overhead limits the decrypt
 
 Private service credentials and the local Noise static private key belong in Keychain or the platform credential store. Normal local app storage holds the peer endpoint ID, peer Noise static public key and fingerprint, local display name, negotiated permissions/capabilities, protocol version, and revocation state. Credential loss or an unexpected peer key requires pairing again; a changed peer key is never silently accepted.
 
-An authenticated controller opens a live session by link ID. The service permits one active session per endpoint and link and emits `session.opened` to both sides. Each direction starts outer `seq` at `1`. A receiver discards a duplicate sequence before Noise processing and closes on a gap.
+An authenticated controller opens a live session by link ID. The service permits one active session per endpoint and link and emits `session.opened` to both sides. Each direction starts outer `seq` at `1`. API Gateway may deliver concurrent relay invocations out of order, so a receiver buffers at most the next 8 frames (128 KiB decoded total) and drains only contiguous sequences into Noise. An old or duplicate sequence, or a gap beyond that bound, closes the session.
 
 Use `Noise_IK_25519_ChaChaPoly_SHA256`, controller as initiator and companion as responder. The exact prologue bytes are:
 
@@ -151,7 +151,7 @@ Raw keystrokes, arbitrary scripts, and direct Resolve network access are not pro
 
 ## Delivery and lifecycle semantics
 
-- Relay forwarding is ordered only by explicit `seq`; AWS stores no payloads.
+- Relay forwarding is ordered only by explicit `seq`; AWS stores no payloads. Receivers apply the bounded reorder rule above before processing `pair.frame` or `session.frame` payloads.
 - Outer `id` values correlate responses; the service does not persist them as idempotency records. After an uncertain `pair.create` or `pair.join`, close the socket and start a new pairing. After an uncertain `session.open`, accept a received `session.opened` event or reconnect and open a fresh session.
 - Socket loss closes the session and discards in-memory frames and response cache.
 - Reconnect uses full-jitter exponential backoff from one second to 15 minutes, then creates a fresh service session and fresh Noise keys.

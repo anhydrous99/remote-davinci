@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remote DaVinci Companion</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
+    body { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1 { margin-bottom: 6px; }
+    .muted { color: #888; }
+    .card { border: 1px solid #7776; border-radius: 14px; padding: 18px; margin-top: 20px; }
+    .status { display: flex; gap: 9px; align-items: center; }
+    .dot { width: 11px; height: 11px; border-radius: 50%; background: #888; }
+    .dot.connected { background: #e6a700; }
+    .dot.secure { background: #25a244; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 150px; padding: 10px; font: 12px ui-monospace, monospace; }
+    button { min-height: 44px; border: 0; border-radius: 10px; padding: 10px 16px; font: inherit; font-weight: 650; background: #306cff; color: white; cursor: pointer; }
+    button.secondary { background: #777; }
+    button.danger { background: #b42318; }
+    button:disabled { opacity: .5; cursor: default; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+    code { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Remote DaVinci Companion</h1>
+  <div class="muted">Local Go host · <span id="relay"></span></div>
+
+  <section class="card" aria-labelledby="connection-heading">
+    <h2 id="connection-heading">Connection</h2>
+    <div class="status" role="status" aria-live="polite">
+      <span id="dot" class="dot"></span><span id="status">Loading…</span>
+    </div>
+    <p id="identity" class="muted"></p>
+  </section>
+
+  <section class="card" aria-labelledby="reset-heading">
+    <h2 id="reset-heading">Reset enrollment</h2>
+    <p id="reset-help">Permanently revoke this link, attempt to revoke the Mac companion endpoint, then remove local credentials.</p>
+    <div class="row"><button id="reset" class="danger" aria-describedby="reset-help" disabled>Revoke and reset</button></div>
+    <p id="reset-status" role="status" aria-live="polite"></p>
+    <p id="forget-help">Emergency local-only recovery: the remote relay identity may remain and must be revoked separately.</p>
+    <div class="row"><button id="forget" class="secondary" aria-describedby="forget-help" disabled>Forget only on this Mac</button></div>
+    <p id="forget-status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section class="card" aria-labelledby="controls-heading">
+    <h2 id="controls-heading">Local controls</h2>
+    <div class="controls">
+      <button data-operation="resolve.page.edit">Open Resolve Edit page</button>
+      <button data-operation="host.volume.toggle-mute">Toggle Mac mute</button>
+    </div>
+    <p id="action-result" role="status" aria-live="polite"></p>
+  </section>
+
+  <section class="card" id="enrollment" aria-labelledby="enrollment-heading">
+    <h2 id="enrollment-heading">Enroll iPhone or iPad</h2>
+    <p>Generate a request in the iOS app, paste it here, then paste the response back into the app. This is a trusted one-operator setup step.</p>
+    <label for="request">Controller enrollment request</label>
+    <textarea id="request" spellcheck="false" autocomplete="off"></textarea>
+    <div class="row"><button id="enroll">Create link</button></div>
+    <p id="enroll-status" role="status" aria-live="polite"></p>
+    <label for="response">Controller enrollment response</label>
+    <textarea id="response" readonly spellcheck="false"></textarea>
+    <div class="row"><button id="copy" class="secondary">Copy response</button></div>
+  </section>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const launchToken = new URL(location.href).searchParams.get('token');
+    if (launchToken) sessionStorage.setItem('remote-davinci-token', launchToken);
+    const uiToken = launchToken || sessionStorage.getItem('remote-davinci-token') || '';
+    if (launchToken) history.replaceState(null, '', location.pathname);
+    let currentState;
+    async function jsonFetch(path, options = {}) {
+      const headers = new Headers(options.headers);
+      headers.set('X-Remote-Davinci-Token', uiToken);
+      const response = await fetch(path, {...options, headers});
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+      return body;
+    }
+    async function refresh() {
+      try {
+        const state = await jsonFetch('/api/state');
+        currentState = state;
+        $('relay').textContent = state.relayUrl;
+        $('status').textContent = state.status;
+        $('dot').className = `dot ${state.secure ? 'secure' : state.connected ? 'connected' : ''}`;
+        $('identity').textContent = state.configured ? `${state.controllerLabel} · link ${state.linkId}` : 'No controller enrolled';
+        $('reset').disabled = !state.configured;
+        $('forget').disabled = !state.configured;
+        $('enroll').disabled = state.configured;
+      } catch (error) { $('status').textContent = error.message; }
+    }
+    document.querySelectorAll('[data-operation]').forEach(button => button.addEventListener('click', async () => {
+      $('action-result').textContent = 'Working…';
+      try {
+        const result = await jsonFetch('/api/action', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({operation: button.dataset.operation})
+        });
+        $('action-result').textContent = JSON.stringify(result);
+      } catch (error) { $('action-result').textContent = error.message; }
+    }));
+    $('enroll').addEventListener('click', async () => {
+      $('enroll').disabled = true; $('enroll-status').textContent = 'Creating relay link…';
+      try {
+        const request = JSON.parse($('request').value);
+        const response = await jsonFetch('/api/enroll', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(request)
+        });
+        $('response').value = JSON.stringify(response);
+        $('enroll-status').textContent = response.warning || 'Link created. Import the response on iOS.';
+        await refresh();
+      } catch (error) { $('enroll-status').textContent = error.message; }
+      finally { $('enroll').disabled = currentState?.configured ?? false; }
+    });
+    $('copy').addEventListener('click', async () => {
+      await navigator.clipboard.writeText($('response').value);
+      $('enroll-status').textContent = 'Response copied.';
+    });
+    $('reset').addEventListener('click', async () => {
+      if (!currentState?.configured || !window.confirm(`Revoke ${currentState.controllerLabel} and remove this Mac's enrollment? This cannot be undone.`)) return;
+      $('reset').disabled = true; $('reset-status').textContent = 'Revoking enrollment…';
+      try {
+        await jsonFetch('/api/reset', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({confirmation: currentState.linkId})
+        });
+        $('request').value = ''; $('response').value = '';
+        $('reset-status').textContent = 'Enrollment revoked and removed.';
+        await refresh();
+      } catch (error) { $('reset-status').textContent = error.message; $('reset').disabled = false; }
+    });
+    $('forget').addEventListener('click', async () => {
+      if (!currentState?.configured || !window.confirm(`Forget ${currentState.controllerLabel} only on this Mac? The remote identity may remain active.`)) return;
+      $('forget').disabled = true; $('forget-status').textContent = 'Removing local enrollment…';
+      try {
+        const result = await jsonFetch('/api/forget', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({confirmation: currentState.linkId})
+        });
+        $('request').value = ''; $('response').value = '';
+        $('forget-status').textContent = result.warning;
+        await refresh();
+      } catch (error) { $('forget-status').textContent = error.message; $('forget').disabled = false; }
+    });
+    refresh(); setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

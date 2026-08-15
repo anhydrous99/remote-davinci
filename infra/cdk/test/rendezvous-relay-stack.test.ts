@@ -126,6 +126,11 @@ describe('RendezvousRelayStack', () => {
       MetricName: 'ExecutionError',
       Namespace: 'AWS/ApiGateway',
     });
+    for (const alarm of Object.values(
+      stack.findResources('AWS::CloudWatch::Alarm'),
+    )) {
+      assert.equal(alarm.Properties.TreatMissingData, 'notBreaching');
+    }
     stack.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmDescription: 'DynamoDB throttled a rendezvous operation',
       Metrics: Match.arrayWith([

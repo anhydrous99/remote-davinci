@@ -1,5 +1,6 @@
 node_modules/
 .build/
+.derivedData*/
 dist/
 coverage/
 cdk.out/

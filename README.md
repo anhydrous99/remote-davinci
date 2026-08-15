@@ -8,6 +8,10 @@ and a macOS DaVinci Resolve companion.
 - `protocol`: the versioned, language-neutral wire contract and Go validators.
 - `services/rendezvous-relay`: WebSocket authorization, pairing, routing, and
   live ciphertext forwarding in one Lambda.
+- `apps/controller/RemoteDavinciController.swiftpm`: the native iOS 17+
+  SwiftUI controller for iPhone and iPad.
+- `cmd/companion` and `internal/companion`: the macOS Go companion and its
+  loopback-only browser GUI.
 - `infra/cdk`: the TypeScript CDK stack for API Gateway, Lambda, DynamoDB, and
   operational alarms.
 - `docs/capacity.md`: the capacity envelope, quota prerequisites, and cost
@@ -70,6 +74,50 @@ Synthesize the development stack with `npm --prefix infra/cdk run synth`. It
 targets `us-east-1` by default; pass CDK context `region` to the infrastructure
 workspace to select another region. Deployment requires an AWS account
 bootstrapped for CDK and is intentionally not performed by the test suite.
+
+## Run the vertical slice
+
+Build and start the macOS companion:
+
+```sh
+make companion
+.build/remote-davinci-companion
+```
+
+It prints and opens a launch-scoped URL at `http://127.0.0.1:7314`; keep that
+URL private because its query token authorizes the loopback GUI for this
+process. For Resolve control, launch DaVinci Resolve Studio and allow
+command-line scripting in Resolve Preferences. The host-volume control does
+not require Resolve.
+
+Open `apps/controller/RemoteDavinciController.swiftpm` in Xcode, select a
+development team and an iPhone or iPad running iOS 17 or later, and Run. Then:
+
+1. Create an enrollment request on iOS.
+2. Paste it into the companion GUI and create the link.
+3. Paste the returned response into iOS and import it.
+4. Keep the companion running, tap Connect, then use either control.
+
+The two shipped operations are deliberately fixed: `resolve.page.edit` opens
+Resolve's Edit page through the documented scripting API, and
+`host.volume.toggle-mute` toggles macOS output mute. Remote raw keys, shell
+commands, and user-authored scripts are not accepted.
+
+Enrollment is a trusted, manual, one-operator ceremony for this slice. The iOS
+bearer secret and Noise private key use the device-only Keychain; the unsigned
+Go CLI uses a mode-0600 configuration file. Add PAKE/QR enrollment and macOS
+Keychain storage before onboarding anyone outside that boundary.
+Both apps offer separately confirmed local-only recovery when remote revocation
+cannot complete; it warns that the old relay identity may remain.
+
+On macOS with Xcode installed, run the controller's Noise/enrollment tests with:
+
+```sh
+make controller-check
+```
+
+The complete deployment, device, failure-path, host-effect, and cleanup matrix
+is in [`docs/e2e-test-plan.md`](docs/e2e-test-plan.md).
 
 ## V1 boundary
 

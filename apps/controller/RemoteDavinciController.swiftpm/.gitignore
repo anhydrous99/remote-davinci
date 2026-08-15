@@ -1,0 +1,6 @@
+.build/
+.derivedData*/
+.simulator-typecheck/
+.swift-build-*/
+.swiftpm/
+*.log

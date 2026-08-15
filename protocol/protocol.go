@@ -23,6 +23,8 @@ const (
 
 	MaxWebSocketFrameBytes   = 32 * 1024
 	MaxRelayPayloadBytes     = 16 * 1024
+	MaxRelayReorderFrames    = 8
+	MaxRelayReorderBytes     = MaxRelayPayloadBytes * MaxRelayReorderFrames
 	MaxControlPlaintextBytes = MaxRelayPayloadBytes - 16
 	MaxPairingPlaintextBytes = (MaxRelayPayloadBytes-23)/2 - 40
 	PairingTTLSeconds        = 5 * 60
