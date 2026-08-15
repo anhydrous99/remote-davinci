@@ -122,8 +122,9 @@ export class RendezvousRelayStack extends Stack {
 
     table.grant(
       relayHandler,
+      'dynamodb:DeleteItem',
       'dynamodb:GetItem',
-      'dynamodb:TransactWriteItems',
+      'dynamodb:PutItem',
       'dynamodb:UpdateItem',
     );
 
@@ -164,6 +165,11 @@ export class RendezvousRelayStack extends Stack {
       webSocketApi: api,
     });
     const cfnStage = stage.node.defaultChild as apigwv2.CfnStage;
+    for (const route of api.node.findAll()) {
+      if (route instanceof apigwv2.CfnRoute) {
+        cfnStage.addResourceDependency(route);
+      }
+    }
     if (accessLogging) {
       const accessLogs = new logs.LogGroup(this, 'AccessLogs', {
         removalPolicy,

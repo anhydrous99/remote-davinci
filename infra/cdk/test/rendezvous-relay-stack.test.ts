@@ -37,6 +37,21 @@ describe('RendezvousRelayStack', () => {
     stack.resourceCountIs('AWS::EC2::VPC', 0);
     stack.resourceCountIs('AWS::Cognito::UserPool', 0);
 
+    const resources = stack.toJSON().Resources as Record<
+      string,
+      { DependsOn?: string[]; Type: string }
+    >;
+    const routeIds = Object.entries(resources)
+      .filter(([, resource]) => resource.Type === 'AWS::ApiGatewayV2::Route')
+      .map(([id]) => id);
+    const renderedStage = Object.values(resources).find(
+      (resource) => resource.Type === 'AWS::ApiGatewayV2::Stage',
+    );
+    assert.ok(renderedStage);
+    for (const routeId of routeIds) {
+      assert.ok(renderedStage.DependsOn?.includes(routeId));
+    }
+
     stack.hasResourceProperties('AWS::DynamoDB::Table', {
       BillingMode: 'PAY_PER_REQUEST',
       KeySchema: [
@@ -176,9 +191,11 @@ describe('RendezvousRelayStack', () => {
     const rendered = JSON.stringify(policies);
 
     assert.match(rendered, /execute-api:ManageConnections/);
+    assert.match(rendered, /dynamodb:DeleteItem/);
     assert.match(rendered, /dynamodb:GetItem/);
-    assert.doesNotMatch(rendered, /dynamodb:DeleteItem/);
-    assert.doesNotMatch(rendered, /dynamodb:PutItem/);
+    assert.match(rendered, /dynamodb:PutItem/);
+    assert.match(rendered, /dynamodb:UpdateItem/);
+    assert.doesNotMatch(rendered, /dynamodb:TransactWriteItems/);
     assert.doesNotMatch(rendered, /dynamodb:Query/);
     assert.doesNotMatch(rendered, /dynamodb:Scan/);
     assert.doesNotMatch(JSON.stringify(json.Resources), /ApiGatewayV2::Authorizer/);
