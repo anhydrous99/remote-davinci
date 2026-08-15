@@ -78,19 +78,28 @@
         "role": { "enum": ["controller", "companion"] }
       }
     },
-    "relayBody": {
+    "framePayload": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 21846,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "pairFrameBody": {
       "type": "object",
-      "required": ["channel", "channelId", "seq", "payload"],
+      "required": ["pairId", "seq", "payload"],
       "properties": {
-        "channel": { "enum": ["pair", "session"] },
-        "channelId": { "$ref": "#/$defs/uuid" },
+        "pairId": { "$ref": "#/$defs/uuid" },
         "seq": { "$ref": "#/$defs/sequence" },
-        "payload": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 21846,
-          "pattern": "^[A-Za-z0-9_-]+$"
-        }
+        "payload": { "$ref": "#/$defs/framePayload" }
+      }
+    },
+    "sessionFrameBody": {
+      "type": "object",
+      "required": ["sessionId", "seq", "payload"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "seq": { "$ref": "#/$defs/sequence" },
+        "payload": { "$ref": "#/$defs/framePayload" }
       }
     },
     "systemHello": {
@@ -190,14 +199,26 @@
         }
       ]
     },
-    "relayFrame": {
+    "pairFrame": {
       "allOf": [
         { "$ref": "#/$defs/baseEnvelope" },
         {
           "type": "object",
           "properties": {
-            "type": { "const": "relay.frame" },
-            "body": { "$ref": "#/$defs/relayBody" }
+            "type": { "const": "pair.frame" },
+            "body": { "$ref": "#/$defs/pairFrameBody" }
+          }
+        }
+      ]
+    },
+    "sessionFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "session.frame" },
+            "body": { "$ref": "#/$defs/sessionFrameBody" }
           }
         }
       ]
@@ -403,18 +424,6 @@
                   "type": "object",
                   "required": ["requestType", "result"],
                   "properties": {
-                    "requestType": { "const": "relay.frame" },
-                    "result": {
-                      "type": "object",
-                      "required": ["delivered"],
-                      "properties": { "delivered": { "const": true } }
-                    }
-                  }
-                },
-                {
-                  "type": "object",
-                  "required": ["requestType", "result"],
-                  "properties": {
                     "requestType": { "const": "link.get" },
                     "result": {
                       "type": "object",
@@ -460,11 +469,8 @@
                     "requestType": { "const": "endpoint.revoke" },
                     "result": {
                       "type": "object",
-                      "required": ["revoked", "linksRevoked"],
-                      "properties": {
-                        "revoked": { "const": true },
-                        "linksRevoked": { "type": "integer", "minimum": 0 }
-                      }
+                      "required": ["revoked"],
+                      "properties": { "revoked": { "const": true } }
                     }
                   }
                 },
@@ -658,13 +664,14 @@
         { "$ref": "#/$defs/pairJoin" },
         { "$ref": "#/$defs/pairCommit" },
         { "$ref": "#/$defs/pairCancel" },
-        { "$ref": "#/$defs/relayFrame" },
+        { "$ref": "#/$defs/pairFrame" },
         { "$ref": "#/$defs/linkGet" },
         { "$ref": "#/$defs/linkRevoke" },
         { "$ref": "#/$defs/endpointRotate" },
         { "$ref": "#/$defs/endpointRevoke" },
         { "$ref": "#/$defs/sessionOpen" },
-        { "$ref": "#/$defs/sessionClose" }
+        { "$ref": "#/$defs/sessionClose" },
+        { "$ref": "#/$defs/sessionFrame" }
       ]
     },
     "serverEnvelope": {
@@ -674,9 +681,10 @@
         { "$ref": "#/$defs/pairReady" },
         { "$ref": "#/$defs/pairCompleted" },
         { "$ref": "#/$defs/pairClosed" },
-        { "$ref": "#/$defs/relayFrame" },
+        { "$ref": "#/$defs/pairFrame" },
         { "$ref": "#/$defs/sessionOpened" },
         { "$ref": "#/$defs/sessionClosed" },
+        { "$ref": "#/$defs/sessionFrame" },
         { "$ref": "#/$defs/linkRevoked" }
       ]
     }

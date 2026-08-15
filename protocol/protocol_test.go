@@ -66,6 +66,18 @@ func TestRendezvousFixturesAndMessageTypes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		switch envelope.Type {
+		case "pair.frame":
+			var body PairFrameBody
+			if err := envelope.DecodeBody(&body); err != nil || body.PairID == "" {
+				t.Fatalf("pair frame body = %#v, error = %v", body, err)
+			}
+		case "session.frame":
+			var body SessionFrameBody
+			if err := envelope.DecodeBody(&body); err != nil || body.SessionID == "" {
+				t.Fatalf("session frame body = %#v, error = %v", body, err)
+			}
+		}
 		clientTypes = append(clientTypes, envelope.Type)
 	}
 	if !reflect.DeepEqual(clientTypes, ClientMessageTypes) {
@@ -87,16 +99,32 @@ func TestRendezvousFixturesAndMessageTypes(t *testing.T) {
 	if _, err := ParseClient(extended); err != nil {
 		t.Fatal(err)
 	}
+	frameCount := 0
+	for _, frame := range values.Client {
+		extended = rawObject(t, frame)
+		messageType, _ := extended["type"].(string)
+		if messageType != "pair.frame" && messageType != "session.frame" {
+			continue
+		}
+		extended["body"].(map[string]any)["futureField"] = true
+		if _, err := ParseClient(extended); err != nil {
+			t.Fatalf("%s with future body field: %v", messageType, err)
+		}
+		frameCount++
+	}
+	if frameCount != 2 {
+		t.Fatalf("got %d frame fixtures, want 2", frameCount)
+	}
 }
 
 func TestSchemaValidIntegerSpellings(t *testing.T) {
 	for _, spelling := range []string{"1.0", "1e0"} {
-		clientJSON := strings.ReplaceAll(`{"protocol":"remote-davinci.rendezvous","v":NUMBER,"type":"relay.frame","id":"00000000-0000-4000-8000-000000000007","body":{"channel":"pair","channelId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","seq":NUMBER,"payload":"AQ"}}`, "NUMBER", spelling)
+		clientJSON := strings.ReplaceAll(`{"protocol":"remote-davinci.rendezvous","v":NUMBER,"type":"pair.frame","id":"00000000-0000-4000-8000-000000000007","body":{"pairId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","seq":NUMBER,"payload":"AQ"}}`, "NUMBER", spelling)
 		client, err := ParseClient(clientJSON)
 		if err != nil {
 			t.Fatalf("%s client: %v", spelling, err)
 		}
-		var frame RelayFrameBody
+		var frame PairFrameBody
 		if err := client.DecodeBody(&frame); err != nil || client.V != 1 || frame.Seq != 1 {
 			t.Fatalf("%s client = %#v, body = %#v, error = %v", spelling, client, frame, err)
 		}
@@ -117,19 +145,24 @@ func TestOKResponsesCorrelateRequiredResults(t *testing.T) {
 		"pair.join":       map[string]any{"pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "sideId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "expiresAt": 1786723500},
 		"pair.commit":     map[string]any{"pending": true},
 		"pair.cancel":     map[string]any{"cancelled": true},
-		"relay.frame":     map[string]any{"delivered": true},
 		"link.get":        map[string]any{"linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "peerEndpointId": "22222222-2222-4222-8222-222222222222", "peerRole": "companion", "status": "active"},
 		"link.revoke":     map[string]any{"revoked": true},
 		"endpoint.rotate": map[string]any{"rotated": true},
-		"endpoint.revoke": map[string]any{"revoked": true, "linksRevoked": 1},
+		"endpoint.revoke": map[string]any{"revoked": true},
 		"session.open":    map[string]any{"sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
 		"session.close":   map[string]any{"closed": true},
 	}
-	if len(results) != len(ClientMessageTypes) {
-		t.Fatalf("results cover %d of %d request types", len(results), len(ClientMessageTypes))
+	if len(results) != len(ClientMessageTypes)-2 {
+		t.Fatalf("results cover %d of %d request types with responses", len(results), len(ClientMessageTypes)-2)
 	}
 	for _, requestType := range ClientMessageTypes {
-		result := results[requestType].(map[string]any)
+		if requestType == "pair.frame" || requestType == "session.frame" {
+			continue
+		}
+		result, expectsOK := results[requestType].(map[string]any)
+		if !expectsOK {
+			t.Fatalf("missing ok result for %s", requestType)
+		}
 		result["futureField"] = true
 		_, err := ParseServer(map[string]any{
 			"protocol": ProtocolName, "v": 1, "type": "ok",
@@ -140,6 +173,15 @@ func TestOKResponsesCorrelateRequiredResults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", requestType, err)
 		}
+	}
+	for _, requestType := range []string{"pair.frame", "session.frame"} {
+		_, err := ParseServer(map[string]any{
+			"protocol": ProtocolName, "v": 1, "type": "ok",
+			"id":      "10000000-0000-4000-8000-000000000010",
+			"replyTo": "00000000-0000-4000-8000-000000000001",
+			"body":    map[string]any{"requestType": requestType, "result": map[string]any{"delivered": true}},
+		})
+		requireCode(t, InvalidMessage, err)
 	}
 	malformed := rawObject(t, fixtures(t).Server[0])
 	malformed["body"].(map[string]any)["result"] = map[string]any{}
@@ -244,6 +286,18 @@ func TestMalformedFramesAndPayloadLimits(t *testing.T) {
 	nonCanonical := rawObject(t, values.Client[6])
 	nonCanonical["body"].(map[string]any)["payload"] = "AB"
 	_, err = ParseClient(nonCanonical)
+	requireCode(t, InvalidMessage, err)
+	legacy := map[string]any{
+		"protocol": ProtocolName,
+		"v":        1,
+		"type":     "relay.frame",
+		"id":       "00000000-0000-4000-8000-000000000007",
+		"body": map[string]any{
+			"channel": "pair", "channelId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+			"seq": 1, "payload": "AQ",
+		},
+	}
+	_, err = ParseClient(legacy)
 	requireCode(t, InvalidMessage, err)
 	metadataLeak := rawObject(t, values.Client[4])
 	metadataLeak["body"].(map[string]any)["peer"].(map[string]any)["noiseKey"] = strings.Repeat("A", 43)

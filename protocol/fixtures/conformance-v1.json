@@ -62,11 +62,10 @@
     {
       "protocol": "remote-davinci.rendezvous",
       "v": 1,
-      "type": "relay.frame",
+      "type": "pair.frame",
       "id": "00000000-0000-4000-8000-000000000007",
       "body": {
-        "channel": "pair",
-        "channelId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "seq": 1,
         "payload": "AQ"
       }
@@ -112,6 +111,17 @@
       "type": "session.close",
       "id": "00000000-0000-4000-8000-000000000013",
       "body": { "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "session.frame",
+      "id": "00000000-0000-4000-8000-000000000014",
+      "body": {
+        "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "seq": 1,
+        "payload": "AQ"
+      }
     }
   ],
   "server": [
@@ -175,11 +185,10 @@
     {
       "protocol": "remote-davinci.rendezvous",
       "v": 1,
-      "type": "relay.frame",
+      "type": "pair.frame",
       "id": "10000000-0000-4000-8000-000000000006",
       "body": {
-        "channel": "session",
-        "channelId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "seq": 1,
         "payload": "AQ"
       }
@@ -203,6 +212,17 @@
       "body": {
         "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         "reason": "peer-disconnected"
+      }
+    },
+    {
+      "protocol": "remote-davinci.rendezvous",
+      "v": 1,
+      "type": "session.frame",
+      "id": "10000000-0000-4000-8000-000000000010",
+      "body": {
+        "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "seq": 1,
+        "payload": "AQ"
       }
     },
     {
@@ -325,15 +345,14 @@
       }
     },
     {
-      "name": "padded relay payload",
+      "name": "padded frame payload",
       "frame": {
         "protocol": "remote-davinci.rendezvous",
         "v": 1,
-        "type": "relay.frame",
+        "type": "session.frame",
         "id": "00000000-0000-4000-8000-000000000001",
         "body": {
-          "channel": "session",
-          "channelId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          "sessionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
           "seq": 1,
           "payload": "AQ=="
         }

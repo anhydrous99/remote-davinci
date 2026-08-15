@@ -1,10 +1,6 @@
 package relay
 
-import (
-	"reflect"
-
-	"github.com/anhydrous99/remote-davinci/protocol"
-)
+import "github.com/anhydrous99/remote-davinci/protocol"
 
 type Connection struct {
 	ConnectionID string `dynamodbav:"connectionId"`
@@ -12,7 +8,6 @@ type Connection struct {
 	EndpointID   string `dynamodbav:"endpointId,omitempty"`
 	SourceKey    string `dynamodbav:"sourceKey"`
 	PairingID    string `dynamodbav:"pairingId,omitempty"`
-	SessionID    string `dynamodbav:"sessionId,omitempty"`
 	ConnectedAt  int64  `dynamodbav:"connectedAt"`
 	ExpiresAt    int64  `dynamodbav:"expiresAt"`
 }
@@ -60,7 +55,6 @@ type Pair struct {
 	SideB     *PairSide   `dynamodbav:"sideB,omitempty"`
 	CommitA   *PairCommit `dynamodbav:"commitA,omitempty"`
 	CommitB   *PairCommit `dynamodbav:"commitB,omitempty"`
-	Version   int64       `dynamodbav:"version"`
 	ExpiresAt int64       `dynamodbav:"expiresAt"`
 }
 
@@ -92,10 +86,19 @@ type CloseSessionResult struct {
 	ClosedNow bool
 }
 
+type DisconnectResult struct {
+	Connection Connection
+	Session    *CloseSessionResult
+}
+
+type RevokeLinkResult struct {
+	Link    Link
+	Session *CloseSessionResult
+}
+
 type RevokeEndpointResult struct {
 	Endpoint Endpoint
-	Links    []Link
-	Sessions []Session
+	Session  *CloseSessionResult
 }
 
 type CommitPairResult struct {
@@ -117,13 +120,7 @@ func retryableError(code protocol.ErrorCode) *ServiceError {
 	return &ServiceError{Code: code, Retryable: true}
 }
 
-func isExpired(record interface{ Expiry() int64 }, now int64) bool { return record.Expiry() <= now }
-
-func (connection Connection) Expiry() int64 { return connection.ExpiresAt }
-func (pair Pair) Expiry() int64             { return pair.ExpiresAt }
-func (session Session) Expiry() int64       { return session.ExpiresAt }
-
-func SameCommit(a, b PairCommit) bool { return reflect.DeepEqual(a, b) }
+func SameCommit(a, b PairCommit) bool { return a == b }
 
 func ReciprocalCommits(a, b PairCommit) bool {
 	return a.LinkID == b.LinkID &&

@@ -33,12 +33,12 @@ const (
 var (
 	ClientMessageTypes = []string{
 		"system.hello", "system.ping", "pair.create", "pair.join", "pair.commit",
-		"pair.cancel", "relay.frame", "link.get", "link.revoke", "endpoint.rotate",
-		"endpoint.revoke", "session.open", "session.close",
+		"pair.cancel", "pair.frame", "link.get", "link.revoke", "endpoint.rotate",
+		"endpoint.revoke", "session.open", "session.close", "session.frame",
 	}
 	ServerMessageTypes = []string{
-		"ok", "error", "pair.ready", "pair.completed", "pair.closed", "relay.frame",
-		"session.opened", "session.closed", "link.revoked",
+		"ok", "error", "pair.ready", "pair.completed", "pair.closed", "pair.frame",
+		"session.opened", "session.closed", "session.frame", "link.revoked",
 	}
 	ControlMessageTypes = []string{"hello", "request", "response", "event"}
 	ErrorCodes          = []ErrorCode{
@@ -72,13 +72,6 @@ type DeviceRole string
 const (
 	Controller DeviceRole = "controller"
 	Companion  DeviceRole = "companion"
-)
-
-type RelayChannel string
-
-const (
-	PairChannel    RelayChannel = "pair"
-	SessionChannel RelayChannel = "session"
 )
 
 type Envelope struct {
@@ -142,11 +135,16 @@ type PairCommitBody struct {
 	Peer   RoutingEndpoint `json:"peer"`
 }
 
-type RelayFrameBody struct {
-	Channel   RelayChannel `json:"channel"`
-	ChannelID string       `json:"channelId"`
-	Seq       int64        `json:"seq"`
-	Payload   string       `json:"payload"`
+type PairFrameBody struct {
+	PairID  string `json:"pairId"`
+	Seq     int64  `json:"seq"`
+	Payload string `json:"payload"`
+}
+
+type SessionFrameBody struct {
+	SessionID string `json:"sessionId"`
+	Seq       int64  `json:"seq"`
+	Payload   string `json:"payload"`
 }
 
 type PairingIdentityBody struct {

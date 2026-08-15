@@ -5,10 +5,10 @@ import {
   Duration,
   RemovalPolicy,
   Stack,
+  Tags,
   type StackProps,
 } from 'aws-cdk-lib';
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
-import * as authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
@@ -19,6 +19,8 @@ import type { Construct } from 'constructs';
 
 export interface RendezvousRelayStackProps extends StackProps {
   readonly environment: 'dev' | 'prod';
+  readonly accessLogs?: boolean;
+  readonly peakCapacity?: boolean;
 }
 
 export class RendezvousRelayStack extends Stack {
@@ -26,7 +28,11 @@ export class RendezvousRelayStack extends Stack {
     super(scope, id, props);
 
     const production = props.environment === 'prod';
+    const accessLogging = props.accessLogs ?? !production;
+    const peakCapacity = production && (props.peakCapacity ?? false);
     const removalPolicy = production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
+    Tags.of(this).add('Project', 'remote-davinci');
+    Tags.of(this).add('Environment', props.environment);
     const repositoryRoot = path.join(__dirname, '../../../..');
     const goCode = (name: string, command: string): lambda.Code => {
       const output = path.join(repositoryRoot, '.build', name);
@@ -62,6 +68,20 @@ export class RendezvousRelayStack extends Stack {
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       deletionProtection: production,
       encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      ...(production
+        ? {
+            maxReadRequestUnits: 30_000,
+            maxWriteRequestUnits: 5_000,
+          }
+        : {}),
+      ...(peakCapacity
+        ? {
+            warmThroughput: {
+              readUnitsPerSecond: 25_000,
+              writeUnitsPerSecond: 5_000,
+            },
+          }
+        : {}),
       partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
       pointInTimeRecoverySpecification: {
         pointInTimeRecoveryEnabled: production,
@@ -76,22 +96,23 @@ export class RendezvousRelayStack extends Stack {
       environment: { TABLE_NAME: table.tableName },
       loggingFormat: lambda.LoggingFormat.JSON,
       memorySize: 256,
+      ...(production
+        ? {
+            applicationLogLevelV2: lambda.ApplicationLogLevel.WARN,
+            systemLogLevelV2: lambda.SystemLogLevel.WARN,
+          }
+        : {}),
+      ...(peakCapacity ? { reservedConcurrentExecutions: 4_500 } : {}),
       runtime: lambda.Runtime.PROVIDED_AL2023,
       timeout: Duration.seconds(10),
     } as const;
     const lambdaLogProps = {
       removalPolicy,
       retention: production
-        ? logs.RetentionDays.THREE_MONTHS
-        : logs.RetentionDays.ONE_WEEK,
+        ? logs.RetentionDays.ONE_MONTH
+        : logs.RetentionDays.THREE_DAYS,
     } as const;
 
-    const authorizerHandler = new lambda.Function(this, 'AuthorizerHandler', {
-      ...lambdaDefaults,
-      code: goCode('authorizer', './services/rendezvous-relay/cmd/authorizer'),
-      handler: 'bootstrap',
-      logGroup: new logs.LogGroup(this, 'AuthorizerLogs', lambdaLogProps),
-    });
     const relayHandler = new lambda.Function(this, 'RelayHandler', {
       ...lambdaDefaults,
       code: goCode('relay', './services/rendezvous-relay/cmd/relay'),
@@ -99,25 +120,15 @@ export class RendezvousRelayStack extends Stack {
       logGroup: new logs.LogGroup(this, 'RelayLogs', lambdaLogProps),
     });
 
-    table.grant(authorizerHandler, 'dynamodb:GetItem');
     table.grant(
       relayHandler,
-      'dynamodb:DeleteItem',
       'dynamodb:GetItem',
-      'dynamodb:PutItem',
-      'dynamodb:Query',
       'dynamodb:TransactWriteItems',
       'dynamodb:UpdateItem',
     );
 
-    const authorizer = new authorizers.WebSocketLambdaAuthorizer(
-      'ConnectAuthorizer',
-      authorizerHandler,
-      { identitySource: ['route.request.header.Authorization'] },
-    );
     const api = new apigwv2.WebSocketApi(this, 'Api', {
       connectRouteOptions: {
-        authorizer,
         integration: new integrations.WebSocketLambdaIntegration(
           'ConnectIntegration',
           relayHandler,
@@ -128,6 +139,7 @@ export class RendezvousRelayStack extends Stack {
           'DefaultIntegration',
           relayHandler,
         ),
+        returnResponse: true,
       },
       disconnectRouteOptions: {
         integration: new integrations.WebSocketLambdaIntegration(
@@ -137,14 +149,14 @@ export class RendezvousRelayStack extends Stack {
       },
       routeSelectionExpression: '$request.body.type',
     });
-
-    const accessLogs = new logs.LogGroup(this, 'AccessLogs', {
-      removalPolicy,
-      retention: production
-        ? logs.RetentionDays.THREE_MONTHS
-        : logs.RetentionDays.ONE_WEEK,
-    });
-    accessLogs.grantWrite(new iam.ServicePrincipal('apigateway.amazonaws.com'));
+    for (const route of ['pair.frame', 'session.frame']) {
+      api.addRoute(route, {
+        integration: new integrations.WebSocketLambdaIntegration(
+          `${route}Integration`,
+          relayHandler,
+        ),
+      });
+    }
 
     const stage = new apigwv2.WebSocketStage(this, 'Stage', {
       autoDeploy: true,
@@ -152,22 +164,44 @@ export class RendezvousRelayStack extends Stack {
       webSocketApi: api,
     });
     const cfnStage = stage.node.defaultChild as apigwv2.CfnStage;
-    cfnStage.accessLogSettings = {
-      destinationArn: accessLogs.logGroupArn,
-      format: JSON.stringify({
-        apiId: '$context.apiId',
-        connectionId: '$context.connectionId',
-        error: '$context.error.message',
-        requestId: '$context.requestId',
-        routeKey: '$context.routeKey',
-        status: '$context.status',
-      }),
-    };
+    if (accessLogging) {
+      const accessLogs = new logs.LogGroup(this, 'AccessLogs', {
+        removalPolicy,
+        retention: production
+          ? logs.RetentionDays.ONE_WEEK
+          : logs.RetentionDays.THREE_DAYS,
+      });
+      accessLogs.grantWrite(new iam.ServicePrincipal('apigateway.amazonaws.com'));
+      cfnStage.accessLogSettings = {
+        destinationArn: accessLogs.logGroupArn,
+        format: JSON.stringify({
+          error: '$context.error.message',
+          requestId: '$context.requestId',
+          routeKey: '$context.routeKey',
+          status: '$context.status',
+        }),
+      };
+    }
     cfnStage.defaultRouteSettings = {
       dataTraceEnabled: false,
-      detailedMetricsEnabled: true,
-      throttlingBurstLimit: 100,
-      throttlingRateLimit: 50,
+      detailedMetricsEnabled: false,
+    };
+    // CDK passes the untyped route-settings map through without normalizing keys.
+    const routeSettings = (rate: number, burst: number) => ({
+      DataTraceEnabled: false,
+      DetailedMetricsEnabled: false,
+      ThrottlingBurstLimit: burst,
+      ThrottlingRateLimit: rate,
+    });
+    cfnStage.routeSettings = {
+      '$connect': routeSettings(production ? 400 : 50, production ? 500 : 100),
+      '$default': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
+      '$disconnect': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
+      'pair.frame': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
+      'session.frame': routeSettings(
+        peakCapacity ? 25_000 : production ? 4_000 : 50,
+        peakCapacity ? 50_000 : production ? 5_000 : 100,
+      ),
     };
 
     relayHandler.addToRolePolicy(
@@ -183,30 +217,25 @@ export class RendezvousRelayStack extends Stack {
       }),
     );
 
-    for (const [name, fn] of [
-      ['Authorizer', authorizerHandler],
-      ['Relay', relayHandler],
-    ] as const) {
-      new cloudwatch.Alarm(this, `${name}Errors`, {
-        alarmDescription: `${name} Lambda reported an error`,
-        evaluationPeriods: 1,
-        metric: fn.metricErrors({ period: Duration.minutes(5) }),
-        threshold: 1,
-      });
-      new cloudwatch.Alarm(this, `${name}Throttles`, {
-        alarmDescription: `${name} Lambda was throttled`,
-        evaluationPeriods: 1,
-        metric: fn.metricThrottles({ period: Duration.minutes(5) }),
-        threshold: 1,
-      });
-    }
+    new cloudwatch.Alarm(this, 'RelayErrors', {
+      alarmDescription: 'Relay Lambda reported an error',
+      evaluationPeriods: 1,
+      metric: relayHandler.metricErrors({ period: Duration.minutes(5) }),
+      threshold: 1,
+    });
+    new cloudwatch.Alarm(this, 'RelayThrottles', {
+      alarmDescription: 'Relay Lambda was throttled',
+      evaluationPeriods: 1,
+      metric: relayHandler.metricThrottles({ period: Duration.minutes(5) }),
+      threshold: 1,
+    });
 
-    new cloudwatch.Alarm(this, 'ApiServerErrors', {
-      alarmDescription: 'WebSocket API returned a 5xx response',
+    new cloudwatch.Alarm(this, 'ApiExecutionErrors', {
+      alarmDescription: 'WebSocket API failed to execute an integration',
       evaluationPeriods: 1,
       metric: new cloudwatch.Metric({
         dimensionsMap: { ApiId: api.apiId, Stage: stage.stageName },
-        metricName: '5XXError',
+        metricName: 'ExecutionError',
         namespace: 'AWS/ApiGateway',
         period: Duration.minutes(5),
         statistic: 'Sum',
@@ -218,10 +247,7 @@ export class RendezvousRelayStack extends Stack {
       evaluationPeriods: 1,
       metric: table.metricThrottledRequestsForOperations({
         operations: [
-          dynamodb.Operation.DELETE_ITEM,
           dynamodb.Operation.GET_ITEM,
-          dynamodb.Operation.PUT_ITEM,
-          dynamodb.Operation.QUERY,
           dynamodb.Operation.TRANSACT_WRITE_ITEMS,
           dynamodb.Operation.UPDATE_ITEM,
         ],

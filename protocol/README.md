@@ -44,7 +44,7 @@ Authorization: Bearer rd1.<endpointId>.<secret>
 
 `secret` is 32 cryptographically random bytes encoded as 43 unpadded base64url characters. `credentialHash` is unpadded base64url of `SHA-256(raw secret bytes)`, not a hash of the encoded string. Clients store the secret in platform secure storage. AWS stores only the hash.
 
-A pairing connection may call `system.*`, `pair.*`, and `relay.frame` for its assigned pairing channel. A bearer connection may call `system.*`, `link.*`, `endpoint.*`, `session.*`, and `relay.frame` for its assigned session. Every privileged operation rechecks current endpoint and link revocation state because API Gateway authorizes only during `$connect`.
+A pairing connection may call `system.*`, pairing lifecycle messages, and `pair.frame` for its assigned pair. A bearer connection may call `system.*`, `link.*`, `endpoint.*`, session lifecycle messages, and `session.frame` for its assigned session. Lifecycle operations recheck the current endpoint and link records. Session forwarding strongly reads the authoritative session route; revocation and connection replacement close that route transactionally before they return.
 
 ## Outer messages
 
@@ -56,13 +56,14 @@ A pairing connection may call `system.*`, `pair.*`, and `relay.frame` for its as
 | `pair.join` | `{ locator }` | `{ pairId, sideId, expiresAt }` |
 | `pair.commit` | `{ pairId, sideId, linkId, self, peer }` | `{ pending: true }` or `{ linkId, active: true }` |
 | `pair.cancel` | `{ pairId }` | `{ cancelled: true }` |
-| `relay.frame` | `{ channel, channelId, seq, payload }` | `{ delivered: true }` |
+| `pair.frame` | `{ pairId, seq, payload }` | None (one-way) |
 | `link.get` | `{ linkId }` | `{ linkId, peerEndpointId, peerRole, status, revokedAt? }` |
 | `link.revoke` | `{ linkId }` | `{ revoked: true }` |
 | `endpoint.rotate` | `{ credentialHash }` | `{ rotated: true }` |
-| `endpoint.revoke` | `{}` | `{ revoked: true, linksRevoked }` |
+| `endpoint.revoke` | `{}` | `{ revoked: true }` |
 | `session.open` | `{ linkId }` | `{ sessionId }` |
 | `session.close` | `{ sessionId }` | `{ closed: true }` |
+| `session.frame` | `{ sessionId, seq, payload }` | None (one-way) |
 
 `pair.commit.self` is `{ endpointId, role, credentialHash }`; `peer` is only `{ endpointId, role }`. These three objects reject extra fields so peer keys, labels, permissions, and capabilities cannot be persisted accidentally. The two commits must use the same `pairId`, `linkId`, opposite roles, and cross-matching endpoint IDs and roles. Each side supplies only its own credential hash.
 
@@ -71,12 +72,13 @@ Server events are:
 - `pair.ready { pairId, peerSideId, expiresAt }`
 - `pair.completed { pairId, linkId, peerEndpointId, peerRole }`
 - `pair.closed { pairId, reason }`
-- `relay.frame { channel, channelId, seq, payload }`
+- `pair.frame { pairId, seq, payload }`
 - `session.opened { sessionId, linkId, peerEndpointId }`
 - `session.closed { sessionId, reason }`
+- `session.frame { sessionId, seq, payload }`
 - `link.revoked { linkId }`
 
-The stable outer errors are exported as `ERROR_CODES`. A relay `ok` means only that AWS accepted and posted the ciphertext to the peer connection; it does not mean the peer decrypted or applied it.
+The stable outer errors are exported as `ErrorCodes`. Successful frame forwarding has no correlated `ok` response. A correlated `error` reports that AWS rejected or could not forward the frame; it says nothing about whether a peer decrypted or applied ciphertext already posted successfully.
 
 ## One-time pairing profile
 
@@ -97,7 +99,7 @@ The joining client sends only the six digits to `pair.join`. Both clients use th
 Use a reviewed implementation compatible with Magic Wormhole's `python-spake2==0.9` client-to-client profile; do not independently invent the curve or point encoding.
 
 1. Run symmetric SPAKE2 with password bytes equal to NFC UTF-8 of the canonical code and `idSymmetric` equal to UTF-8 `remote-davinci/pair/v1`.
-2. A client-to-client wire message is compact UTF-8 JSON `{ "phase": "...", "body": "..." }`. Encode those bytes as the outer relay frame's base64url `payload`. `phase` is `pake`, `version`, or a canonical decimal application sequence beginning at `0`; `body` is lowercase, even-length hexadecimal.
+2. A client-to-client wire message is compact UTF-8 JSON `{ "phase": "...", "body": "..." }`. Encode those bytes as the outer `pair.frame` base64url `payload`. `phase` is `pake`, `version`, or a canonical decimal application sequence beginning at `0`; `body` is lowercase, even-length hexadecimal.
 3. For `pake`, `body` decodes to UTF-8 JSON `{ "pake_v1": "<lowercase hex SPAKE message>" }`.
 4. Let the SPAKE output be `K`. For every encrypted message derive a 32-byte phase key with RFC 5869 HKDF-SHA256: input key `K`, no salt, and info `ASCII("wormhole:phase:") || SHA256(ASCII(senderSideId)) || SHA256(ASCII(phase))`.
 5. Encrypt `version` and numeric phases with NaCl SecretBox (XSalsa20-Poly1305), using a fresh random 24-byte nonce prepended to the authenticated ciphertext, then lowercase-hex encode the result into `body`.
@@ -111,7 +113,7 @@ The compact phase-`0` wrapper plus SecretBox and hex overhead limits the decrypt
 
 Private service credentials and the local Noise static private key belong in Keychain or the platform credential store. Normal local app storage holds the peer endpoint ID, peer Noise static public key and fingerprint, local display name, negotiated permissions/capabilities, protocol version, and revocation state. Credential loss or an unexpected peer key requires pairing again; a changed peer key is never silently accepted.
 
-An authenticated controller opens a live session by link ID. The service permits one active session per companion and emits `session.opened` to both sides. Each direction starts outer `seq` at `1`. A receiver discards a duplicate sequence before Noise processing and closes on a gap.
+An authenticated controller opens a live session by link ID. The service permits one active session per endpoint and link and emits `session.opened` to both sides. Each direction starts outer `seq` at `1`. A receiver discards a duplicate sequence before Noise processing and closes on a gap.
 
 Use `Noise_IK_25519_ChaChaPoly_SHA256`, controller as initiator and companion as responder. The exact prologue bytes are:
 
@@ -119,7 +121,7 @@ Use `Noise_IK_25519_ChaChaPoly_SHA256`, controller as initiator and companion as
 UTF8("remote-davinci/session/v1\n" + linkId + "\n" + sessionId)
 ```
 
-`sessionNoisePrologue()` produces those bytes. Each endpoint must compare the authenticated remote static key to the key stored during pairing before enabling controls. One Noise handshake or transport message occupies one session relay payload. After the handshake, each transport plaintext is one compact UTF-8 control envelope; its maximum is 16,368 bytes to leave room for the 16-byte ChaChaPoly tag.
+`SessionNoisePrologue()` produces those bytes. Each endpoint must compare the authenticated remote static key to the key stored during pairing before enabling controls. One Noise handshake or transport message occupies one `session.frame` payload. After the handshake, each transport plaintext is one compact UTF-8 control envelope; its maximum is 16,368 bytes to leave room for the 16-byte ChaChaPoly tag.
 
 ## Encrypted control protocol
 
@@ -152,9 +154,9 @@ Raw keystrokes, arbitrary scripts, and direct Resolve network access are not pro
 - Relay forwarding is ordered only by explicit `seq`; AWS stores no payloads.
 - Outer `id` values correlate responses; the service does not persist them as idempotency records. After an uncertain `pair.create` or `pair.join`, close the socket and start a new pairing. After an uncertain `session.open`, accept a received `session.opened` event or reconnect and open a fresh session.
 - Socket loss closes the session and discards in-memory frames and response cache.
-- Reconnect uses full-jitter exponential backoff from one to sixty seconds, then creates a fresh service session and fresh Noise keys.
-- No relay frame or Resolve command is replayed into a replacement session.
-- Keepalive every five minutes avoids the ten-minute idle timeout. Reconnect before 110 minutes to stay below API Gateway's two-hour connection limit.
+- Reconnect uses full-jitter exponential backoff from one second to 15 minutes, then creates a fresh service session and fresh Noise keys.
+- No session frame or Resolve command is replayed into a replacement session.
+- Native WebSocket ping/pong every five minutes avoids the ten-minute idle timeout without an application message. `system.ping` is only an explicit health/clock diagnostic. Reconnect at a randomized age from 90 to 110 minutes to stay below API Gateway's two-hour connection limit.
 - Mobile suspension may make the controller unavailable. V1 reports offline state honestly and has no wake or deferred-delivery path.
 
 ## Runtime use

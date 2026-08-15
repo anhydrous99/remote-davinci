@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -22,7 +23,7 @@ const (
 //go:embed schemas/*.json
 var schemaFiles embed.FS
 
-var validators = compileSchemas()
+var validators = sync.OnceValue(compileSchemas)
 
 type compiledSchemas struct {
 	client, server, rendezvous, control, pairing, wormhole *jsonschema.Schema
@@ -59,7 +60,7 @@ func compileSchemas() compiledSchemas {
 }
 
 func ParseClient(input any) (ClientEnvelope, error) {
-	data, _, err := parse(input, validators.client, MaxWebSocketFrameBytes)
+	data, err := parse(input, validators().client, MaxWebSocketFrameBytes)
 	if err != nil {
 		return ClientEnvelope{}, err
 	}
@@ -74,7 +75,7 @@ func ParseClient(input any) (ClientEnvelope, error) {
 }
 
 func ParseServer(input any) (ServerEnvelope, error) {
-	data, _, err := parse(input, validators.server, MaxWebSocketFrameBytes)
+	data, err := parse(input, validators().server, MaxWebSocketFrameBytes)
 	if err != nil {
 		return ServerEnvelope{}, err
 	}
@@ -89,7 +90,7 @@ func ParseServer(input any) (ServerEnvelope, error) {
 }
 
 func ParseRendezvous(input any) (RendezvousEnvelope, error) {
-	data, _, err := parse(input, validators.rendezvous, MaxWebSocketFrameBytes)
+	data, err := parse(input, validators().rendezvous, MaxWebSocketFrameBytes)
 	if err != nil {
 		return RendezvousEnvelope{}, err
 	}
@@ -104,7 +105,7 @@ func ParseRendezvous(input any) (RendezvousEnvelope, error) {
 }
 
 func ParseControl(input any) (ControlEnvelope, error) {
-	data, _, err := parse(input, validators.control, MaxControlPlaintextBytes)
+	data, err := parse(input, validators().control, MaxControlPlaintextBytes)
 	if err != nil {
 		return ControlEnvelope{}, err
 	}
@@ -125,7 +126,7 @@ func ParseControl(input any) (ControlEnvelope, error) {
 }
 
 func ParsePairing(input any) (PairingIdentityEnvelope, error) {
-	data, _, err := parse(input, validators.pairing, MaxPairingPlaintextBytes)
+	data, err := parse(input, validators().pairing, MaxPairingPlaintextBytes)
 	if err != nil {
 		return PairingIdentityEnvelope{}, err
 	}
@@ -141,7 +142,7 @@ func ParsePairing(input any) (PairingIdentityEnvelope, error) {
 }
 
 func ParseWormhole(input any) (WormholeMessage, error) {
-	data, _, err := parse(input, validators.wormhole, MaxRelayPayloadBytes)
+	data, err := parse(input, validators().wormhole, MaxRelayPayloadBytes)
 	if err != nil {
 		return WormholeMessage{}, err
 	}
@@ -170,33 +171,33 @@ func ParseWormhole(input any) (WormholeMessage, error) {
 	return message, nil
 }
 
-func parse(input any, schema *jsonschema.Schema, maxBytes int) ([]byte, any, error) {
+func parse(input any, schema *jsonschema.Schema, maxBytes int) ([]byte, error) {
 	data, err := inputJSON(input)
 	if err != nil {
-		return nil, nil, validationError(InvalidMessage, "Protocol frame is not JSON-serializable")
+		return nil, validationError(InvalidMessage, "Protocol frame is not JSON-serializable")
 	}
 	if len(data) > maxBytes {
-		return nil, nil, validationError(PayloadTooLarge, "Protocol frame exceeds its byte limit")
+		return nil, validationError(PayloadTooLarge, "Protocol frame exceeds its byte limit")
 	}
 	value, err := jsonschema.UnmarshalJSON(bytes.NewReader(data))
 	if err != nil {
-		return nil, nil, validationError(InvalidMessage, "Protocol frame is not valid JSON")
+		return nil, validationError(InvalidMessage, "Protocol frame is not valid JSON")
 	}
-	if err := preflightRelayPayload(value); err != nil {
-		return nil, nil, err
+	if err := preflightFramePayload(value); err != nil {
+		return nil, err
 	}
 	if err := schema.Validate(value); err != nil {
 		if unsupportedVersion(value) {
-			return nil, nil, validationError(UnsupportedVersion, "Protocol version is not supported")
+			return nil, validationError(UnsupportedVersion, "Protocol version is not supported")
 		}
-		return nil, nil, validationError(InvalidMessage, "Protocol frame does not match the v1 contract", schemaIssues(err)...)
+		return nil, validationError(InvalidMessage, "Protocol frame does not match the v1 contract", schemaIssues(err)...)
 	}
 	value = normalizeIntegers(value)
 	data, err = json.Marshal(value)
 	if err != nil {
-		return nil, nil, validationError(InvalidMessage, "Protocol frame is not valid JSON")
+		return nil, validationError(InvalidMessage, "Protocol frame is not valid JSON")
 	}
-	return data, value, nil
+	return data, nil
 }
 
 func normalizeIntegers(value any) any {
@@ -268,9 +269,13 @@ func schemaIssues(err error) []string {
 	return issues
 }
 
-func preflightRelayPayload(value any) error {
+func preflightFramePayload(value any) error {
 	record, ok := value.(map[string]any)
-	if !ok || record["protocol"] != ProtocolName || record["type"] != "relay.frame" {
+	if !ok || record["protocol"] != ProtocolName {
+		return nil
+	}
+	messageType := record["type"]
+	if messageType != "pair.frame" && messageType != "session.frame" {
 		return nil
 	}
 	body, ok := record["body"].(map[string]any)
@@ -299,19 +304,6 @@ func rendezvousSemantics(envelope Envelope) error {
 		}
 		if body.Self.EndpointID == body.Peer.EndpointID || body.Self.Role == body.Peer.Role {
 			return validationError(InvalidMessage, "Pairing endpoints must be distinct and have opposite roles")
-		}
-	}
-	if envelope.Type == "relay.frame" {
-		var body RelayFrameBody
-		if err := envelope.DecodeBody(&body); err != nil {
-			return validationError(InvalidMessage, "Protocol frame does not match the v1 contract")
-		}
-		decoded, ok := canonicalBase64URL(body.Payload)
-		if !ok {
-			return validationError(InvalidMessage, "Relay payload must be canonical unpadded base64url")
-		}
-		if len(decoded) > MaxRelayPayloadBytes {
-			return validationError(PayloadTooLarge, "Decoded relay payload exceeds 16 KiB")
 		}
 	}
 	return nil

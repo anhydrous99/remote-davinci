@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -12,33 +13,17 @@ import (
 	"log/slog"
 	"math/big"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/anhydrous99/remote-davinci/protocol"
+	"github.com/aws/aws-lambda-go/events"
 )
 
-type WebSocketEvent struct {
-	Body           string                  `json:"body,omitempty"`
-	RequestContext WebSocketRequestContext `json:"requestContext"`
-}
-
-type WebSocketRequestContext struct {
-	RouteKey     string         `json:"routeKey"`
-	ConnectionID string         `json:"connectionId"`
-	DomainName   string         `json:"domainName,omitempty"`
-	Stage        string         `json:"stage,omitempty"`
-	Identity     SocketIdentity `json:"identity,omitempty"`
-	Authorizer   any            `json:"authorizer,omitempty"`
-}
-
-type SocketIdentity struct {
-	SourceIP string `json:"sourceIp,omitempty"`
-}
-
-type WebSocketResponse struct {
-	StatusCode int `json:"statusCode"`
-}
+type WebSocketEvent = events.APIGatewayWebsocketProxyRequest
+type WebSocketResponse = events.APIGatewayProxyResponse
 
 type Message struct {
 	Protocol string `json:"protocol"`
@@ -78,13 +63,7 @@ var (
 		"system.hello": true, "system.ping": true, "link.get": true, "link.revoke": true,
 		"endpoint.rotate": true, "endpoint.revoke": true, "session.open": true, "session.close": true,
 	}
-	knownErrors = func() map[protocol.ErrorCode]bool {
-		result := make(map[protocol.ErrorCode]bool, len(protocol.ErrorCodes))
-		for _, code := range protocol.ErrorCodes {
-			result[code] = true
-		}
-		return result
-	}()
+	requestIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
 func NewHandler(dependencies HandlerDependencies) *Handler {
@@ -125,7 +104,7 @@ func failure(replyTo string, failure error, id string) Message {
 	case errors.As(failure, &service):
 		code, retryable, retryAfter = service.Code, service.Retryable, service.RetryAfterMS
 	}
-	if !knownErrors[code] {
+	if !slices.Contains(protocol.ErrorCodes, code) {
 		code, retryable = protocol.Internal, true
 	}
 	body := map[string]any{"code": code, "retryable": retryable}
@@ -163,6 +142,16 @@ func SourceKey(sourceIP string) string {
 	return base64.RawURLEncoding.EncodeToString(digest[:])
 }
 
+func credentialDigest(secret string) string {
+	decoded, _ := base64.RawURLEncoding.DecodeString(secret)
+	digest := sha256.Sum256(decoded)
+	return base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
+func constantTimeEqual(left, right string) bool {
+	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
 func (h *Handler) notify(ctx context.Context, connectionID string, message Message, event WebSocketEvent) (bool, error) {
 	if connectionID == "" {
 		return false, nil
@@ -190,144 +179,136 @@ func (h *Handler) notifyEndpoint(ctx context.Context, endpointID string, message
 	return err
 }
 
-func (h *Handler) closeAndNotify(ctx context.Context, sessionID, endpointID, reason string, event WebSocketEvent, skipConnectionID string) (*CloseSessionResult, error) {
-	result, err := h.store.CloseSession(ctx, sessionID, endpointID, h.now())
-	if err != nil || result == nil {
-		return result, err
+func (h *Handler) notifyClosedSession(ctx context.Context, result *CloseSessionResult, reason string, event WebSocketEvent, skipConnectionID string) error {
+	if result == nil || !result.ClosedNow {
+		return nil
 	}
-	if result.ClosedNow {
-		message := response("session.closed", map[string]any{"sessionId": sessionID, "reason": reason}, h.id(), "")
-		for _, connectionID := range []string{result.Session.ControllerConnectionID, result.Session.CompanionConnectionID} {
-			if connectionID != skipConnectionID {
-				if _, err := h.notify(ctx, connectionID, message, event); err != nil {
-					return nil, err
-				}
+	message := response("session.closed", map[string]any{"sessionId": result.Session.SessionID, "reason": reason}, h.id(), "")
+	for _, connectionID := range []string{result.Session.ControllerConnectionID, result.Session.CompanionConnectionID} {
+		if connectionID != skipConnectionID {
+			if _, err := h.notify(ctx, connectionID, message, event); err != nil {
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (h *Handler) notifyOpenedSession(ctx context.Context, session Session, event WebSocketEvent) error {
+	for _, target := range []struct {
+		connectionID   string
+		peerEndpointID string
+	}{
+		{session.ControllerConnectionID, session.CompanionID},
+		{session.CompanionConnectionID, session.ControllerID},
+	} {
+		delivered, err := h.notify(ctx, target.connectionID, response("session.opened", map[string]any{
+			"sessionId": session.SessionID, "linkId": session.LinkID, "peerEndpointId": target.peerEndpointID,
+		}, h.id(), ""), event)
+		if err != nil {
+			return err
+		}
+		if !delivered {
+			return retryableError(protocol.PeerOffline)
+		}
+	}
+	return nil
+}
+
+func (h *Handler) closeAndNotify(ctx context.Context, sessionID, endpointID, reason string, event WebSocketEvent, skipConnectionID string) (*CloseSessionResult, error) {
+	result, err := h.store.CloseSession(ctx, sessionID, endpointID, h.now())
+	if err != nil {
+		return result, err
+	}
+	if err := h.notifyClosedSession(ctx, result, reason, event, skipConnectionID); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
 
-func (h *Handler) cleanup(ctx context.Context, connectionID, reason string, event WebSocketEvent, sendEvents bool) error {
-	connection, err := h.store.Disconnect(ctx, connectionID)
-	if err != nil || connection == nil {
+func (h *Handler) cleanup(ctx context.Context, connectionID, reason string, event WebSocketEvent, sendPairEvent bool) error {
+	result, err := h.store.Disconnect(ctx, connectionID, h.now())
+	if err != nil || result == nil {
 		return err
 	}
+	connection := result.Connection
 	if connection.PairingID != "" {
 		pair, err := h.store.CancelPair(ctx, connection.PairingID, connectionID, h.now())
 		var service *ServiceError
 		if err != nil && (!errors.As(err, &service) || service.Code != protocol.Conflict) {
 			return err
 		}
-		if sendEvents && pair != nil && pair.Status == "CLOSED" {
+		if sendPairEvent && pair != nil && pair.Status == "CLOSED" {
 			peer, err := peerConnection(*pair, connectionID)
 			if err != nil {
 				return err
 			}
-			_, err = h.notify(ctx, peer, response("pair.closed", map[string]any{
+			if _, err := h.notify(ctx, peer, response("pair.closed", map[string]any{
 				"pairId": pair.PairID, "reason": reason,
-			}, h.id(), ""), event)
-			if err != nil {
+			}, h.id(), ""), event); err != nil {
 				return err
 			}
 		}
 	}
-	if connection.SessionID != "" {
-		_, err := h.closeAndNotify(ctx, connection.SessionID, "", reason, event, connectionID)
+	return h.notifyClosedSession(ctx, result.Session, reason, event, connectionID)
+}
+
+func (h *Handler) relayPairFrame(ctx context.Context, message protocol.ClientEnvelope, event WebSocketEvent) error {
+	var frame protocol.PairFrameBody
+	if err := message.DecodeBody(&frame); err != nil {
 		return err
+	}
+	if err := h.store.RateLimit(ctx, SourceKey(sourceIP(event.RequestContext.Identity.SourceIP)), message.Type, 120, h.now()); err != nil {
+		return err
+	}
+	pair, err := h.store.PairByID(ctx, frame.PairID, h.now())
+	if err != nil {
+		return err
+	}
+	if pair.Status != "READY" && pair.Status != "HALF_COMMITTED" {
+		return serviceError(protocol.PairUnavailable)
+	}
+	peer, err := peerConnection(pair, event.RequestContext.ConnectionID)
+	if err != nil {
+		return err
+	}
+	delivered, err := h.notify(ctx, peer, response("pair.frame", message.Body, h.id(), ""), event)
+	if err != nil {
+		return err
+	}
+	if !delivered {
+		return retryableError(protocol.PeerOffline)
+	}
+	return nil
+}
+
+func (h *Handler) relaySessionFrame(ctx context.Context, message protocol.ClientEnvelope, event WebSocketEvent) error {
+	var frame protocol.SessionFrameBody
+	if err := message.DecodeBody(&frame); err != nil {
+		return err
+	}
+	// ponytail: one authority read preserves immediate revocation; add an edge
+	// per-session limiter only if the documented 60 fps client cap is abused.
+	session, err := h.store.Session(ctx, frame.SessionID, h.now())
+	if err != nil {
+		return err
+	}
+	peer, err := sessionPeer(session, event.RequestContext.ConnectionID)
+	if err != nil {
+		return err
+	}
+	delivered, err := h.notify(ctx, peer, response("session.frame", message.Body, h.id(), ""), event)
+	if err != nil {
+		return err
+	}
+	if !delivered {
+		return retryableError(protocol.PeerOffline)
 	}
 	return nil
 }
 
 func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope, connection Connection, event WebSocketEvent) (map[string]any, error) {
 	timestamp := h.now()
-	if message.Type == "relay.frame" {
-		var frame protocol.RelayFrameBody
-		if err := message.DecodeBody(&frame); err != nil {
-			return nil, err
-		}
-		if frame.Channel == protocol.PairChannel {
-			if connection.AuthMode != "pairing" || connection.PairingID != frame.ChannelID {
-				return nil, serviceError(protocol.Forbidden)
-			}
-			pair, err := h.store.PairByID(ctx, frame.ChannelID, timestamp)
-			if err != nil {
-				return nil, err
-			}
-			if pair.Status != "READY" && pair.Status != "HALF_COMMITTED" {
-				return nil, serviceError(protocol.PairUnavailable)
-			}
-			peer, err := peerConnection(pair, connection.ConnectionID)
-			if err != nil {
-				return nil, err
-			}
-			delivered, err := h.notify(ctx, peer, response("relay.frame", message.Body, h.id(), ""), event)
-			if err != nil {
-				return nil, err
-			}
-			if !delivered {
-				return nil, retryableError(protocol.PeerOffline)
-			}
-			return map[string]any{"delivered": true}, nil
-		}
-		if connection.AuthMode != "endpoint" || connection.EndpointID == "" {
-			return nil, serviceError(protocol.Forbidden)
-		}
-		session, err := h.store.Session(ctx, frame.ChannelID, timestamp)
-		if err != nil {
-			return nil, err
-		}
-		expectedEndpoint := ""
-		if session.ControllerConnectionID == connection.ConnectionID {
-			expectedEndpoint = session.ControllerID
-		} else if session.CompanionConnectionID == connection.ConnectionID {
-			expectedEndpoint = session.CompanionID
-		}
-		if expectedEndpoint != connection.EndpointID {
-			return nil, serviceError(protocol.Forbidden)
-		}
-		controller, err := h.store.GetEndpoint(ctx, session.ControllerID)
-		if err != nil {
-			return nil, err
-		}
-		companion, err := h.store.GetEndpoint(ctx, session.CompanionID)
-		if err != nil {
-			return nil, err
-		}
-		link, err := h.store.Link(ctx, session.LinkID)
-		if err != nil {
-			return nil, err
-		}
-		valid := link != nil && link.Status == "ACTIVE" && link.ActiveSessionID == session.SessionID &&
-			link.ControllerID == session.ControllerID && link.CompanionID == session.CompanionID &&
-			controller != nil && controller.RevokedAt == 0 && controller.ConnectionID == session.ControllerConnectionID &&
-			companion != nil && companion.RevokedAt == 0 && companion.ConnectionID == session.CompanionConnectionID
-		if !valid {
-			reason, code, retryable := "peer-disconnected", protocol.PeerOffline, true
-			if link != nil && link.Status == "REVOKED" {
-				reason, code, retryable = "revoked", protocol.Forbidden, false
-			}
-			if _, err := h.closeAndNotify(ctx, session.SessionID, "", reason, event, connection.ConnectionID); err != nil {
-				return nil, err
-			}
-			if retryable {
-				return nil, retryableError(code)
-			}
-			return nil, serviceError(code)
-		}
-		peer, err := sessionPeer(session, connection.ConnectionID)
-		if err != nil {
-			return nil, err
-		}
-		delivered, err := h.notify(ctx, peer, response("relay.frame", message.Body, h.id(), ""), event)
-		if err != nil {
-			return nil, err
-		}
-		if !delivered {
-			return nil, retryableError(protocol.PeerOffline)
-		}
-		return map[string]any{"delivered": true}, nil
-	}
 	if connection.AuthMode == "pairing" && !pairingActions[message.Type] ||
 		connection.AuthMode == "endpoint" && !endpointActions[message.Type] {
 		return nil, serviceError(protocol.Forbidden)
@@ -345,8 +326,8 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		for attempt := 0; attempt < 5; attempt++ {
 			pair := Pair{
 				PairID: h.id(), Locator: h.locator(), Status: "OPEN",
-				SideA:   PairSide{ConnectionID: connection.ConnectionID, SideID: h.id()},
-				Version: 1, ExpiresAt: timestamp + protocol.PairingTTLSeconds,
+				SideA:     PairSide{ConnectionID: connection.ConnectionID, SideID: h.id()},
+				ExpiresAt: timestamp + protocol.PairingTTLSeconds,
 			}
 			err := h.store.CreatePair(ctx, pair)
 			if err == nil {
@@ -450,11 +431,22 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if link.ControllerID == connection.EndpointID {
 			peerEndpointID, peerRole = link.CompanionID, protocol.Companion
 		}
-		result := map[string]any{
-			"linkId": link.LinkID, "peerEndpointId": peerEndpointID, "peerRole": peerRole, "status": strings.ToLower(link.Status),
+		peerEndpoint, err := h.store.GetEndpoint(ctx, peerEndpointID)
+		if err != nil {
+			return nil, err
 		}
-		if link.RevokedAt != 0 {
-			result["revokedAt"] = link.RevokedAt
+		status, revokedAt := link.Status, link.RevokedAt
+		if peerEndpoint == nil || peerEndpoint.RevokedAt != 0 {
+			status = "REVOKED"
+			if peerEndpoint != nil && (revokedAt == 0 || peerEndpoint.RevokedAt < revokedAt) {
+				revokedAt = peerEndpoint.RevokedAt
+			}
+		}
+		result := map[string]any{
+			"linkId": link.LinkID, "peerEndpointId": peerEndpointID, "peerRole": peerRole, "status": strings.ToLower(status),
+		}
+		if revokedAt != 0 {
+			result["revokedAt"] = revokedAt
 		}
 		return result, nil
 	case "link.revoke":
@@ -465,24 +457,18 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err := message.DecodeBody(&body); err != nil {
 			return nil, err
 		}
-		current, err := h.store.Link(ctx, body.LinkID)
-		if err != nil {
-			return nil, err
-		}
 		revoked, err := h.store.RevokeLink(ctx, body.LinkID, connection.EndpointID, timestamp)
 		if err != nil {
 			return nil, err
 		}
-		if current != nil && current.ActiveSessionID != "" {
-			if _, err := h.closeAndNotify(ctx, current.ActiveSessionID, connection.EndpointID, "revoked", event, ""); err != nil {
-				return nil, err
-			}
+		if err := h.notifyClosedSession(ctx, revoked.Session, "revoked", event, ""); err != nil {
+			return nil, err
 		}
-		peerEndpointID := revoked.ControllerID
-		if revoked.ControllerID == connection.EndpointID {
-			peerEndpointID = revoked.CompanionID
+		peerEndpointID := revoked.Link.ControllerID
+		if revoked.Link.ControllerID == connection.EndpointID {
+			peerEndpointID = revoked.Link.CompanionID
 		}
-		if err := h.notifyEndpoint(ctx, peerEndpointID, response("link.revoked", map[string]any{"linkId": revoked.LinkID}, h.id(), ""), event); err != nil {
+		if err := h.notifyEndpoint(ctx, peerEndpointID, response("link.revoked", map[string]any{"linkId": revoked.Link.LinkID}, h.id(), ""), event); err != nil {
 			return nil, err
 		}
 		return map[string]any{"revoked": true}, nil
@@ -506,25 +492,20 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err != nil {
 			return nil, err
 		}
-		for _, session := range revoked.Sessions {
-			closed := response("session.closed", map[string]any{"sessionId": session.SessionID, "reason": "revoked"}, h.id(), "")
-			if _, err := h.notify(ctx, session.ControllerConnectionID, closed, event); err != nil {
-				return nil, err
+		if err := h.notifyClosedSession(ctx, revoked.Session, "revoked", event, ""); err != nil {
+			return nil, err
+		}
+		if revoked.Session != nil && revoked.Session.ClosedNow {
+			session := revoked.Session.Session
+			peerConnectionID := session.ControllerConnectionID
+			if session.ControllerID == connection.EndpointID {
+				peerConnectionID = session.CompanionConnectionID
 			}
-			if _, err := h.notify(ctx, session.CompanionConnectionID, closed, event); err != nil {
+			if _, err := h.notify(ctx, peerConnectionID, response("link.revoked", map[string]any{"linkId": session.LinkID}, h.id(), ""), event); err != nil {
 				return nil, err
 			}
 		}
-		for _, link := range revoked.Links {
-			peerEndpointID := link.ControllerID
-			if link.ControllerID == connection.EndpointID {
-				peerEndpointID = link.CompanionID
-			}
-			if err := h.notifyEndpoint(ctx, peerEndpointID, response("link.revoked", map[string]any{"linkId": link.LinkID}, h.id(), ""), event); err != nil {
-				return nil, err
-			}
-		}
-		return map[string]any{"revoked": true, "linksRevoked": len(revoked.Links)}, nil
+		return map[string]any{"revoked": true}, nil
 	case "session.open":
 		if connection.EndpointID == "" {
 			return nil, serviceError(protocol.Forbidden)
@@ -537,25 +518,9 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err != nil {
 			return nil, err
 		}
-		controllerNotified, err := h.notify(ctx, session.ControllerConnectionID, response("session.opened", map[string]any{
-			"sessionId": session.SessionID, "linkId": session.LinkID, "peerEndpointId": session.CompanionID,
-		}, h.id(), ""), event)
-		if err != nil {
-			return nil, err
-		}
-		if !controllerNotified {
-			_, _ = h.closeAndNotify(ctx, session.SessionID, "", "peer-disconnected", event, "")
-			return nil, retryableError(protocol.PeerOffline)
-		}
-		companionNotified, err := h.notify(ctx, session.CompanionConnectionID, response("session.opened", map[string]any{
-			"sessionId": session.SessionID, "linkId": session.LinkID, "peerEndpointId": session.ControllerID,
-		}, h.id(), ""), event)
-		if err != nil {
-			return nil, err
-		}
-		if !companionNotified {
-			_, _ = h.closeAndNotify(ctx, session.SessionID, "", "peer-disconnected", event, "")
-			return nil, retryableError(protocol.PeerOffline)
+		if notifyErr := h.notifyOpenedSession(ctx, session, event); notifyErr != nil {
+			_, closeErr := h.closeAndNotify(ctx, session.SessionID, "", "peer-disconnected", event, "")
+			return nil, errors.Join(notifyErr, closeErr)
 		}
 		return map[string]any{"sessionId": session.SessionID}, nil
 	case "session.close":
@@ -575,84 +540,159 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 	}
 }
 
-func (h *Handler) Handle(ctx context.Context, event WebSocketEvent) (WebSocketResponse, error) {
-	routeKey, connectionID := event.RequestContext.RouteKey, event.RequestContext.ConnectionID
-	if routeKey == "$connect" {
-		authMode := authorizerValue(event.RequestContext.Authorizer, "authMode")
-		endpointID := authorizerValue(event.RequestContext.Authorizer, "endpointId")
-		credentialHash := authorizerValue(event.RequestContext.Authorizer, "credentialHash")
-		if authMode != "pairing" && authMode != "endpoint" || authMode == "endpoint" && (endpointID == "" || credentialHash == "") {
+func (h *Handler) handleConnect(ctx context.Context, event WebSocketEvent) (WebSocketResponse, error) {
+	authorization, err := protocol.ParseAuthorization(header(event.Headers, "authorization"))
+	if err != nil {
+		h.logger.WarnContext(ctx, "connect-rejected", "connectionId", event.RequestContext.ConnectionID, "error", protocol.Unauthenticated)
+		return WebSocketResponse{StatusCode: 401}, nil
+	}
+	authMode, endpointID, credentialHash := "pairing", "", ""
+	if authorization.Scheme == "bearer" {
+		endpoint, readErr := h.store.GetEndpoint(ctx, authorization.EndpointID)
+		if readErr != nil {
+			return WebSocketResponse{}, readErr
+		}
+		credentialHash = credentialDigest(authorization.Secret)
+		if endpoint == nil || endpoint.RevokedAt != 0 || !constantTimeEqual(endpoint.CredentialHash, credentialHash) {
+			h.logger.WarnContext(ctx, "connect-rejected", "connectionId", event.RequestContext.ConnectionID, "error", protocol.Unauthenticated)
 			return WebSocketResponse{StatusCode: 401}, nil
 		}
-		timestamp := h.now()
-		connection := Connection{
-			ConnectionID: connectionID, AuthMode: authMode, EndpointID: endpointID,
-			SourceKey:   SourceKey(sourceIP(event.RequestContext.Identity.SourceIP)),
-			ConnectedAt: timestamp, ExpiresAt: timestamp + 2*60*60 + 5*60,
-		}
-		if err := h.store.Connect(ctx, connection, credentialHash); err != nil {
-			var service *ServiceError
-			code := protocol.Internal
-			status := 500
-			if errors.As(err, &service) {
-				code, status = service.Code, 401
+		authMode, endpointID = "endpoint", authorization.EndpointID
+	}
+	timestamp := h.now()
+	connection := Connection{
+		ConnectionID: event.RequestContext.ConnectionID, AuthMode: authMode, EndpointID: endpointID,
+		SourceKey:   SourceKey(sourceIP(event.RequestContext.Identity.SourceIP)),
+		ConnectedAt: timestamp, ExpiresAt: timestamp + 2*60*60 + 5*60,
+	}
+	closed, err := h.store.Connect(ctx, connection, credentialHash)
+	if err != nil {
+		var service *ServiceError
+		code, status := protocol.Internal, 500
+		if errors.As(err, &service) {
+			code = service.Code
+			if service.Code == protocol.Unauthenticated || service.Code == protocol.Forbidden {
+				status = 401
+			} else if service.Retryable {
+				status = 503
 			}
-			h.logger.WarnContext(ctx, "connect-rejected", "connectionId", connectionID, "error", code)
-			return WebSocketResponse{StatusCode: status}, nil
 		}
-		return WebSocketResponse{StatusCode: 200}, nil
+		h.logger.WarnContext(ctx, "connect-rejected", "connectionId", event.RequestContext.ConnectionID, "error", code)
+		return WebSocketResponse{StatusCode: status}, nil
 	}
-	if routeKey == "$disconnect" {
-		if err := h.cleanup(ctx, connectionID, "peer-disconnected", event, true); err != nil {
-			return WebSocketResponse{}, err
+	if closed != nil {
+		skip := closed.Session.ControllerConnectionID
+		if closed.Session.ControllerID != endpointID {
+			skip = closed.Session.CompanionConnectionID
 		}
-		return WebSocketResponse{StatusCode: 200}, nil
+		if err := h.notifyClosedSession(ctx, closed, "replaced", event, skip); err != nil {
+			h.logger.WarnContext(ctx, "replacement-notification-failed", "connectionId", event.RequestContext.ConnectionID)
+		}
 	}
-	if routeKey != "$default" {
-		return WebSocketResponse{StatusCode: 400}, nil
-	}
-	requestID := h.id()
-	connection, err := h.store.Connection(ctx, connectionID, h.now())
+	return WebSocketResponse{StatusCode: 200}, nil
+}
+
+func (h *Handler) handleFrame(ctx context.Context, event WebSocketEvent) (WebSocketResponse, error) {
+	message, err := protocol.ParseClient(event.Body)
+	requestID := message.ID
 	if err == nil {
-		var message protocol.ClientEnvelope
-		message, err = protocol.ParseClient(event.Body)
-		if err == nil {
-			requestID = message.ID
-			h.logger.InfoContext(ctx, "message", "connectionId", connectionID, "messageType", message.Type)
-			var result map[string]any
-			result, err = h.dispatch(ctx, message, connection, event)
-			if err == nil {
-				_, err = h.notify(ctx, connectionID, ok(message, result, h.id()), event)
-			}
+		if message.Type != event.RequestContext.RouteKey {
+			err = serviceError(protocol.InvalidMessage)
+		} else if message.Type == "pair.frame" {
+			err = h.relayPairFrame(ctx, message, event)
+		} else {
+			err = h.relaySessionFrame(ctx, message, event)
 		}
+	} else {
+		requestID = requestIDFromBody(event.Body, h.id())
 	}
 	if err != nil {
-		code := protocol.Internal
-		var validation *protocol.ValidationError
-		var service *ServiceError
-		if errors.As(err, &validation) {
-			code = validation.Code
-		} else if errors.As(err, &service) {
-			code = service.Code
-		}
-		h.logger.WarnContext(ctx, "message-rejected", "connectionId", connectionID, "error", code)
-		if _, notifyErr := h.notify(ctx, connectionID, failure(requestID, err, h.id()), event); notifyErr != nil {
+		h.logRejected(ctx, event, err)
+		if _, notifyErr := h.notify(ctx, event.RequestContext.ConnectionID, failure(requestID, err, h.id()), event); notifyErr != nil {
 			return WebSocketResponse{}, notifyErr
 		}
 	}
 	return WebSocketResponse{StatusCode: 200}, nil
 }
 
-func authorizerValue(authorizer any, key string) string {
-	switch value := authorizer.(type) {
-	case map[string]any:
-		result, _ := value[key].(string)
-		return result
-	case map[string]string:
-		return value[key]
-	default:
-		return ""
+func (h *Handler) handleDefault(ctx context.Context, event WebSocketEvent) (WebSocketResponse, error) {
+	message, err := protocol.ParseClient(event.Body)
+	requestID := message.ID
+	var reply Message
+	if err == nil {
+		var connection Connection
+		connection, err = h.store.Connection(ctx, event.RequestContext.ConnectionID, h.now())
+		if err == nil && connection.AuthMode == "pairing" {
+			err = h.store.RateLimit(ctx, connection.SourceKey, "pairing.message", 120, h.now())
+		}
+		if err == nil {
+			var result map[string]any
+			result, err = h.dispatch(ctx, message, connection, event)
+			if err == nil {
+				reply = ok(message, result, h.id())
+			}
+		}
+	} else {
+		requestID = requestIDFromBody(event.Body, h.id())
 	}
+	if err != nil {
+		h.logRejected(ctx, event, err)
+		reply = failure(requestID, err, h.id())
+	}
+	body, err := MarshalMessage(reply)
+	if err != nil {
+		return WebSocketResponse{}, err
+	}
+	return WebSocketResponse{StatusCode: 200, Body: string(body)}, nil
+}
+
+func (h *Handler) logRejected(ctx context.Context, event WebSocketEvent, err error) {
+	code := protocol.Internal
+	var validation *protocol.ValidationError
+	var service *ServiceError
+	if errors.As(err, &validation) {
+		code = validation.Code
+	} else if errors.As(err, &service) {
+		code = service.Code
+	}
+	h.logger.WarnContext(ctx, "message-rejected", "connectionId", event.RequestContext.ConnectionID, "routeKey", event.RequestContext.RouteKey, "error", code)
+}
+
+func (h *Handler) Handle(ctx context.Context, event WebSocketEvent) (WebSocketResponse, error) {
+	switch event.RequestContext.RouteKey {
+	case "$connect":
+		return h.handleConnect(ctx, event)
+	case "$disconnect":
+		if err := h.cleanup(ctx, event.RequestContext.ConnectionID, "peer-disconnected", event, true); err != nil {
+			return WebSocketResponse{}, err
+		}
+		return WebSocketResponse{StatusCode: 200}, nil
+	case "pair.frame", "session.frame":
+		return h.handleFrame(ctx, event)
+	case "$default":
+		return h.handleDefault(ctx, event)
+	default:
+		return WebSocketResponse{StatusCode: 400}, nil
+	}
+}
+
+func header(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			return value
+		}
+	}
+	return ""
+}
+
+func requestIDFromBody(body, fallback string) string {
+	var envelope struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal([]byte(body), &envelope) == nil && requestIDPattern.MatchString(envelope.ID) {
+		return envelope.ID
+	}
+	return fallback
 }
 
 func sourceIP(value string) string {
