@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -516,7 +517,7 @@ func TestEnrollmentValidationRejectsNonCanonicalCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := EnrollmentRequest{
-		V: 1, RelayURL: DefaultRelayURL, ControllerEndpointID: testControllerID,
+		V: 1, ControllerEndpointID: testControllerID,
 		ControllerCredentialHash: base64.RawURLEncoding.EncodeToString(hash[:]),
 		ControllerNoiseKey:       base64.RawURLEncoding.EncodeToString(key.Public), DeviceLabel: "Test iPad",
 	}
@@ -524,21 +525,12 @@ func TestEnrollmentValidationRejectsNonCanonicalCredentials(t *testing.T) {
 	if _, err := ParseEnrollmentRequest(data); err != nil {
 		t.Fatal(err)
 	}
-	request.RelayURL = "https://relay.example/v1"
-	data, _ = json.Marshal(request)
-	if _, err := ParseEnrollmentRequest(data); err == nil {
-		t.Fatal("accepted a non-WSS enrollment relay")
-	}
-	request.RelayURL = DefaultRelayURL
 	request.ControllerCredentialHash += "="
 	data, _ = json.Marshal(request)
 	if _, err := ParseEnrollmentRequest(data); err == nil {
 		t.Fatal("accepted padded/non-canonical credential hash")
 	}
 	request.ControllerCredentialHash = base64.RawURLEncoding.EncodeToString(hash[:])
-	if _, _, err := Provision(t.Context(), "wss://different.example/v1", request); err == nil || !strings.Contains(err.Error(), "relay does not match") {
-		t.Fatalf("mismatched enrollment relay error = %v", err)
-	}
 	for _, lowOrder := range [][]byte{make([]byte, 32), append([]byte{1}, make([]byte, 31)...)} {
 		request.ControllerNoiseKey = base64.RawURLEncoding.EncodeToString(lowOrder)
 		data, _ = json.Marshal(request)
@@ -550,6 +542,48 @@ func TestEnrollmentValidationRejectsNonCanonicalCredentials(t *testing.T) {
 		if err := config.validate(); err == nil {
 			t.Fatalf("accepted non-contributory configured key %x", lowOrder)
 		}
+	}
+}
+
+func TestEnrollmentRequestV1WireIsExactlyFiveFields(t *testing.T) {
+	secret := sha256.Sum256(bytes.Repeat([]byte{1}, 32))
+	key, err := noise.DH25519.GenerateKeypair(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := EnrollmentRequest{
+		V: 1, ControllerEndpointID: testControllerID,
+		ControllerCredentialHash: base64.RawURLEncoding.EncodeToString(secret[:]),
+		ControllerNoiseKey:       base64.RawURLEncoding.EncodeToString(key.Public),
+		DeviceLabel:              "Staggered controller",
+	}
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"controllerCredentialHash", "controllerEndpointId", "controllerNoiseKey", "deviceLabel", "v"}
+	got := make([]string, 0, len(wire))
+	for key := range wire {
+		got = append(got, key)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("enrollment request fields = %v, want %v", got, want)
+	}
+	if _, err := ParseEnrollmentRequest(raw); err != nil {
+		t.Fatalf("five-field V1 request rejected: %v", err)
+	}
+	wire["relayUrl"] = json.RawMessage(`"wss://relay.example/v1"`)
+	sixField, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseEnrollmentRequest(sixField); err == nil {
+		t.Fatal("accepted a non-V1 sixth enrollment field")
 	}
 }
 
@@ -720,7 +754,6 @@ func TestProvisionCompletesRelayPairing(t *testing.T) {
 	http.DefaultClient = server.Client()
 	defer func() { http.DefaultClient = originalClient }()
 	relay := "wss" + strings.TrimPrefix(server.URL, "https")
-	request.RelayURL = relay
 
 	config, enrollment, err := Provision(ctx, relay, request, func(config Config) error {
 		persisted <- config
@@ -752,7 +785,7 @@ func TestProvisionCompletesRelayPairing(t *testing.T) {
 	if err := config.validate(); err != nil {
 		t.Fatal(err)
 	}
-	if config.RelayURL != relay || config.LinkID != enrollment.LinkID || config.EndpointID != enrollment.CompanionEndpointID ||
+	if config.RelayURL != relay || enrollment.RelayURL != relay || config.LinkID != enrollment.LinkID || config.EndpointID != enrollment.CompanionEndpointID ||
 		config.ControllerEndpointID != testControllerID || enrollment.ControllerEndpointID != testControllerID ||
 		config.ControllerNoiseKey != request.ControllerNoiseKey || config.ControllerLabel != request.DeviceLabel {
 		t.Fatalf("inconsistent provision result: config = %#v, enrollment = %#v", config, enrollment)
@@ -853,25 +886,57 @@ func TestGUIUsesOneTimeBrowserBootstrapAndLaunchScopedToken(t *testing.T) {
 
 func TestRelayPendingResponsesAreBounded(t *testing.T) {
 	peer := &relayPeer{}
+	small := validPendingServerFrame(t, 1, 1)
 	for range maxPendingRelayResponses {
-		if err := peer.queuePending(json.RawMessage(`{}`)); err != nil {
+		if err := peer.queuePending(small); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := peer.queuePending(json.RawMessage(`{}`)); err == nil {
+	if err := peer.queuePending(small); err == nil {
 		t.Fatal("accepted too many unmatched relay responses")
 	}
 
 	peer = &relayPeer{}
-	chunk := json.RawMessage(bytes.Repeat([]byte{'x'}, maxFrameBytes))
-	for peer.pendingBytes+len(chunk) <= maxPendingRelayResponseBytes {
-		if err := peer.queuePending(chunk); err != nil {
+	maximal := validPendingServerFrame(t, 1, protocol.MaxRelayPayloadBytes)
+	for sequence := 1; sequence <= protocol.MaxRelayReorderFrames; sequence++ {
+		frame := validPendingServerFrame(t, int64(sequence), protocol.MaxRelayPayloadBytes)
+		if err := peer.queuePending(frame); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := peer.queuePending(json.RawMessage(`x`)); err == nil {
+	if peer.pendingBytes <= protocol.MaxRelayReorderBytes {
+		t.Fatalf("eight maximum payload frames used %d wire bytes; test did not cross decoded-byte limit %d", peer.pendingBytes, protocol.MaxRelayReorderBytes)
+	}
+	for peer.pendingBytes+len(maximal) <= maxPendingRelayWireBytes {
+		if err := peer.queuePending(maximal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.queuePending(maximal); err == nil {
 		t.Fatal("accepted unmatched relay responses beyond the byte limit")
 	}
+}
+
+func validPendingServerFrame(t *testing.T, sequence int64, payloadBytes int) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(wireEnvelope{
+		Protocol: protocol.ProtocolName,
+		V:        protocol.ProtocolVersion,
+		Type:     "session.frame",
+		ID:       fmt.Sprintf("90000000-0000-4000-8000-%012d", sequence),
+		Body: map[string]any{
+			"sessionId": testSessionID,
+			"seq":       sequence,
+			"payload":   base64.RawURLEncoding.EncodeToString(make([]byte, payloadBytes)),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.ParseServer(raw); err != nil {
+		t.Fatalf("test server frame invalid: %v", err)
+	}
+	return raw
 }
 
 func TestRevokeEnrollmentCheckpointsBeforeBestEffortEndpointRevocation(t *testing.T) {

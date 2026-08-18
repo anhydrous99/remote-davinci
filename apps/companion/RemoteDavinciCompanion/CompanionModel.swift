@@ -28,6 +28,7 @@ enum ReadinessResult: Equatable {
 enum CompanionFailure: LocalizedError {
     case invalidReadiness
     case invalidEnrollment
+    case invalidRelay
     case invalidResponse
     case server(String)
 
@@ -37,11 +38,34 @@ enum CompanionFailure: LocalizedError {
             return "The server helper returned an invalid startup response."
         case .invalidEnrollment:
             return "Paste a valid controller enrollment request."
+        case .invalidRelay:
+            return "REMOTE_DAVINCI_RELAY_URL must be a credential-free wss URL."
         case .invalidResponse:
             return "The server helper returned an invalid response."
         case let .server(message):
             return message
         }
+    }
+}
+
+enum CompanionLaunchArguments {
+    static let relayEnvironmentKey = "REMOTE_DAVINCI_RELAY_URL"
+
+    static func make(environment: [String: String]) throws -> [String] {
+        guard let relayURL = environment[relayEnvironmentKey] else { return ["-native"] }
+        guard let components = URLComponents(string: relayURL),
+              components.scheme == "wss",
+              components.host?.isEmpty == false,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              let url = components.url,
+              url.absoluteString == relayURL
+        else {
+            throw CompanionFailure.invalidRelay
+        }
+        return ["-native", "-relay", relayURL]
     }
 }
 
@@ -297,6 +321,7 @@ struct CompanionHostSnapshot: Equatable {
 final class CompanionHost {
     var onChange: ((CompanionHostSnapshot) -> Void)?
 
+    private let environment: [String: String]
     private let restartDelays: [TimeInterval] = [1, 2, 4, 8, 16]
     private var process: Process?
     private var inputPipe: Pipe?
@@ -312,6 +337,10 @@ final class CompanionHost {
     private var startupWorkItem: DispatchWorkItem?
     private var startupFailure: String?
     private var terminalStartupFailure: String?
+
+    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.environment = environment
+    }
 
     func start() {
         guard !shouldRun else { return }
@@ -348,6 +377,16 @@ final class CompanionHost {
 
     private func launch() {
         guard shouldRun, process == nil else { return }
+        let arguments: [String]
+        do {
+            arguments = try CompanionLaunchArguments.make(environment: environment)
+        } catch {
+            shouldRun = false
+            status = error.localizedDescription
+            canRetry = false
+            publish()
+            return
+        }
         guard let executable = Bundle.main.url(
             forAuxiliaryExecutable: "remote-davinci-companion"
         ), FileManager.default.isExecutableFile(atPath: executable.path) else {
@@ -361,7 +400,7 @@ final class CompanionHost {
         let input = Pipe()
         let output = Pipe()
         process.executableURL = executable
-        process.arguments = ["-native"]
+        process.arguments = arguments
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice

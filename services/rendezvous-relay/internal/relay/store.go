@@ -114,6 +114,22 @@ func conditionalFailure(err error) bool {
 	return found
 }
 
+func transactionConditionalFailureAt(err error, index int) bool {
+	var cancelled *types.TransactionCanceledException
+	if !errors.As(err, &cancelled) || index < 0 || index >= len(cancelled.CancellationReasons) ||
+		aws.ToString(cancelled.CancellationReasons[index].Code) != "ConditionalCheckFailed" {
+		return false
+	}
+	for _, reason := range cancelled.CancellationReasons {
+		switch aws.ToString(reason.Code) {
+		case "", "None", "ConditionalCheckFailed":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (s *DynamoStore) GetEndpoint(ctx context.Context, endpointID string) (*Endpoint, error) {
 	var endpoint Endpoint
 	found, err := s.get(ctx, "ENDPOINT", endpointID, &endpoint)
@@ -379,22 +395,34 @@ func (s *DynamoStore) RateLimit(ctx context.Context, sourceKey, action string, l
 	return s.rateLimit(ctx, sourceKey, action, limit, minuteRateWindowSeconds, now)
 }
 
-func (s *DynamoStore) rateLimit(ctx context.Context, sourceKey, action string, limit, windowSeconds, now int64) error {
+func (s *DynamoStore) rateLimitUpdate(sourceKey, action string, limit, windowSeconds, now int64) (*types.Update, int64, error) {
 	bucket := now / windowSeconds
 	expressionValues, err := values(map[string]any{
 		":expiresAt": (bucket + 2) * windowSeconds, ":one": int64(1), ":limit": limit,
 	})
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
-	_, err = s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+	retryAfter := min(((bucket+1)*windowSeconds-now)*1_000, int64(3_600_000))
+	return &types.Update{
 		TableName: aws.String(s.tableName), Key: key("RATE", fmt.Sprintf("%s#%s#%d", sourceKey, action, bucket)),
 		UpdateExpression:         aws.String("SET expiresAt = :expiresAt ADD #count :one"),
 		ConditionExpression:      aws.String("attribute_not_exists(#count) OR #count < :limit"),
 		ExpressionAttributeNames: map[string]string{"#count": "count"}, ExpressionAttributeValues: expressionValues,
+	}, retryAfter, nil
+}
+
+func (s *DynamoStore) rateLimit(ctx context.Context, sourceKey, action string, limit, windowSeconds, now int64) error {
+	update, retryAfter, err := s.rateLimitUpdate(sourceKey, action, limit, windowSeconds, now)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: update.TableName, Key: update.Key, UpdateExpression: update.UpdateExpression,
+		ConditionExpression: update.ConditionExpression, ExpressionAttributeNames: update.ExpressionAttributeNames,
+		ExpressionAttributeValues: update.ExpressionAttributeValues,
 	})
 	if conditionalFailure(err) {
-		retryAfter := min(((bucket+1)*windowSeconds-now)*1_000, int64(3_600_000))
 		return &ServiceError{Code: protocol.RateLimited, Retryable: true, RetryAfterMS: &retryAfter}
 	}
 	return err
@@ -601,9 +629,6 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 	if err != nil {
 		return CommitPairResult{}, err
 	}
-	if err := s.rateLimit(ctx, "global", "pair.activate", pairActivationsPerDay, dailyRateWindowSeconds, now); err != nil {
-		return CommitPairResult{}, err
-	}
 	endpoints := []Endpoint{
 		{EndpointID: first.Self.EndpointID, CredentialHash: first.Self.CredentialHash, Role: first.Self.Role, CreatedAt: now, UpdatedAt: now},
 		{EndpointID: second.Self.EndpointID, CredentialHash: second.Self.CredentialHash, Role: second.Self.Role, CreatedAt: now, UpdatedAt: now},
@@ -627,6 +652,10 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 	if err != nil {
 		return CommitPairResult{}, err
 	}
+	rateUpdate, retryAfter, err := s.rateLimitUpdate("global", "pair.activate", pairActivationsPerDay, dailyRateWindowSeconds, now)
+	if err != nil {
+		return CommitPairResult{}, err
+	}
 	operations := []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: aws.String(s.tableName), Key: key("PAIR", pair.PairID),
@@ -637,7 +666,12 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 		{Put: &types.Put{TableName: aws.String(s.tableName), Item: linkItem, ConditionExpression: aws.String("attribute_not_exists(pk)")}},
 	}
 	operations = append(operations, endpointWrites...)
+	rateIndex := len(operations)
+	operations = append(operations, types.TransactWriteItem{Update: rateUpdate})
 	_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: operations})
+	if transactionConditionalFailureAt(err, rateIndex) {
+		return CommitPairResult{}, &ServiceError{Code: protocol.RateLimited, Retryable: true, RetryAfterMS: &retryAfter}
+	}
 	if conditionalFailure(err) {
 		return CommitPairResult{}, retryableError(protocol.Conflict)
 	}

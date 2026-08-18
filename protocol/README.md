@@ -84,12 +84,13 @@ The stable outer errors are exported as `ErrorCodes`. Successful frame forwardin
 
 The current controller and companion do **not** implement the PAKE profile
 below. Enrollment is a manual bootstrap for one operator controlling both
-unlocked devices: the controller creates a request containing its intended
-relay and identity, the companion verifies that relay matches its configured
-relay and administratively submits both relay commits, and the controller
-accepts only a response with the original controller ID and relay. The two JSON
-documents must be transferred over an authenticated operator-controlled path;
-the software does not cryptographically authenticate that manual transfer.
+unlocked devices: the controller validates and persists its intended relay
+locally before creating the unchanged V1 identity request, the companion uses
+its own configured relay and administratively submits both relay commits, and
+the controller accepts only a response with the original controller ID and its
+locally pinned relay. The two JSON documents must be transferred over an
+authenticated operator-controlled path; the software does not cryptographically
+authenticate that manual transfer.
 
 Enrollment is all-or-nothing authorization for the current five fixed
 operations (`resolve.page.cut`, `resolve.page.edit`, `resolve.page.fusion`,

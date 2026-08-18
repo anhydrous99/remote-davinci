@@ -5,6 +5,49 @@ import XCTest
 final class CompanionTests: XCTestCase {
     private let token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
+    func testHelperLaunchArgumentsPassConfiguredRelayOverride() throws {
+        let relayURL = "wss://relay.example/v1"
+
+        XCTAssertEqual(
+            try CompanionLaunchArguments.make(environment: [
+                CompanionLaunchArguments.relayEnvironmentKey: relayURL,
+            ]),
+            ["-native", "-relay", relayURL]
+        )
+        XCTAssertEqual(try CompanionLaunchArguments.make(environment: [:]), ["-native"])
+    }
+
+    @MainActor
+    func testInvalidRelayOverrideFailsBeforeHelperLaunch() {
+        let invalidRelayURLs = [
+            "https://relay.example/v1",
+            "wss://user@relay.example/v1",
+            "wss://relay.example/v1?token=secret",
+            "wss://relay.example/v1#fragment",
+            "wss:///v1",
+        ]
+
+        for relayURL in invalidRelayURLs {
+            let environment = [CompanionLaunchArguments.relayEnvironmentKey: relayURL]
+            XCTAssertThrowsError(try CompanionLaunchArguments.make(environment: environment))
+        }
+
+        let host = CompanionHost(environment: [
+            CompanionLaunchArguments.relayEnvironmentKey: invalidRelayURLs[0],
+        ])
+        var snapshot: CompanionHostSnapshot?
+        host.onChange = { snapshot = $0 }
+        host.start()
+        XCTAssertEqual(
+            snapshot,
+            CompanionHostSnapshot(
+                connection: nil,
+                status: "REMOTE_DAVINCI_RELAY_URL must be a credential-free wss URL.",
+                canRetry: false
+            )
+        )
+    }
+
     @MainActor
     func testHostedTestsNeverStartTheHelper() {
         CompanionModel.shared.start()

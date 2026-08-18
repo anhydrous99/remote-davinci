@@ -138,7 +138,8 @@ Enrollment is a trusted, manual, one-operator ceremony for this slice. Transfer
 both JSON documents directly between the unlocked controller and Mac without
 an intermediary; that operator-controlled path is the authenticated channel.
 The shipped apps do not run PAKE or negotiate operation grants. The originating
-controller pins the relay in its request and rejects a response for any other
+controller validates and persists its selected relay before emitting the
+unchanged V1 identity request, then rejects a companion response for any other
 relay. Accepting a response grants that one controller all five fixed V1
 operations listed above.
 

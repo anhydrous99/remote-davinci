@@ -60,6 +60,22 @@ func storageItem(t *testing.T, kind, id string, value any) map[string]types.Attr
 
 func storageUUID(value string) string { return "00000000-0000-4000-8000-" + value }
 
+func storageReason(code string) types.CancellationReason {
+	return types.CancellationReason{Code: &code}
+}
+
+func storageCancellationReasons(size int, overrides map[int]string) []types.CancellationReason {
+	reasons := make([]types.CancellationReason, size)
+	for index := range reasons {
+		code := "None"
+		if override, ok := overrides[index]; ok {
+			code = override
+		}
+		reasons[index] = storageReason(code)
+	}
+	return reasons
+}
+
 func TestConditionalFailureInspectsTransactionCancellationReasons(t *testing.T) {
 	reason := func(code string) types.CancellationReason { return types.CancellationReason{Code: &code} }
 	for _, test := range []struct {
@@ -76,6 +92,29 @@ func TestConditionalFailureInspectsTransactionCancellationReasons(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			if got := conditionalFailure(test.err); got != test.matched {
 				t.Fatalf("conditionalFailure() = %t, want %t", got, test.matched)
+			}
+		})
+	}
+}
+
+func TestTransactionConditionalFailureAtInspectsRequestedMember(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		err     error
+		index   int
+		matched bool
+	}{
+		{"requested member", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{4: "ConditionalCheckFailed"})}, 4, true},
+		{"requested and other conditions", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{0: "ConditionalCheckFailed", 4: "ConditionalCheckFailed"})}, 4, true},
+		{"different member", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{0: "ConditionalCheckFailed"})}, 4, false},
+		{"condition and throttle", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{1: "ThrottlingError", 4: "ConditionalCheckFailed"})}, 4, false},
+		{"missing reasons", &types.TransactionCanceledException{}, 4, false},
+		{"direct condition", &types.ConditionalCheckFailedException{}, 0, false},
+		{"out of range", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(1, map[int]string{0: "ConditionalCheckFailed"})}, 1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := transactionConditionalFailureAt(test.err, test.index); got != test.matched {
+				t.Fatalf("transactionConditionalFailureAt() = %t, want %t", got, test.matched)
 			}
 		})
 	}
@@ -447,7 +486,7 @@ func TestPairingDisconnectAtomicallyCancelsOwnedPair(t *testing.T) {
 	}
 }
 
-func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
+func pairActivationFixture() (string, Pair, PairCommit) {
 	pairID := storageUUID("000000000036")
 	linkID := storageUUID("000000000037")
 	aID, bID := storageUUID("000000000038"), storageUUID("000000000039")
@@ -465,8 +504,13 @@ func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
 		PairID: pairID, Locator: "123456", Status: "HALF_COMMITTED",
 		SideA:   PairSide{ConnectionID: "a", SideID: a.SideID},
 		SideB:   &PairSide{ConnectionID: "b", SideID: b.SideID},
-		CommitA: &a, ExpiresAt: 1_000,
+		CommitA: &a, ExpiresAt: 200_000,
 	}
+	return pairID, pair, b
+}
+
+func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
+	pairID, pair, b := pairActivationFixture()
 	db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
 		"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
 	}}
@@ -474,7 +518,7 @@ func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
 	if err != nil || result.Link == nil || result.Pair.Status != "ACTIVE" {
 		t.Fatalf("result = %#v, error = %v", result, err)
 	}
-	if len(db.transactions) != 1 || len(db.transactions[0].TransactItems) != 4 {
+	if len(db.transactions) != 1 || len(db.transactions[0].TransactItems) != 5 {
 		t.Fatalf("transactions = %#v", db.transactions)
 	}
 	update := db.transactions[0].TransactItems[0].Update
@@ -489,35 +533,24 @@ func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
 }
 
 func TestPairActivationUsesGlobalDailyCircuitBreaker(t *testing.T) {
-	pairID := storageUUID("000000000060")
-	linkID := storageUUID("000000000061")
-	aID, bID := storageUUID("000000000062"), storageUUID("000000000063")
-	a := PairCommit{
-		ConnectionID: "a", SideID: storageUUID("000000000064"), LinkID: linkID,
-		Self: PairEndpointCommit{EndpointID: aID, Role: protocol.Controller, CredentialHash: "a"},
-		Peer: PairIdentity{EndpointID: bID, Role: protocol.Companion},
-	}
-	b := PairCommit{
-		ConnectionID: "b", SideID: storageUUID("000000000065"), LinkID: linkID,
-		Self: PairEndpointCommit{EndpointID: bID, Role: protocol.Companion, CredentialHash: "b"},
-		Peer: PairIdentity{EndpointID: aID, Role: protocol.Controller},
-	}
-	pair := Pair{
-		PairID: pairID, Locator: "123456", Status: "HALF_COMMITTED",
-		SideA: PairSide{ConnectionID: "a", SideID: a.SideID},
-		SideB: &PairSide{ConnectionID: "b", SideID: b.SideID}, CommitA: &a, ExpiresAt: 200_000,
-	}
+	pairID, pair, b := pairActivationFixture()
 	db := &storageDynamo{
 		items: map[string]map[string]types.AttributeValue{
 			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
 		},
-		updateItem: func(input *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
-			if storagePK(input.Key) != "RATE#global#pair.activate#1" ||
-				input.ExpressionAttributeValues[":limit"].(*types.AttributeValueMemberN).Value != "10000" ||
-				input.ExpressionAttributeValues[":expiresAt"].(*types.AttributeValueMemberN).Value != "259200" {
-				t.Fatalf("daily rate update = %#v", input)
+		transact: func(input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			if len(input.TransactItems) != 5 {
+				t.Fatalf("transaction = %#v", input.TransactItems)
 			}
-			return nil, &types.ConditionalCheckFailedException{}
+			rate := input.TransactItems[4].Update
+			if rate == nil || storagePK(rate.Key) != "RATE#global#pair.activate#1" ||
+				rate.ExpressionAttributeValues[":limit"].(*types.AttributeValueMemberN).Value != "10000" ||
+				rate.ExpressionAttributeValues[":expiresAt"].(*types.AttributeValueMemberN).Value != "259200" ||
+				*rate.UpdateExpression != "SET expiresAt = :expiresAt ADD #count :one" ||
+				*rate.ConditionExpression != "attribute_not_exists(#count) OR #count < :limit" {
+				t.Fatalf("daily rate update = %#v", rate)
+			}
+			return nil, &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{4: "ConditionalCheckFailed"})}
 		},
 	}
 	_, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 90_000)
@@ -525,9 +558,85 @@ func TestPairActivationUsesGlobalDailyCircuitBreaker(t *testing.T) {
 	if !errors.As(err, &service) || service.Code != protocol.RateLimited || service.RetryAfterMS == nil || *service.RetryAfterMS != 3_600_000 {
 		t.Fatalf("error = %#v", err)
 	}
-	if len(db.updates) != 1 || len(db.transactions) != 0 {
+	if len(db.updates) != 0 || len(db.transactions) != 1 {
 		t.Fatalf("updates = %d, transactions = %d", len(db.updates), len(db.transactions))
 	}
+}
+
+func TestPairActivationMapsNonQuotaConditionToConflict(t *testing.T) {
+	pairID, pair, b := pairActivationFixture()
+	db := &storageDynamo{
+		items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
+		},
+		transact: func(input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			return nil, &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(len(input.TransactItems), map[int]string{0: "ConditionalCheckFailed"})}
+		},
+	}
+	_, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+	var service *ServiceError
+	if !errors.As(err, &service) || service.Code != protocol.Conflict || !service.Retryable {
+		t.Fatalf("error = %#v", err)
+	}
+	if len(db.updates) != 0 || len(db.transactions) != 1 {
+		t.Fatalf("updates = %d, transactions = %d", len(db.updates), len(db.transactions))
+	}
+}
+
+func TestPairActivationPreservesMixedOperationalCancellation(t *testing.T) {
+	pairID, pair, b := pairActivationFixture()
+	db := &storageDynamo{
+		items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
+		},
+		transact: func(input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			return nil, &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(len(input.TransactItems), map[int]string{
+				1: "ThrottlingError", len(input.TransactItems) - 1: "ConditionalCheckFailed",
+			})}
+		},
+	}
+	_, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+	var service *ServiceError
+	if errors.As(err, &service) {
+		t.Fatalf("mixed cancellation mapped to service error = %#v", service)
+	}
+	var cancelled *types.TransactionCanceledException
+	if !errors.As(err, &cancelled) {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestPairActivationQuotaSkipsNonActivationCommits(t *testing.T) {
+	t.Run("first commit", func(t *testing.T) {
+		pairID, pair, b := pairActivationFixture()
+		pair.Status, pair.CommitA = "READY", nil
+		db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
+		}}
+		result, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+		if err != nil || result.Link != nil || result.Pair.Status != "HALF_COMMITTED" {
+			t.Fatalf("result = %#v, error = %v", result, err)
+		}
+		if len(db.updates) != 1 || storagePK(db.updates[0].Key) != "PAIR#"+pairID || len(db.transactions) != 0 {
+			t.Fatalf("updates = %#v, transactions = %#v", db.updates, db.transactions)
+		}
+	})
+
+	t.Run("active retry", func(t *testing.T) {
+		pairID, pair, b := pairActivationFixture()
+		pair.Status, pair.CommitB = "ACTIVE", &b
+		db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID:   storageItem(t, "pair", pairID, pair),
+			"LINK#" + b.LinkID: storageItem(t, "link", b.LinkID, Link{LinkID: b.LinkID, Status: "ACTIVE"}),
+		}}
+		result, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+		if err != nil || result.Link == nil || result.Link.LinkID != b.LinkID {
+			t.Fatalf("result = %#v, error = %v", result, err)
+		}
+		if len(db.updates) != 0 || len(db.transactions) != 0 {
+			t.Fatalf("updates = %#v, transactions = %#v", db.updates, db.transactions)
+		}
+	})
 }
 
 func TestPairCancellationLosesToConcurrentActivation(t *testing.T) {

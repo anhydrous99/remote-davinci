@@ -29,11 +29,11 @@ import (
 )
 
 const (
-	DefaultRelayURL              = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
-	maxFrameBytes                = 32 * 1024
-	maxPendingRelayResponses     = 32
-	maxPendingRelayResponseBytes = protocol.MaxRelayReorderBytes
-	relayRequestTimeout          = 15 * time.Second
+	DefaultRelayURL          = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
+	maxFrameBytes            = protocol.MaxWebSocketFrameBytes
+	maxPendingRelayResponses = 32
+	maxPendingRelayWireBytes = protocol.MaxWebSocketFrameBytes * protocol.MaxRelayReorderFrames
+	relayRequestTimeout      = 15 * time.Second
 )
 
 var Version = "0.1.0"
@@ -44,7 +44,6 @@ var x25519ValidationPrivate = [32]byte{1}
 
 type EnrollmentRequest struct {
 	V                        int    `json:"v"`
-	RelayURL                 string `json:"relayUrl"`
 	ControllerEndpointID     string `json:"controllerEndpointId"`
 	ControllerCredentialHash string `json:"controllerCredentialHash"`
 	ControllerNoiseKey       string `json:"controllerNoiseKey"`
@@ -117,9 +116,6 @@ func contributoryX25519PublicKey(publicKey, privateKey []byte) bool {
 func validateEnrollment(request EnrollmentRequest) error {
 	if request.V != 1 || !uuidPattern.MatchString(request.ControllerEndpointID) ||
 		utf8.RuneCountInString(request.DeviceLabel) < 1 || utf8.RuneCountInString(request.DeviceLabel) > 80 {
-		return errors.New("invalid enrollment request")
-	}
-	if _, err := relayURL(request.RelayURL); err != nil {
 		return errors.New("invalid enrollment request")
 	}
 	if _, err := decode32(request.ControllerCredentialHash); err != nil {
@@ -292,7 +288,9 @@ func (peer *relayPeer) request(ctx context.Context, messageType string, body any
 }
 
 func (peer *relayPeer) queuePending(raw json.RawMessage) error {
-	if len(peer.pending) >= maxPendingRelayResponses || peer.pendingBytes+len(raw) > maxPendingRelayResponseBytes {
+	// pendingBytes counts complete on-wire JSON WebSocket message bytes. Keep it
+	// separate from the decoded payload-byte limit used by session reordering.
+	if len(peer.pending) >= maxPendingRelayResponses || peer.pendingBytes+len(raw) > maxPendingRelayWireBytes {
 		return errors.New("relay returned too many unmatched responses")
 	}
 	peer.pending = append(peer.pending, append(json.RawMessage(nil), raw...))
@@ -365,9 +363,6 @@ func Provision(ctx context.Context, relay string, request EnrollmentRequest, per
 	}
 	if err := validateEnrollment(request); err != nil {
 		return Config{}, EnrollmentResponse{}, err
-	}
-	if request.RelayURL != relay {
-		return Config{}, EnrollmentResponse{}, errors.New("enrollment request relay does not match this companion")
 	}
 	companionEndpointID, err := randomUUID()
 	if err != nil {

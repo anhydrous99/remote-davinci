@@ -144,7 +144,7 @@ describe('RendezvousRelayStack', () => {
     stack.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmDescription: 'Relay rejected or rate-limited connections or messages',
       MetricName: 'RelayRejections',
-      Namespace: 'RemoteDavinci',
+      Namespace: 'RemoteDavinci/dev',
       Threshold: 20,
     });
     const metricFilters = Object.values(
@@ -158,7 +158,7 @@ describe('RendezvousRelayStack', () => {
       {
         DefaultValue: 0,
         MetricName: 'RelayRejections',
-        MetricNamespace: 'RemoteDavinci',
+        MetricNamespace: 'RemoteDavinci/dev',
         MetricValue: '1',
       },
     ]);
@@ -259,6 +259,20 @@ describe('RendezvousRelayStack', () => {
 
   it('sets deployable default production capacity, throttles, and retention', () => {
     const stack = template('prod');
+    stack.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      MetricName: 'RelayRejections',
+      Namespace: 'RemoteDavinci/prod',
+    });
+    stack.hasResourceProperties('AWS::Logs::MetricFilter', {
+      MetricTransformations: [
+        {
+          DefaultValue: 0,
+          MetricName: 'RelayRejections',
+          MetricNamespace: 'RemoteDavinci/prod',
+          MetricValue: '1',
+        },
+      ],
+    });
     stack.hasResource('AWS::DynamoDB::Table', {
       DeletionPolicy: 'Retain',
       UpdateReplacePolicy: 'Retain',

@@ -33,6 +33,7 @@ export class RendezvousRelayStack extends Stack {
     const production = props.environment === 'prod';
     const accessLogging = props.accessLogs ?? true;
     const peakCapacity = production && (props.peakCapacity ?? false);
+    const relayRejectionsNamespace = `RemoteDavinci/${props.environment}`;
     const removalPolicy = production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
     const alarmTopicArn = props.alarmTopicArn;
     if (production && alarmTopicArn === undefined) {
@@ -152,7 +153,7 @@ export class RendezvousRelayStack extends Stack {
       ),
       logGroup: relayLogs,
       metricName: 'RelayRejections',
-      metricNamespace: 'RemoteDavinci',
+      metricNamespace: relayRejectionsNamespace,
       metricValue: '1',
     });
 
@@ -279,7 +280,7 @@ export class RendezvousRelayStack extends Stack {
         evaluationPeriods: 1,
         metric: new cloudwatch.Metric({
           metricName: 'RelayRejections',
-          namespace: 'RemoteDavinci',
+          namespace: relayRejectionsNamespace,
           period: Duration.minutes(5),
           statistic: 'Sum',
         }),

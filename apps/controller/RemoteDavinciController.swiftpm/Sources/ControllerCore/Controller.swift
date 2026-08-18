@@ -6,7 +6,6 @@ import UIKit
 
 struct EnrollmentRequest: Codable, Equatable {
     let v: Int
-    let relayUrl: String
     let controllerEndpointId: String
     let controllerCredentialHash: String
     let controllerNoiseKey: String
@@ -44,6 +43,7 @@ struct ActiveEnrollment {
 
 enum EnrollmentError: LocalizedError, Equatable {
     case invalidDeviceLabel
+    case invalidRelay
     case invalidJSON
     case invalidResponse
     case mismatchedController
@@ -54,6 +54,7 @@ enum EnrollmentError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidDeviceLabel: "Enter a device label between 1 and 80 characters."
+        case .invalidRelay: "The configured relay must be a canonical credential-free wss URL."
         case .invalidJSON: "The enrollment response is not valid JSON."
         case .invalidResponse: "The enrollment response is invalid."
         case .mismatchedController: "The response belongs to another controller."
@@ -67,7 +68,22 @@ enum EnrollmentError: LocalizedError, Equatable {
 enum Enrollment {
     static let defaultRelayURL = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
 
-    static func create(deviceLabel: String) throws -> (EnrollmentRequest, StoredEnrollment) {
+    static func deploymentRelayURL(_ override: String?) throws -> String {
+        try validatedRelayURL(override ?? defaultRelayURL)
+    }
+
+    static func replacementRelayURL(
+        stored: StoredEnrollment?,
+        deploymentRelayURL: String
+    ) throws -> String {
+        try validatedRelayURL(stored?.expectedRelayUrl ?? deploymentRelayURL)
+    }
+
+    static func create(
+        deviceLabel: String,
+        relayURL: String = defaultRelayURL
+    ) throws -> (EnrollmentRequest, StoredEnrollment) {
+        let relayURL = try validatedRelayURL(relayURL)
         let label = deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (1...80).contains(label.unicodeScalars.count) else {
             throw EnrollmentError.invalidDeviceLabel
@@ -81,24 +97,53 @@ enum Enrollment {
             controllerSecret: Base64URL.encode(secret),
             controllerNoisePrivateKey: Base64URL.encode(noisePrivateKey.rawRepresentation),
             deviceLabel: label,
-            expectedRelayUrl: defaultRelayURL,
+            expectedRelayUrl: relayURL,
             response: nil
         )
-        return (request(for: stored), stored)
+        return (try request(for: stored), stored)
     }
 
-    static func request(for stored: StoredEnrollment) -> EnrollmentRequest {
-        let secret = Base64URL.decode32(stored.controllerSecret) ?? Data()
-        let privateKey = Base64URL.decode32(stored.controllerNoisePrivateKey)
-            .flatMap { try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: $0) }
+    static func request(for stored: StoredEnrollment) throws -> EnrollmentRequest {
+        guard let expectedRelayURL = stored.expectedRelayUrl else {
+            throw EnrollmentError.invalidRelay
+        }
+        _ = try validatedRelayURL(expectedRelayURL)
+        guard isCanonicalUUID(stored.controllerEndpointId),
+              let secret = Base64URL.decode32(stored.controllerSecret),
+              let privateKeyData = Base64URL.decode32(stored.controllerNoisePrivateKey),
+              let privateKey = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKeyData),
+              (1...80).contains(stored.deviceLabel.unicodeScalars.count)
+        else {
+            throw EnrollmentError.invalidResponse
+        }
         return EnrollmentRequest(
             v: 1,
-            relayUrl: stored.expectedRelayUrl ?? defaultRelayURL,
             controllerEndpointId: stored.controllerEndpointId,
             controllerCredentialHash: Base64URL.encode(Data(SHA256.hash(data: secret))),
-            controllerNoiseKey: privateKey.map { Base64URL.encode($0.publicKey.rawRepresentation) } ?? "",
+            controllerNoiseKey: Base64URL.encode(privateKey.publicKey.rawRepresentation),
             deviceLabel: stored.deviceLabel
         )
+    }
+
+    static func migrateLegacy(
+        _ stored: StoredEnrollment,
+        deploymentRelayURL: String
+    ) throws -> StoredEnrollment {
+        _ = try validatedRelayURL(deploymentRelayURL)
+        if let expectedRelayURL = stored.expectedRelayUrl {
+            _ = try validatedRelayURL(expectedRelayURL)
+            return stored
+        }
+
+        var migrated = stored
+        if let response = stored.response {
+            try validate(response: response, for: stored)
+            migrated.expectedRelayUrl = response.relayUrl
+        } else {
+            migrated.expectedRelayUrl = deploymentRelayURL
+            _ = try request(for: migrated)
+        }
+        return migrated
     }
 
     static func importResponse(_ json: String, into stored: StoredEnrollment) throws -> StoredEnrollment {
@@ -107,14 +152,22 @@ enum Enrollment {
         else {
             throw EnrollmentError.invalidJSON
         }
-        guard response.v == 1,
-              isCanonicalUUID(response.linkId),
-              isCanonicalUUID(response.controllerEndpointId),
-              isCanonicalUUID(response.companionEndpointId),
-              response.controllerEndpointId != response.companionEndpointId,
-              let companionNoiseKey = Base64URL.decode32(response.companionNoiseKey),
-              isContributoryX25519PublicKey(companionNoiseKey),
-              let components = URLComponents(string: response.relayUrl),
+        try validate(response: response, for: stored)
+        guard let expectedRelayURL = stored.expectedRelayUrl else {
+            throw EnrollmentError.invalidRelay
+        }
+        _ = try validatedRelayURL(expectedRelayURL)
+        guard response.relayUrl == expectedRelayURL else {
+            throw EnrollmentError.mismatchedRelay
+        }
+
+        var active = stored
+        active.response = response
+        return active
+    }
+
+    private static func validatedRelayURL(_ value: String) throws -> String {
+        guard let components = URLComponents(string: value),
               components.scheme == "wss",
               components.host?.isEmpty == false,
               components.user == nil,
@@ -122,28 +175,38 @@ enum Enrollment {
               components.query == nil,
               components.fragment == nil,
               let relayURL = components.url,
-              relayURL.absoluteString == response.relayUrl
+              relayURL.absoluteString == value
         else {
-            throw EnrollmentError.invalidResponse
+            throw EnrollmentError.invalidRelay
         }
-        guard response.controllerEndpointId == stored.controllerEndpointId else {
-            throw EnrollmentError.mismatchedController
-        }
-        let expectedRelayURL = stored.expectedRelayUrl ?? defaultRelayURL
-        guard response.relayUrl == expectedRelayURL else {
-            throw EnrollmentError.mismatchedRelay
-        }
-        guard Base64URL.decode32(stored.controllerSecret) != nil,
+        return value
+    }
+
+    private static func validate(
+        response: EnrollmentResponse,
+        for stored: StoredEnrollment
+    ) throws {
+        guard response.v == 1,
+              isCanonicalUUID(response.linkId),
+              isCanonicalUUID(response.controllerEndpointId),
+              isCanonicalUUID(response.companionEndpointId),
+              response.controllerEndpointId != response.companionEndpointId,
+              let companionNoiseKey = Base64URL.decode32(response.companionNoiseKey),
+              isContributoryX25519PublicKey(companionNoiseKey),
+              Base64URL.decode32(stored.controllerSecret) != nil,
               Base64URL.decode32(stored.controllerNoisePrivateKey) != nil,
               isCanonicalUUID(stored.controllerEndpointId)
         else {
             throw EnrollmentError.invalidResponse
         }
-
-        var active = stored
-        active.expectedRelayUrl = expectedRelayURL
-        active.response = response
-        return active
+        do {
+            _ = try validatedRelayURL(response.relayUrl)
+        } catch {
+            throw EnrollmentError.invalidResponse
+        }
+        guard response.controllerEndpointId == stored.controllerEndpointId else {
+            throw EnrollmentError.mismatchedController
+        }
     }
 
     static func isContributoryX25519PublicKey(_ data: Data) -> Bool {
@@ -576,6 +639,7 @@ public final class ControllerModel: ObservableObject {
         let expiresAt: Int64
     }
 
+    private var enrollmentRelayURL: String?
     private var storedEnrollment: StoredEnrollment?
     private let urlSession = URLSession(configuration: .ephemeral)
     private var socket: URLSessionWebSocketTask?
@@ -595,29 +659,48 @@ public final class ControllerModel: ObservableObject {
     private var lateResponses = LateResponseWindow()
     private var reconnectAttempt = 0
 
-    public init() {
+    public init(relayURL: String? = nil) {
         do {
-            guard let stored = try KeychainStore.load() else { return }
-            hasLocalEnrollment = true
-            storedEnrollment = stored
-            let request = Enrollment.request(for: stored)
-            guard isCanonicalUUID(request.controllerEndpointId),
-                  Base64URL.decode32(stored.controllerSecret) != nil,
-                  Base64URL.decode32(stored.controllerNoisePrivateKey) != nil,
-                  !request.controllerNoiseKey.isEmpty
-            else {
-                throw EnrollmentError.invalidResponse
+            enrollmentRelayURL = try Enrollment.deploymentRelayURL(relayURL)
+        } catch {
+            enrollmentRelayURL = nil
+            enrollmentStatus = error.localizedDescription
+            return
+        }
+
+        do {
+            guard let deploymentRelayURL = enrollmentRelayURL else {
+                throw EnrollmentError.invalidRelay
             }
-            enrollmentRequestJSON = try request.jsonString()
+            guard let loaded = try KeychainStore.load() else { return }
+            let stored = try Enrollment.migrateLegacy(
+                loaded,
+                deploymentRelayURL: deploymentRelayURL
+            )
+            let request = try Enrollment.request(for: stored)
+            let requestJSON = try request.jsonString()
+            let replacementRelayURL = try Enrollment.replacementRelayURL(
+                stored: stored,
+                deploymentRelayURL: deploymentRelayURL
+            )
+            let status: String
             if stored.response != nil {
                 _ = try Enrollment.active(from: stored)
-                isEnrolled = true
-                enrollmentStatus = stored.linkRevocationConfirmed == true
+                status = stored.linkRevocationConfirmed == true
                     ? "Link revoked; finish re-enrollment"
                     : "Enrolled"
             } else {
-                enrollmentStatus = "Request ready"
+                status = "Request ready"
             }
+            if stored != loaded {
+                try KeychainStore.save(stored)
+            }
+            storedEnrollment = stored
+            enrollmentRelayURL = replacementRelayURL
+            hasLocalEnrollment = true
+            enrollmentRequestJSON = requestJSON
+            isEnrolled = stored.response != nil
+            enrollmentStatus = status
         } catch {
             hasLocalEnrollment = true
             enrollmentStatus = error.localizedDescription
@@ -631,7 +714,11 @@ public final class ControllerModel: ObservableObject {
         }
         stopMaintainingConnection(status: "Disconnected", feedback: "")
         do {
-            let (request, stored) = try Enrollment.create(deviceLabel: deviceLabel)
+            guard let enrollmentRelayURL else { throw EnrollmentError.invalidRelay }
+            let (request, stored) = try Enrollment.create(
+                deviceLabel: deviceLabel,
+                relayURL: enrollmentRelayURL
+            )
             let requestJSON = try request.jsonString()
             try KeychainStore.save(stored)
             storedEnrollment = stored
@@ -1116,7 +1203,11 @@ public final class ControllerModel: ObservableObject {
     }
 
     private func createReplacementRequest(status: String) throws {
-        let (request, replacement) = try Enrollment.create(deviceLabel: deviceLabel)
+        guard let enrollmentRelayURL else { throw EnrollmentError.invalidRelay }
+        let (request, replacement) = try Self.replacementEnrollment(
+            deviceLabel: deviceLabel,
+            relayURL: enrollmentRelayURL
+        )
         let requestJSON = try request.jsonString()
         try KeychainStore.save(replacement)
         storedEnrollment = replacement
@@ -1125,6 +1216,13 @@ public final class ControllerModel: ObservableObject {
         enrollmentStatus = status
         connectionStatus = "Disconnected"
         feedback = ""
+    }
+
+    nonisolated static func replacementEnrollment(
+        deviceLabel: String,
+        relayURL: String
+    ) throws -> (EnrollmentRequest, StoredEnrollment) {
+        try Enrollment.create(deviceLabel: deviceLabel, relayURL: relayURL)
     }
 
     private func persistLinkRevocationCheckpoint(linkID: String) throws {

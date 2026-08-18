@@ -175,6 +175,11 @@ when direct HTTP boundary probing is required:
 go run ./cmd/companion -config /absolute/private/temp/companion.json -allow-insecure-file-config
 ```
 
+For a confirmed disposable or self-hosted relay, set the same canonical
+`REMOTE_DAVINCI_RELAY_URL` in the controller and companion Xcode launch
+environments before creating either side's enrollment. Omit it when testing the
+default production relay.
+
 Capture its single-use bootstrap URL privately.
 
 Verify:
@@ -216,9 +221,10 @@ fresh endpoints. This test operator, with both devices unlocked and under direct
 control, is the authenticated channel: the shipped apps do not run PAKE or
 negotiate granular grants. For each device:
 
-1. Confirm the controller request's relay on the trusted Mac and import the
-   returned response only on the originating device. Tamper the response relay
-   once and require rejection before importing the untampered response.
+1. Confirm the controller's locally selected relay matches the trusted Mac's
+   configured relay and import the returned response only on the originating
+   device. Tamper the response relay once and require rejection before importing
+   the untampered response.
 2. Connect and verify both sides report a secure session and matching peer.
 3. Tap each page tab and use the host mute control once. Require remote actions
    to remain unavailable while disconnected or handshaking, and page commands
