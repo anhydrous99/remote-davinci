@@ -37,7 +37,7 @@ struct ControllerView: View {
 
     private var pageSelection: Binding<ResolvePage> {
         Binding(
-            get: { model.selectedPage },
+            get: { model.displayedPage },
             set: { model.requestPage($0) }
         )
     }
@@ -49,10 +49,20 @@ struct ControllerView: View {
                     Color.clear
                         .accessibilityElement()
                         .accessibilityLabel("\(page.rawValue.capitalized) page")
+                        .accessibilityHint("Opens this page in DaVinci Resolve on the Mac")
                         .tabItem {
                             Label(page.rawValue.capitalized, systemImage: page.systemImage)
                         }
                         .tag(page)
+                }
+            }
+            .disabled(!model.isReady || model.pendingPage != nil)
+            .overlay {
+                if let page = model.pendingPage {
+                    ProgressView("Opening \(page.rawValue.capitalized)…")
+                        .accessibilityLabel(
+                            "Opening \(page.rawValue.capitalized) page in DaVinci Resolve"
+                        )
                 }
             }
             .navigationTitle("Remote DaVinci")

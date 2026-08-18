@@ -601,6 +601,17 @@ final class ControllerTests: XCTestCase {
         XCTAssertNil(ResolvePage(operation: "host.volume.toggle-mute"))
     }
 
+    func testPendingPageOverridesConfirmedPageUntilCleared() {
+        XCTAssertEqual(
+            ResolvePageControl.displayedPage(selected: .edit, pending: .color),
+            .color
+        )
+        XCTAssertEqual(
+            ResolvePageControl.displayedPage(selected: .fusion, pending: nil),
+            .fusion
+        )
+    }
+
     func testResolvePageResponseRequiresMatchingReadback() throws {
         XCTAssertEqual(
             try ResolvePageControl.responsePage(

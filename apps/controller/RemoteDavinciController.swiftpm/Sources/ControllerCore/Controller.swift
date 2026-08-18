@@ -592,6 +592,10 @@ public enum ResolvePage: String, CaseIterable, Sendable {
 }
 
 enum ResolvePageControl {
+    static func displayedPage(selected: ResolvePage, pending: ResolvePage?) -> ResolvePage {
+        pending ?? selected
+    }
+
     static func responsePage(operation: String, result: Any) throws -> ResolvePage? {
         guard let expected = ResolvePage(operation: operation) else { return nil }
         guard let result = result as? [String: Any],
@@ -640,6 +644,11 @@ public final class ControllerModel: ObservableObject {
     @Published public private(set) var companionCapabilities = Set<String>()
     @Published public private(set) var grantedPermissions = Set<String>()
     @Published public private(set) var selectedPage: ResolvePage = .edit
+    @Published public private(set) var pendingPage: ResolvePage?
+
+    public var displayedPage: ResolvePage {
+        ResolvePageControl.displayedPage(selected: selectedPage, pending: pendingPage)
+    }
 
     private struct PendingCommand {
         let id: String
@@ -877,11 +886,11 @@ public final class ControllerModel: ObservableObject {
     }
 
     public func requestPage(_ page: ResolvePage) {
-        Task { await sendCommand(page.operation) }
+        sendCommand(page.operation)
     }
 
     public func toggleHostMute() {
-        Task { await sendCommand("host.volume.toggle-mute") }
+        sendCommand("host.volume.toggle-mute")
     }
 
     public func revokeAndReenroll() {
@@ -1186,6 +1195,7 @@ public final class ControllerModel: ObservableObject {
         expiryTask?.cancel()
         expiryTask = nil
         self.pendingCommand = nil
+        defer { pendingPage = nil }
         guard nowMilliseconds() <= pendingCommand.expiresAt else {
             feedback = "\(pendingCommand.operation) expired"
             return
@@ -1209,35 +1219,38 @@ public final class ControllerModel: ObservableObject {
         }
     }
 
-    private func sendCommand(_ operation: String) async {
+    private func sendCommand(_ operation: String) {
         guard Self.operations.contains(operation), canSend(operation), let task = socket else { return }
         let sentAt = nowMilliseconds()
         let expiresAt = sentAt + 5_000
         let id = UUID().uuidString.lowercased()
         pendingCommand = PendingCommand(id: id, operation: operation, expiresAt: expiresAt)
+        pendingPage = ResolvePage(operation: operation)
         feedback = "Sending \(operation)"
 
-        do {
-            try await sendControl(
-                type: "request",
-                id: id,
-                body: [
-                    "operation": operation,
-                    "args": [String: Any](),
-                    "sentAt": sentAt,
-                    "expiresAt": expiresAt,
-                ],
-                on: task
-            )
-            guard socket === task, pendingCommand?.id == id else { return }
-            feedback = "Waiting for \(operation)"
-            expiryTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(5))
-                guard !Task.isCancelled else { return }
-                self?.expireCommand(id)
+        Task {
+            do {
+                try await sendControl(
+                    type: "request",
+                    id: id,
+                    body: [
+                        "operation": operation,
+                        "args": [String: Any](),
+                        "sentAt": sentAt,
+                        "expiresAt": expiresAt,
+                    ],
+                    on: task
+                )
+                guard socket === task, pendingCommand?.id == id else { return }
+                feedback = "Waiting for \(operation)"
+                expiryTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(5))
+                    guard !Task.isCancelled else { return }
+                    self?.expireCommand(id)
+                }
+            } catch {
+                connectionFailed(task, error: error)
             }
-        } catch {
-            connectionFailed(task, error: error)
         }
     }
 
@@ -1245,6 +1258,7 @@ public final class ControllerModel: ObservableObject {
         guard let pendingCommand, pendingCommand.id == id else { return }
         lateResponses.remember(id)
         self.pendingCommand = nil
+        pendingPage = nil
         expiryTask = nil
         feedback = "\(pendingCommand.operation) expired"
     }
@@ -1723,6 +1737,7 @@ public final class ControllerModel: ObservableObject {
         noiseReady = false
         receivedHello = false
         pendingCommand = nil
+        pendingPage = nil
         lateResponses = LateResponseWindow()
         companionCapabilities = []
         isConnected = false
