@@ -1,15 +1,15 @@
 # `protocol`
 
 This is the implementer-facing protocol reference. For app installation and the
-manual enrollment flow, use the [README quick start](../README.md#run-the-mac-companion-and-iphone-app).
+QR pairing flow, use the [README quick start](../README.md#run-the-mac-companion-and-iphone-app).
 
 Language-neutral v1 contracts and Go trust-boundary validators for the Remote DaVinci rendezvous, pairing, relay, and control protocols.
 
-The JSON Schemas in `schemas` are the wire-format source of truth. The public Go package exports the corresponding message types, constants, and parsers. Unknown fields on a known message are ignored for forward compatibility, except for the deliberately closed `pair.commit` identity objects. Unknown message types, missing fields, invalid field values, and unsupported protocol versions fail closed.
+The JSON Schemas in `schemas` are the wire-format source of truth. The public Go package exports the corresponding message types, constants, and parsers. Unknown fields on a known rendezvous message are ignored for forward compatibility, except for the deliberately closed `pair.commit` identity objects. QR invitation objects are also closed. Unknown message types, missing fields, invalid field values, and unsupported protocol versions fail closed.
 
 ## Scope and trust boundary
 
-The AWS service is an availability and routing intermediary. It may learn endpoint IDs, roles, link IDs, credential hashes, pairing locators, IP addresses, connection times, and traffic volume. It must not receive or store Noise keys or fingerprints, device labels, permissions, capabilities, pairing words, private keys, decrypted control messages, or relay plaintext.
+The AWS service is an availability and routing intermediary. It may learn endpoint IDs, roles, link IDs, credential hashes, pairing locators, QR join-token hashes, IP addresses, connection times, and traffic volume. A QR join token is visible transiently to the join handler, which hashes it before storage lookup. The service must not receive or store Noise keys or fingerprints, device labels, permissions, capabilities, pairing words, QR pre-shared keys, private keys, decrypted control messages, or relay plaintext.
 
 V1 is single-region, relay-only, and live-only. It has no mailbox, offline queue, push channel, direct-connect negotiation, account, or arbitrary script transport.
 
@@ -55,8 +55,8 @@ A pairing connection may call `system.*`, pairing lifecycle messages, and `pair.
 | --- | --- | --- |
 | `system.hello` | `{}` | `{ serverTime, protocolVersion }` |
 | `system.ping` | `{ sentAt }` | `{ receivedAt }` |
-| `pair.create` | `{}` | `{ pairId, sideId, locator, expiresAt }` |
-| `pair.join` | `{ locator }` | `{ pairId, sideId, expiresAt }` |
+| `pair.create` | `{}` or `{ joinTokenHash }` | `{ pairId, sideId, expiresAt }`, plus `locator` only for the legacy profile |
+| `pair.join` | Exactly one of `{ locator }` or `{ joinToken }` | `{ pairId, sideId, expiresAt }` |
 | `pair.commit` | `{ pairId, sideId, linkId, self, peer }` | `{ pending: true }` or `{ linkId, active: true }` |
 | `pair.cancel` | `{ pairId }` | `{ cancelled: true }` |
 | `pair.frame` | `{ pairId, seq, payload }` | None (one-way) |
@@ -83,25 +83,33 @@ Server events are:
 
 The stable outer errors are exported as `ErrorCodes`. Successful frame forwarding has no correlated `ok` response. A correlated `error` reports that AWS rejected or could not forward the frame; it says nothing about whether a peer decrypted or applied ciphertext already posted successfully.
 
-## Shipped enrollment boundary
+## QR pairing profile
 
-The current controller and companion do **not** implement the PAKE profile
-below. Enrollment is a manual bootstrap for one operator controlling both
-unlocked devices: the controller validates and persists its intended relay
-locally before creating the unchanged V1 identity request, the companion uses
-its own configured relay and administratively submits both relay commits, and
-the controller accepts only a response with the original controller ID and its
-locally pinned relay. The two JSON documents must be transferred over an
-authenticated operator-controlled path; the software does not cryptographically
-authenticate that manual transfer.
+The companion creates independent random 32-byte `joinToken` and `psk` values. It sends only `base64url(SHA-256(raw joinToken))` as `joinTokenHash` to `pair.create`. The relay stores a TTL-bound `JOIN#<joinTokenHash>` pointer; it does not allocate or return a six-digit locator for this profile. The controller submits the raw token once to `pair.join`; the handler hashes it before lookup. A token pair cannot be joined through the locator profile, and a legacy locator pair cannot be joined through the token profile.
 
-Enrollment is all-or-nothing authorization for the current five fixed
-operations (`resolve.page.cut`, `resolve.page.edit`, `resolve.page.fusion`,
-`resolve.page.color`, and `host.volume.toggle-mute`). Capability `hello`
-messages support feature negotiation only. The apps neither negotiate nor
-persist per-operation grants.
+The QR document is the closed `pairing-invite-v1.schema.json` object:
 
-## Deferred authenticated pairing profile
+```json
+{"protocol":"remote-davinci.pairing-invite","v":1,"relayUrl":"wss://relay.example/v1","pairId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","creatorSideId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","linkId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","joinToken":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","psk":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI","expiresAt":1786723500}
+```
+
+Both peers run `Noise_NNpsk0_25519_ChaChaPoly_SHA256` with empty handshake payloads and the QR `psk`. The prologue is UTF-8 `remote-davinci/pair-qr/v1`, followed by newline-delimited `relayUrl`, `pairId`, creator side ID, joiner side ID, `linkId`, and decimal `expiresAt`. After the handshake, the controller sends the first encrypted pairing identity transport frame and the companion replies only after local approval. Durable sessions continue to use the existing Noise IK profile.
+
+## Enrollment boundary
+
+The QR profile is the normal live onboarding path. The existing two-document
+manual bootstrap remains an advanced fallback while physical-device validation
+is pending. The PAKE/manual-code profile below is still deferred.
+
+The QR controller requests from the current five fixed operations
+(`resolve.page.cut`, `resolve.page.edit`, `resolve.page.fusion`,
+`resolve.page.color`, and `host.volume.toggle-mute`). After local approval, the
+companion returns and persists only its supported intersection; both runtimes
+persist that grant and the companion enforces it before dispatch. The current
+controller requests all five. Legacy manual enrollment has no negotiated grant
+field and migrates as the same five-operation V1 grant.
+
+## Deferred manual-code PAKE profile
 
 This section is an expansion gate, not a shipped-runtime claim. Before
 multi-user, delegated, unattended, or untrusted-channel enrollment, implement
@@ -138,7 +146,7 @@ The compact phase-`0` wrapper plus SecretBox and hex overhead limits the decrypt
 
 ## Durable link and session profile
 
-Private service credentials and the local Noise static private key belong in Keychain or the platform credential store. The current apps store the requested relay, peer endpoint ID, peer Noise static public key, local display name, and revocation state in Keychain; they do not store a negotiated grant. A future PAKE/grant implementation also stores the verified fingerprint, approved permission intersection, negotiated capabilities, and protocol version. Credential loss or an unexpected peer key requires pairing again; a changed peer key is never silently accepted.
+Private service credentials and the local Noise static private key belong in Keychain or the platform credential store. The current apps store the requested relay, peer endpoint ID, peer Noise static public key and fingerprint, local display name, approved permission intersection, pairing protocol, activation checkpoint, and revocation state in Keychain. Credential loss or an unexpected peer key requires pairing again; a changed peer key is never silently accepted.
 
 An authenticated controller opens a live session by link ID. The service permits one active session per endpoint and link and emits `session.opened` to both sides. Each direction starts outer `seq` at `1`. API Gateway may deliver concurrent relay invocations out of order, so a receiver buffers at most the next 8 frames (128 KiB decoded total) and drains only contiguous sequences into Noise. An old or duplicate sequence, or a gap beyond that bound, closes the session.
 
@@ -197,7 +205,7 @@ Resolve pages outside Cut, Edit, Fusion, and Color produce no event, leave the
 last supported app tab selected, and are never changed by the controller merely
 to force synchronization.
 
-Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The current companion accepts requests only after the enrolled controller completes Noise IK, then authorizes against the fixed five-operation allowlist above. This is the full grant conferred by current enrollment; it is not a negotiated or persisted per-operation grant. A future granular-grant implementation must add one central stored-grant check before dispatch. Within a session, duplicate request IDs return the cached response without executing twice.
+Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The current companion accepts requests only after the enrolled controller completes Noise IK, then authorizes against both the fixed five-operation allowlist and the stored pairing grant before dispatch. Within a session, duplicate request IDs return the cached response without executing twice.
 
 ## Delivery and lifecycle semantics
 

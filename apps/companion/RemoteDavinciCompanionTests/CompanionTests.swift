@@ -97,7 +97,7 @@ final class CompanionTests: XCTestCase {
     }
 
     func testStateAndEnrollmentModelsMatchHelperJSON() throws {
-        let state = try JSONDecoder().decode(CompanionState.self, from: Data(#"{"configured":true,"relayUrl":"wss://relay.example/v1","endpointId":"endpoint","linkId":"link","controllerLabel":"iPad","connected":true,"secure":true,"status":"Secure session"}"#.utf8))
+        let state = try JSONDecoder().decode(CompanionState.self, from: Data(#"{"configured":true,"relayUrl":"wss://relay.example/v1","endpointId":"endpoint","linkId":"link","controllerLabel":"iPad","connected":true,"secure":true,"status":"Secure session","pairing":null}"#.utf8))
         XCTAssertEqual(state.connectionSummary, "Secure controller session")
         XCTAssertEqual(state.controllerLabel, "iPad")
 
@@ -115,5 +115,32 @@ final class CompanionTests: XCTestCase {
             from: Data(try reply.formattedJSON().utf8)
         )
         XCTAssertEqual(roundTrip, reply)
+    }
+
+    func testPairingInviteRoundTripsToRenderableQRCode() throws {
+        let invite = PairingInvite(
+            protocolName: "remote-davinci.pairing-invite",
+            v: 1,
+            relayURL: "wss://relay.example/v1",
+            pairID: "11111111-1111-4111-8111-111111111111",
+            creatorSideID: "22222222-2222-4222-8222-222222222222",
+            linkID: "33333333-3333-4333-8333-333333333333",
+            joinToken: token,
+            psk: token,
+            expiresAt: 1_800_000_000
+        )
+
+        let payload = try invite.qrPayload()
+        XCTAssertEqual(try JSONDecoder().decode(PairingInvite.self, from: Data(payload.utf8)), invite)
+        XCTAssertNotNil(QRCodeRenderer.image(for: payload))
+    }
+
+    func testPairingStateMatchesHelperJSON() throws {
+        let data = Data(#"{"configured":false,"relayUrl":"wss://relay.example/v1","connected":false,"secure":false,"status":"Awaiting approval","pairing":{"phase":"awaiting_approval","pairId":"11111111-1111-4111-8111-111111111111","expiresAt":1800000000,"controllerLabel":"My iPhone","controllerFingerprint":"sha256:test","requestedPermissions":["resolve.page.edit"]}}"#.utf8)
+        let state = try JSONDecoder().decode(CompanionState.self, from: data)
+
+        XCTAssertTrue(state.pairing?.isAwaitingApproval == true)
+        XCTAssertEqual(state.pairing?.controllerLabel, "My iPhone")
+        XCTAssertEqual(state.pairing?.requestedPermissions, ["resolve.page.edit"])
     }
 }

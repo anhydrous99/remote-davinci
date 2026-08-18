@@ -1,7 +1,7 @@
 # End-to-end test plan
 
 This is the release-validation matrix, not the basic setup guide. To build,
-enroll, and run the two apps, start with [Run the Mac companion and iPhone
+pair, and run the two apps, start with [Run the Mac companion and iPhone
 app](../README.md#run-the-mac-companion-and-iphone-app).
 
 This plan validates the complete live path:
@@ -19,8 +19,9 @@ is not release readiness.
 - Use a disposable `RemoteDavinci-dev` stack for provisioning, revocation,
   replay, and failure-path tests. The live canary refuses to run without the
   disposable opt-in or an explicit dangerous production override.
-- Never copy enrollment JSON, bearer headers, Noise keys, ciphertext, or the
-  companion launch token into test evidence or shared logs. The native app
+- Never copy QR invitations, enrollment JSON, bearer headers, Noise keys,
+  ciphertext, pairing secrets, or the companion launch token into test evidence
+  or shared logs. The native app
   captures the helper's launch record privately. The development CLI
   prints a single-use browser-bootstrap URL to the local console; capture it
   privately and record only stable operation/error codes and pass/fail results.
@@ -77,9 +78,13 @@ skips, or expected failures.
 Coverage required:
 
 - Rendezvous/control schema validation and frame byte limits.
-- Official Noise IK interoperability vector and peer-static-key validation.
-- Enrollment response validation, exact request/response relay binding, relay
-  mismatch rejection, and device-only Keychain coding.
+- Official Noise IK and Noise NNpsk0 interoperability vectors, peer-static-key
+  validation, and cross-language pairing-handshake coverage.
+- Strict QR invitation parsing, relay pinning, expiry, independent secret
+  validation, pairing prologue binding, legacy enrollment response validation,
+  and device-only Keychain coding.
+- Token-only pair creation/join, hash-only admission storage, wrong/missing/
+  reused token rejection, and no downgrade to the legacy locator profile.
 - Eight-frame/128 KiB bounded reordering, contiguous drain, and rejection of
   duplicates, stale sequences, oversized gaps, and oversized payloads.
 - One-command-in-flight, expiration, deduplication, and late-response handling.
@@ -105,10 +110,11 @@ For both an iPhone and iPad simulator:
 1. Build normally for the simulator so the app receives an ad-hoc signature;
    do not use an unsigned build for Keychain launch validation.
 2. Uninstall any prior app, install the fresh product, and cold launch it.
-3. Verify the initial state says `Not enrolled`, with connection and host
-   controls disabled and the Cut, Edit, Fusion, and Color tab labels visible.
-4. Create an enrollment request, terminate and relaunch, and verify the pending
-   request survives in Keychain without exposing its secret in logs.
+3. Verify the initial state says `Not enrolled`, shows **Scan Mac QR Code**, and
+   leaves connection and host controls disabled.
+4. Because the simulator camera cannot prove scanning, exercise the paste-invite
+   fallback with valid, malformed, expired, and wrong-relay invitations. Verify
+   no pending credential is promoted before reciprocal activation.
 5. Verify all four page bodies are blank, then inspect portrait phone plus
    portrait and landscape tablet layouts, Dynamic Type, tab VoiceOver labels,
    and destructive confirmation dialogs.
@@ -202,6 +208,12 @@ Verify:
 - `/api/*` rejects a missing or wrong launch token.
 - Non-loopback/DNS-rebinding Host values, cross-origin POSTs, non-JSON POSTs,
   oversized bodies, unknown fields, and trailing JSON are rejected.
+- Pairing start returns its invitation only once; state polling exposes only
+  sanitized phase/expiry/controller data. Approve, reject, and cancel require
+  the current pair ID and the launch-scoped API token.
+- A scan hides the QR before approval. Reject, cancel, expiry, helper shutdown,
+  malformed identity, and cryptographic failure close the slot and erase its
+  in-memory join token and PSK without creating configuration.
 - The current-enrollment guard blocks replacement until reset or explicit
   separately confirmed local forget; the latter warns that the remote identity
   may remain.
@@ -222,34 +234,39 @@ mutate the host, and every supported runtime failure leaves a recoverable state.
 
 ## Phase 6: physical-device live matrix
 
-Repeat the manual enrollment ceremony separately on an iPhone and iPad using
-fresh endpoints. This test operator, with both devices unlocked and under direct
-control, is the authenticated channel: the shipped apps do not run PAKE or
-negotiate granular grants. For each device:
+Repeat QR pairing separately on a physical iPhone and iPad using fresh
+endpoints. For each device:
 
-1. Confirm the controller's locally selected relay matches the trusted Mac's
-   configured relay and import the returned response only on the originating
-   device. Tamper the response relay once and require rejection before importing
-   the untampered response.
-2. Connect and verify both sides report a secure session and matching peer.
-3. Tap each page tab and use the host mute control once. Require remote actions
+1. Test camera permission allow, deny, re-enable in Settings, low light,
+   portrait/landscape, Dynamic Type, VoiceOver, and repeated scanner callbacks.
+   The scanner must stop after one valid invite.
+2. Tamper the QR relay, pair ID, join token, PSK, expiry, and one unknown field
+   separately. Require rejection or cryptographic failure with no saved link;
+   also reject an expired screenshot and reuse of a successfully scanned QR.
+3. Scan a fresh QR, verify the Mac hides it, compare the displayed controller
+   label/fingerprint and five requested controls, then approve. Reject a separate
+   fresh attempt once and verify neither device persists it.
+4. Verify both sides report a secure session and matching peer, and that the
+   controller connects automatically only after activation.
+5. Tap each page tab and use the host mute control once. Require remote actions
    to remain unavailable while disconnected or handshaking, and page commands
    to remain bounded to one in flight.
-4. Confirm success, stable failure code, and unknown-result UI states are
+6. Confirm success, stable failure code, and unknown-result UI states are
    distinguishable.
-5. Background for 30 seconds, foreground, and reconnect; confirm no prior
-   command is replayed.
-6. Disable/restore Wi-Fi, switch Wi-Fi to cellular and back, restart the
+7. Background while scanning, authenticating, awaiting approval, and after
+   activation. Pre-activation cases require a fresh code; after activation,
+   foreground and reconnect with no prior command replay.
+8. Disable/restore Wi-Fi, switch Wi-Fi to cellular and back, restart the
    companion, and replace the bearer socket. Confirm bounded backoff and fresh
    sessions without stale-session teardown.
-7. Inject a delayed response beyond command expiry. It may update an expired
+9. Inject a delayed response beyond command expiry. It may update an expired
    result policy but must not close an otherwise healthy secure session.
-8. Revoke and re-enroll. Verify the old link stops immediately, both old bearer
-   credentials fail, exact Keychain data is removed, and the new identity is
-   different.
-9. Test the separately confirmed local-forget path with a deliberately stale
-   credential; record any intentionally orphaned inert endpoint for stack
-   teardown.
+10. Revoke and re-enroll. Verify the old link stops immediately, both old bearer
+    credentials fail, exact Keychain data is removed, and the new identity is
+    different.
+11. Test the separately confirmed local-forget path with a deliberately stale
+    credential; record any intentionally orphaned inert endpoint for stack
+    teardown.
 
 Pass: both form factors complete the matrix over a real signed Keychain and
 real suspension/network behavior, with zero replay or unauthorized execution.
@@ -319,7 +336,8 @@ Before teardown, inspect the disposable stack:
 - Lambda errors/throttles and API execution errors.
 - DynamoDB throttles, TTL status, and only expected active/tombstoned records.
 - Sanitized logs for validation codes; search explicitly for bearer prefixes,
-  enrollment field names, Noise material, and full payloads.
+  enrollment/invitation field names, join tokens, PSKs, Noise material, and full
+  payloads.
 
 Then:
 

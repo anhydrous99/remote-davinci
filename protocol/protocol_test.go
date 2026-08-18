@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -134,6 +135,88 @@ func TestSchemaValidIntegerSpellings(t *testing.T) {
 		if err != nil || control.V != 1 {
 			t.Fatalf("%s control = %#v, error = %v", spelling, control, err)
 		}
+	}
+}
+
+func TestQRPairingInviteAndTokenAdmission(t *testing.T) {
+	joinToken := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	psk := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
+	pairID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	creatorSideID := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	joinerSideID := "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+	linkID := "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	invite := map[string]any{
+		"protocol": PairingInviteProtocolName, "v": 1,
+		"relayUrl": "wss://relay.example/v1", "pairId": pairID,
+		"creatorSideId": creatorSideID, "linkId": linkID,
+		"joinToken": joinToken, "psk": psk, "expiresAt": int64(300),
+	}
+	parsed, err := ParsePairingInvite(invite)
+	if err != nil || parsed.JoinToken != joinToken {
+		t.Fatalf("invite = %#v, error = %v", parsed, err)
+	}
+	if err := ValidatePairingInviteAt(parsed, 1); err != nil {
+		t.Fatal(err)
+	}
+	requireCode(t, PairExpired, ValidatePairingInviteAt(parsed, 300))
+	tooFar := parsed
+	tooFar.ExpiresAt = 302
+	requireCode(t, PairExpired, ValidatePairingInviteAt(tooFar, 1))
+	prologue, err := PairingNoisePrologue(parsed.RelayURL, pairID, creatorSideID, joinerSideID, linkID, parsed.ExpiresAt)
+	if err != nil || string(prologue) != "remote-davinci/pair-qr/v1\nwss://relay.example/v1\n"+pairID+"\n"+creatorSideID+"\n"+joinerSideID+"\n"+linkID+"\n300" {
+		t.Fatalf("prologue = %q, error = %v", prologue, err)
+	}
+	hash, err := JoinTokenHash(joinToken)
+	wantHash := sha256.Sum256(bytes.Repeat([]byte{1}, 32))
+	if err != nil || hash != base64.RawURLEncoding.EncodeToString(wantHash[:]) {
+		t.Fatalf("hash = %q, error = %v", hash, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		change func(map[string]any)
+		code   ErrorCode
+	}{
+		{"unknown field", func(value map[string]any) { value["future"] = true }, InvalidMessage},
+		{"insecure relay", func(value map[string]any) { value["relayUrl"] = "https://relay.example/v1" }, InvalidMessage},
+		{"reused token as psk", func(value map[string]any) { value["psk"] = joinToken }, InvalidMessage},
+		{"unsupported version", func(value map[string]any) { value["v"] = 2 }, UnsupportedVersion},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			copy := make(map[string]any, len(invite))
+			for key, value := range invite {
+				copy[key] = value
+			}
+			test.change(copy)
+			_, err := ParsePairingInvite(copy)
+			requireCode(t, test.code, err)
+		})
+	}
+
+	validHash := base64.RawURLEncoding.EncodeToString(wantHash[:])
+	for _, body := range []map[string]any{{}, {"locator": "482901", "joinToken": joinToken}} {
+		_, err := ParseClient(map[string]any{
+			"protocol": ProtocolName, "v": 1, "type": "pair.join", "id": pairID, "body": body,
+		})
+		requireCode(t, InvalidMessage, err)
+	}
+	for messageType, body := range map[string]map[string]any{
+		"pair.create": {"joinTokenHash": validHash},
+		"pair.join":   {"joinToken": joinToken},
+	} {
+		if _, err := ParseClient(map[string]any{
+			"protocol": ProtocolName, "v": 1, "type": messageType, "id": pairID, "body": body,
+		}); err != nil {
+			t.Fatalf("%s: %v", messageType, err)
+		}
+	}
+	if _, err := ParseServer(map[string]any{
+		"protocol": ProtocolName, "v": 1, "type": "ok", "id": pairID, "replyTo": creatorSideID,
+		"body": map[string]any{"requestType": "pair.create", "result": map[string]any{
+			"pairId": pairID, "sideId": creatorSideID, "expiresAt": 300,
+		}},
+	}); err != nil {
+		t.Fatalf("token pair.create response: %v", err)
 	}
 }
 

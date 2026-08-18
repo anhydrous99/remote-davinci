@@ -38,6 +38,16 @@ const (
 
 var Version = "0.1.0"
 
+const allPermissionBits uint8 = 1<<5 - 1
+
+var supportedOperations = []string{
+	"resolve.page.cut",
+	"resolve.page.edit",
+	"resolve.page.fusion",
+	"resolve.page.color",
+	"host.volume.toggle-mute",
+}
+
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 var x25519ValidationPrivate = [32]byte{1}
@@ -61,17 +71,19 @@ type EnrollmentResponse struct {
 }
 
 type Config struct {
-	V                    int    `json:"v"`
-	RelayURL             string `json:"relayUrl"`
-	LinkID               string `json:"linkId"`
-	EndpointID           string `json:"endpointId"`
-	Secret               string `json:"secret"`
-	NoisePrivateKey      string `json:"noisePrivateKey"`
-	ControllerEndpointID string `json:"controllerEndpointId"`
-	ControllerNoiseKey   string `json:"controllerNoiseKey"`
-	ControllerLabel      string `json:"controllerLabel"`
-	ActivationPending    bool   `json:"activationPending,omitempty"`
-	LinkRevoked          bool   `json:"linkRevoked,omitempty"`
+	V                     int    `json:"v"`
+	RelayURL              string `json:"relayUrl"`
+	LinkID                string `json:"linkId"`
+	EndpointID            string `json:"endpointId"`
+	Secret                string `json:"secret"`
+	NoisePrivateKey       string `json:"noisePrivateKey"`
+	ControllerEndpointID  string `json:"controllerEndpointId"`
+	ControllerNoiseKey    string `json:"controllerNoiseKey"`
+	ControllerFingerprint string `json:"controllerFingerprint,omitempty"`
+	ControllerLabel       string `json:"controllerLabel"`
+	PermissionMask        uint8  `json:"permissionMask,omitempty"`
+	ActivationPending     bool   `json:"activationPending,omitempty"`
+	LinkRevoked           bool   `json:"linkRevoked,omitempty"`
 }
 
 func (config Config) validate() error {
@@ -92,6 +104,15 @@ func (config Config) validate() error {
 	}
 	controllerKey, err := decode32(config.ControllerNoiseKey)
 	if err != nil || !contributoryX25519PublicKey(controllerKey, privateKey) {
+		return errors.New("invalid companion configuration")
+	}
+	if config.ControllerFingerprint != "" {
+		fingerprint, err := protocol.NoiseKeyFingerprint(config.ControllerNoiseKey)
+		if err != nil || fingerprint != config.ControllerFingerprint {
+			return errors.New("invalid companion configuration")
+		}
+	}
+	if config.PermissionMask&^allPermissionBits != 0 {
 		return errors.New("invalid companion configuration")
 	}
 	if len(secret) != 32 {
@@ -678,12 +699,21 @@ func parseMuteResult(output []byte, commandErr error) (map[string]any, error) {
 type controlProcessor struct {
 	now       func() time.Time
 	execute   func(context.Context, string) (map[string]any, error)
+	allowed   map[string]bool
 	peerHello bool
 	cache     map[string][]byte
 }
 
-func newControlProcessor(execute func(context.Context, string) (map[string]any, error)) *controlProcessor {
-	return &controlProcessor{now: time.Now, execute: execute, cache: make(map[string][]byte)}
+func newControlProcessor(execute func(context.Context, string) (map[string]any, error), permissions ...[]string) *controlProcessor {
+	granted := supportedOperations
+	if len(permissions) == 1 {
+		granted = permissions[0]
+	}
+	allowed := make(map[string]bool, len(granted))
+	for _, operation := range granted {
+		allowed[operation] = true
+	}
+	return &controlProcessor{now: time.Now, execute: execute, allowed: allowed, cache: make(map[string][]byte)}
 }
 
 func (processor *controlProcessor) handle(ctx context.Context, plaintext []byte) ([]byte, bool, error) {
@@ -716,6 +746,9 @@ func (processor *controlProcessor) handle(ctx context.Context, plaintext []byte)
 		now := processor.now().UnixMilli()
 		if body.ExpiresAt <= now || body.SentAt > now+30_000 || len(body.Args) != 0 {
 			return processor.response(envelope.ID, nil, &operationError{code: "request.invalid"})
+		}
+		if !processor.allowed[body.Operation] {
+			return processor.response(envelope.ID, nil, &operationError{code: "operation.forbidden"})
 		}
 		result, executeErr := processor.execute(ctx, body.Operation)
 		return processor.response(envelope.ID, result, executeErr)
@@ -762,8 +795,33 @@ func controlHello() ([]byte, error) {
 	return json.Marshal(wireEnvelope{
 		Protocol: protocol.ControlProtocolName, V: protocol.ControlProtocolVersion, Type: "hello", ID: id,
 		Body: protocol.ControlHelloBody{
-			Role:         protocol.Companion,
-			Capabilities: []string{"resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color", "host.volume.toggle-mute"}, AppVersion: Version,
+			Role: protocol.Companion, Capabilities: append([]string(nil), supportedOperations...), AppVersion: Version,
 		},
 	})
+}
+
+func grantedPermissions(mask uint8) []string {
+	if mask == 0 { // Legacy enrollment granted every v1 operation.
+		mask = allPermissionBits
+	}
+	permissions := make([]string, 0, len(supportedOperations))
+	for index, operation := range supportedOperations {
+		if mask&(1<<index) != 0 {
+			permissions = append(permissions, operation)
+		}
+	}
+	return permissions
+}
+
+func requestedPermissionMask(requested []string) uint8 {
+	var mask uint8
+	for index, supported := range supportedOperations {
+		for _, operation := range requested {
+			if operation == supported {
+				mask |= 1 << index
+				break
+			}
+		}
+	}
+	return mask
 }

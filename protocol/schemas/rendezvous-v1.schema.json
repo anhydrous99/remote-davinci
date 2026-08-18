@@ -137,7 +137,12 @@
           "type": "object",
           "properties": {
             "type": { "const": "pair.create" },
-            "body": { "$ref": "#/$defs/emptyBody" }
+            "body": {
+              "type": "object",
+              "properties": {
+                "joinTokenHash": { "$ref": "#/$defs/base64url32" }
+              }
+            }
           }
         }
       ]
@@ -151,10 +156,14 @@
             "type": { "const": "pair.join" },
             "body": {
               "type": "object",
-              "required": ["locator"],
               "properties": {
-                "locator": { "type": "string", "pattern": "^[0-9]{6}$" }
-              }
+                "locator": { "type": "string", "pattern": "^[0-9]{6}$" },
+                "joinToken": { "$ref": "#/$defs/base64url32" }
+              },
+              "oneOf": [
+                { "required": ["locator"], "not": { "required": ["joinToken"] } },
+                { "required": ["joinToken"], "not": { "required": ["locator"] } }
+              ]
             }
           }
         }
@@ -358,7 +367,7 @@
                     "requestType": { "const": "pair.create" },
                     "result": {
                       "type": "object",
-                      "required": ["pairId", "sideId", "locator", "expiresAt"],
+                      "required": ["pairId", "sideId", "expiresAt"],
                       "properties": {
                         "pairId": { "$ref": "#/$defs/uuid" },
                         "sideId": { "$ref": "#/$defs/uuid" },

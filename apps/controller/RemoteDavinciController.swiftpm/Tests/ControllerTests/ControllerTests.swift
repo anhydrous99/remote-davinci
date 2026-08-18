@@ -43,6 +43,183 @@ final class ControllerTests: XCTestCase {
         )
     }
 
+    func testOfficialFlynnNoiseNNpsk0Vector() throws {
+        let initiator = try NoiseNNpsk0Initiator(
+            psk: try XCTUnwrap(Data(hex:
+                "2176657279736563726574766572797365637265747665727973656372657421"
+            )),
+            prologue: Data(),
+            ephemeralPrivateKey: try XCTUnwrap(Data(hex:
+                "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+            ))
+        )
+
+        XCTAssertEqual(
+            try initiator.writeMessage1(),
+            Data(hex:
+                "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254" +
+                    "e7136508cb8178281204abd62e9f2a3e"
+            )
+        )
+        try initiator.readMessage2(try XCTUnwrap(Data(hex:
+            "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466" +
+                "922f3b7824001193c077abd8b7a73030"
+        )))
+        XCTAssertEqual(
+            try initiator.encryptTransport(Data("yellowsubmarine".utf8)),
+            Data(hex: "b349a522c145762c7c737ac1d1425ce1fb25c7cca626177ee4ceed3cd6fb3d")
+        )
+        XCTAssertEqual(
+            try initiator.decryptTransport(try XCTUnwrap(Data(hex:
+                "b41e24399dc3f1ad2faf82868700e4bf31bb89f6616e1d6a92802bb8ad80d6"
+            ))),
+            Data("submarineyellow".utf8)
+        )
+    }
+
+    func testPairingInviteMatchesGoContractAndPrologue() throws {
+        let relay = "wss://relay.example/v1"
+        let object = pairingInviteObject(expiresAt: 301)
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+        let invite = try PairingInvite.parse(json, expectedRelayURL: relay, now: 1)
+
+        XCTAssertEqual(invite.protocolName, "remote-davinci.pairing-invite")
+        XCTAssertEqual(invite.joinToken, Base64URL.encode(Data(repeating: 1, count: 32)))
+        XCTAssertEqual(
+            String(decoding: pairingNoisePrologue(
+                relayURL: invite.relayUrl,
+                pairID: invite.pairId,
+                creatorSideID: invite.creatorSideId,
+                joinerSideID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                linkID: invite.linkId,
+                expiresAt: invite.expiresAt
+            ), as: UTF8.self),
+            "remote-davinci/pair-qr/v1\nwss://relay.example/v1\n" +
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n" +
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n" +
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd\n" +
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc\n301"
+        )
+    }
+
+    func testPairingInviteRejectsMalformedAndUnknownFields() throws {
+        let relay = "wss://relay.example/v1"
+
+        var unknown = pairingInviteObject(expiresAt: 300)
+        unknown["future"] = true
+        XCTAssertThrowsError(try parsePairingInvite(unknown, relay: relay)) { error in
+            XCTAssertEqual(error as? PairingError, .invalidInvite)
+        }
+
+        var missing = pairingInviteObject(expiresAt: 300)
+        missing.removeValue(forKey: "linkId")
+        XCTAssertThrowsError(try parsePairingInvite(missing, relay: relay)) { error in
+            XCTAssertEqual(error as? PairingError, .invalidInvite)
+        }
+
+        var unsupported = pairingInviteObject(expiresAt: 300)
+        unsupported["v"] = 2
+        XCTAssertThrowsError(try parsePairingInvite(unsupported, relay: relay)) { error in
+            XCTAssertEqual(error as? PairingError, .invalidInvite)
+        }
+
+        var noncanonicalUUID = pairingInviteObject(expiresAt: 300)
+        noncanonicalUUID["pairId"] = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+        XCTAssertThrowsError(try parsePairingInvite(noncanonicalUUID, relay: relay)) { error in
+            XCTAssertEqual(error as? PairingError, .invalidInvite)
+        }
+
+        var noncanonicalSecret = pairingInviteObject(expiresAt: 300)
+        noncanonicalSecret["psk"] = Base64URL.encode(Data(repeating: 2, count: 32)) + "="
+        XCTAssertThrowsError(try parsePairingInvite(noncanonicalSecret, relay: relay)) { error in
+            XCTAssertEqual(error as? PairingError, .invalidInvite)
+        }
+
+        var reusedSecret = pairingInviteObject(expiresAt: 300)
+        reusedSecret["psk"] = reusedSecret["joinToken"]
+        XCTAssertThrowsError(try parsePairingInvite(reusedSecret, relay: relay)) { error in
+            XCTAssertEqual(error as? PairingError, .invalidInvite)
+        }
+    }
+
+    func testPairingInvitePinsRelayAndEnforcesExactLifetime() throws {
+        let relay = "wss://relay.example/v1"
+        XCTAssertNoThrow(try parsePairingInvite(
+            pairingInviteObject(expiresAt: 301),
+            relay: relay,
+            now: 1
+        ))
+
+        XCTAssertThrowsError(try parsePairingInvite(
+            pairingInviteObject(expiresAt: 1),
+            relay: relay,
+            now: 1
+        )) { error in
+            XCTAssertEqual(error as? PairingError, .expiredInvite)
+        }
+        XCTAssertThrowsError(try parsePairingInvite(
+            pairingInviteObject(expiresAt: 302),
+            relay: relay,
+            now: 1
+        )) { error in
+            XCTAssertEqual(error as? PairingError, .expiredInvite)
+        }
+
+        XCTAssertThrowsError(try parsePairingInvite(
+            pairingInviteObject(expiresAt: 300),
+            relay: "wss://other.example/v1"
+        )) { error in
+            XCTAssertEqual(error as? PairingError, .mismatchedRelay)
+        }
+
+        var insecure = pairingInviteObject(expiresAt: 300)
+        insecure["relayUrl"] = "https://relay.example/v1"
+        XCTAssertThrowsError(try parsePairingInvite(insecure, relay: relay)) { error in
+            XCTAssertEqual(error as? PairingError, .invalidInvite)
+        }
+    }
+
+    func testPairingCheckpointDeletesOnlyDefinitiveCommitFailures() {
+        XCTAssertEqual(
+            pairingCheckpointDisposition(commitStarted: false, error: PairingError.invalidMessage),
+            .delete,
+            "A locally staged identity is disposable before commit begins"
+        )
+        XCTAssertEqual(
+            pairingCheckpointDisposition(
+                commitStarted: true,
+                error: PairingError.pairClosed("failed")
+            ),
+            .delete
+        )
+        XCTAssertEqual(
+            pairingCheckpointDisposition(
+                commitStarted: true,
+                error: PairingError.relay(code: "FORBIDDEN", retryable: false)
+            ),
+            .delete
+        )
+        XCTAssertEqual(
+            pairingCheckpointDisposition(
+                commitStarted: true,
+                error: PairingError.relay(code: "INTERNAL", retryable: true)
+            ),
+            .retain
+        )
+        XCTAssertEqual(
+            pairingCheckpointDisposition(commitStarted: true, error: PairingError.invalidMessage),
+            .retain,
+            "Malformed or uncorrelated replies cannot prove that activation lost"
+        )
+        XCTAssertEqual(
+            pairingCheckpointDisposition(
+                commitStarted: true,
+                error: URLError(.networkConnectionLost)
+            ),
+            .retain
+        )
+    }
+
     func testEnrollmentRequestUsesExactFiveFieldV1WireAndPinsDeploymentRelay() throws {
         let customRelay = "wss://relay.example/v1"
         let (request, stored) = try Enrollment.create(
@@ -140,6 +317,23 @@ final class ControllerTests: XCTestCase {
         )
         XCTAssertEqual(migrated.expectedRelayUrl, response.relayUrl)
         XCTAssertEqual(try Enrollment.active(from: migrated).relayURL.absoluteString, response.relayUrl)
+        var activationPending = migrated
+        activationPending.activationPending = true
+        activationPending.grantedPermissions = ["resolve.page.edit"]
+        activationPending.companionNoiseFingerprint = "sha256:test"
+        activationPending.pairingProtocol = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
+        XCTAssertEqual(
+            try Enrollment.active(from: activationPending).linkID,
+            response.linkId,
+            "Pending credentials remain usable only to reconcile an uncertain commit"
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                StoredEnrollment.self,
+                from: JSONEncoder().encode(activationPending)
+            ),
+            activationPending
+        )
         let effectiveRelay = try Enrollment.replacementRelayURL(
             stored: migrated,
             deploymentRelayURL: Enrollment.defaultRelayURL
@@ -401,6 +595,10 @@ final class ControllerTests: XCTestCase {
         )
         XCTAssertNil(stored.linkRevocationConfirmed)
         XCTAssertNil(stored.expectedRelayUrl)
+        XCTAssertNil(stored.activationPending)
+        XCTAssertNil(stored.grantedPermissions)
+        XCTAssertNil(stored.companionNoiseFingerprint)
+        XCTAssertNil(stored.pairingProtocol)
         stored = try Enrollment.migrateLegacy(
             stored,
             deploymentRelayURL: "wss://self-hosted.example/v1"
@@ -535,6 +733,29 @@ final class ControllerTests: XCTestCase {
             .failure(code: "CONFLICT", retryable: true)
         )
     }
+}
+
+private func pairingInviteObject(expiresAt: Int64) -> [String: Any] {
+    [
+        "protocol": "remote-davinci.pairing-invite",
+        "v": 1,
+        "relayUrl": "wss://relay.example/v1",
+        "pairId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "creatorSideId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "linkId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "joinToken": Base64URL.encode(Data(repeating: 1, count: 32)),
+        "psk": Base64URL.encode(Data(repeating: 2, count: 32)),
+        "expiresAt": expiresAt,
+    ]
+}
+
+private func parsePairingInvite(
+    _ object: [String: Any],
+    relay: String,
+    now: Int64 = 1
+) throws -> PairingInvite {
+    let data = try JSONSerialization.data(withJSONObject: object)
+    return try PairingInvite.parse(String(decoding: data, as: UTF8.self), expectedRelayURL: relay, now: now)
 }
 
 private extension Data {

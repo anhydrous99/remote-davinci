@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	rendezvousSchemaID = "https://remote-davinci.dev/schemas/rendezvous-v1.schema.json"
-	controlSchemaID    = "https://remote-davinci.dev/schemas/control-v1.schema.json"
-	pairingSchemaID    = "https://remote-davinci.dev/schemas/pairing-v1.schema.json"
+	rendezvousSchemaID    = "https://remote-davinci.dev/schemas/rendezvous-v1.schema.json"
+	controlSchemaID       = "https://remote-davinci.dev/schemas/control-v1.schema.json"
+	pairingSchemaID       = "https://remote-davinci.dev/schemas/pairing-v1.schema.json"
+	pairingInviteSchemaID = "https://remote-davinci.dev/schemas/pairing-invite-v1.schema.json"
 )
 
 //go:embed schemas/*.json
@@ -26,16 +27,17 @@ var schemaFiles embed.FS
 var validators = sync.OnceValue(compileSchemas)
 
 type compiledSchemas struct {
-	client, server, rendezvous, control, pairing, wormhole *jsonschema.Schema
+	client, server, rendezvous, control, pairing, pairingInvite, wormhole *jsonschema.Schema
 }
 
 func compileSchemas() compiledSchemas {
 	compiler := jsonschema.NewCompiler()
 	compiler.DefaultDraft(jsonschema.Draft2020)
 	for name, id := range map[string]string{
-		"rendezvous-v1.schema.json": rendezvousSchemaID,
-		"control-v1.schema.json":    controlSchemaID,
-		"pairing-v1.schema.json":    pairingSchemaID,
+		"rendezvous-v1.schema.json":     rendezvousSchemaID,
+		"control-v1.schema.json":        controlSchemaID,
+		"pairing-v1.schema.json":        pairingSchemaID,
+		"pairing-invite-v1.schema.json": pairingInviteSchemaID,
 	} {
 		data, err := schemaFiles.ReadFile("schemas/" + name)
 		if err != nil {
@@ -50,12 +52,13 @@ func compileSchemas() compiledSchemas {
 		}
 	}
 	return compiledSchemas{
-		client:     compiler.MustCompile(rendezvousSchemaID + "#/$defs/clientEnvelope"),
-		server:     compiler.MustCompile(rendezvousSchemaID + "#/$defs/serverEnvelope"),
-		rendezvous: compiler.MustCompile(rendezvousSchemaID),
-		control:    compiler.MustCompile(controlSchemaID),
-		pairing:    compiler.MustCompile(pairingSchemaID),
-		wormhole:   compiler.MustCompile(pairingSchemaID + "#/$defs/wormholeMessage"),
+		client:        compiler.MustCompile(rendezvousSchemaID + "#/$defs/clientEnvelope"),
+		server:        compiler.MustCompile(rendezvousSchemaID + "#/$defs/serverEnvelope"),
+		rendezvous:    compiler.MustCompile(rendezvousSchemaID),
+		control:       compiler.MustCompile(controlSchemaID),
+		pairing:       compiler.MustCompile(pairingSchemaID),
+		pairingInvite: compiler.MustCompile(pairingInviteSchemaID),
+		wormhole:      compiler.MustCompile(pairingSchemaID + "#/$defs/wormholeMessage"),
 	}
 }
 
@@ -139,6 +142,23 @@ func ParsePairing(input any) (PairingIdentityEnvelope, error) {
 		return PairingIdentityEnvelope{}, validationError(InvalidMessage, "Noise fingerprint does not match the public key")
 	}
 	return envelope, nil
+}
+
+func ParsePairingInvite(input any) (PairingInvite, error) {
+	data, err := parse(input, validators().pairingInvite, MaxPairingInviteBytes)
+	if err != nil {
+		return PairingInvite{}, err
+	}
+	var invite PairingInvite
+	if err := json.Unmarshal(data, &invite); err != nil {
+		return PairingInvite{}, validationError(InvalidMessage, "Pairing invite is not valid JSON")
+	}
+	joinToken, joinOK := canonicalBase64URL(invite.JoinToken)
+	psk, pskOK := canonicalBase64URL(invite.PSK)
+	if !validRelayURL(invite.RelayURL) || !joinOK || len(joinToken) != 32 || !pskOK || len(psk) != 32 || invite.JoinToken == invite.PSK {
+		return PairingInvite{}, validationError(InvalidMessage, "Pairing invite contains invalid security fields")
+	}
+	return invite, nil
 }
 
 func ParseWormhole(input any) (WormholeMessage, error) {
@@ -239,7 +259,7 @@ func unsupportedVersion(value any) bool {
 	}
 	protocol, _ := record["protocol"].(string)
 	version, exists := record["v"]
-	if !exists || (protocol != ProtocolName && protocol != ControlProtocolName && protocol != PairingProtocolName) {
+	if !exists || (protocol != ProtocolName && protocol != ControlProtocolName && protocol != PairingProtocolName && protocol != PairingInviteProtocolName) {
 		return false
 	}
 	return fmt.Sprint(version) != "1"

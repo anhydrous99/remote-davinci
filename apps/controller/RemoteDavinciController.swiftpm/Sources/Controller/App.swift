@@ -13,8 +13,15 @@ struct RemoteDavinciControllerApp: App {
         WindowGroup {
             ControllerView(model: model)
                 .onChange(of: scenePhase) { _, phase in
-                    if phase == .background, model.isConnectionDesired {
-                        model.disconnect()
+                    if phase == .background {
+                        if model.isPairing {
+                            model.cancelPairing()
+                        }
+                        if model.isConnectionDesired {
+                            model.disconnect()
+                        }
+                    } else if phase == .active, model.hasPendingPairingActivation {
+                        model.connect()
                     }
                 }
         }
@@ -89,45 +96,69 @@ private struct ControllerSettingsView: View {
     @ObservedObject var model: ControllerModel
     @State private var showingReenrollConfirmation = false
     @State private var showingLocalForgetConfirmation = false
+    @State private var showingPairingScanner = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Trusted enrollment") {
+                Section("Pair with Mac") {
                     TextField("Device label", text: $model.deviceLabel)
                         .textContentType(.name)
                         .accessibilityLabel("Controller device label")
+                        .disabled(model.isPairing)
 
-                    if !model.hasLocalEnrollment {
-                        Button("Create Enrollment Request") {
-                            model.createEnrollmentRequest()
+                    if model.isPairing {
+                        ProgressView(model.pairingStatus)
+                            .accessibilityLabel("Pairing status: \(model.pairingStatus)")
+
+                        Button("Cancel Pairing", role: .cancel) {
+                            model.cancelPairing()
                         }
-                    }
-
-                    if !model.isEnrolled, !model.enrollmentRequestJSON.isEmpty {
-                        Text(model.enrollmentRequestJSON)
-                            .font(.caption.monospaced())
-                            .textSelection(.enabled)
-                            .accessibilityLabel("Enrollment request JSON")
-
-                        ShareLink("Share Enrollment Request", item: model.enrollmentRequestJSON)
-
-                        Text("Paste the response from the trusted Mac companion:")
-                            .font(.caption)
-                        TextEditor(text: $model.enrollmentResponseJSON)
-                            .font(.caption.monospaced())
-                            .frame(minHeight: 110)
-                            .accessibilityLabel("Enrollment response JSON")
-
-                        Button("Import Enrollment Response") {
-                            model.importEnrollmentResponse()
+                    } else if model.canStartPairing {
+                        Button {
+                            showingPairingScanner = true
+                        } label: {
+                            Label("Scan Mac QR Code", systemImage: "qrcode.viewfinder")
                         }
-                        .disabled(model.enrollmentResponseJSON.isEmpty)
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityHint("Opens the camera to scan the pairing code on your Mac")
                     }
 
                     Text(model.enrollmentStatus)
-                        .foregroundStyle(model.canConnect ? .green : .secondary)
+                        .foregroundStyle(model.isEnrolled ? .green : .secondary)
                         .accessibilityLabel("Enrollment status: \(model.enrollmentStatus)")
+
+                    if !model.isEnrolled, !model.hasPendingPairingActivation {
+                        DisclosureGroup("Advanced Manual Enrollment") {
+                            if !model.hasLocalEnrollment {
+                                Button("Create Enrollment Request") {
+                                    model.createEnrollmentRequest()
+                                }
+                            }
+
+                            if !model.enrollmentRequestJSON.isEmpty {
+                                Text(model.enrollmentRequestJSON)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                                    .accessibilityLabel("Enrollment request JSON")
+
+                                ShareLink("Share Enrollment Request", item: model.enrollmentRequestJSON)
+
+                                Text("Paste the response from the trusted Mac companion:")
+                                    .font(.caption)
+                                TextEditor(text: $model.enrollmentResponseJSON)
+                                    .font(.caption.monospaced())
+                                    .frame(minHeight: 110)
+                                    .accessibilityLabel("Enrollment response JSON")
+
+                                Button("Import Enrollment Response") {
+                                    model.importEnrollmentResponse()
+                                }
+                                .disabled(model.enrollmentResponseJSON.isEmpty)
+                            }
+                        }
+                        .disabled(model.isPairing)
+                    }
 
                     if model.isEnrolled {
                         Button("Revoke and Re-enroll", role: .destructive) {
@@ -185,6 +216,7 @@ private struct ControllerSettingsView: View {
                     Button("Done") {
                         dismiss()
                     }
+                    .disabled(model.isPairing)
                 }
             }
             .confirmationDialog(
@@ -210,6 +242,9 @@ private struct ControllerSettingsView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("The old remote identity may remain active. Use this only when remote revocation cannot complete.")
+            }
+            .sheet(isPresented: $showingPairingScanner) {
+                PairingScannerSheet(model: model)
             }
         }
     }

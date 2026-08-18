@@ -48,14 +48,15 @@ type PairCommit struct {
 }
 
 type Pair struct {
-	PairID    string      `dynamodbav:"pairId"`
-	Locator   string      `dynamodbav:"locator"`
-	Status    string      `dynamodbav:"status"`
-	SideA     PairSide    `dynamodbav:"sideA"`
-	SideB     *PairSide   `dynamodbav:"sideB,omitempty"`
-	CommitA   *PairCommit `dynamodbav:"commitA,omitempty"`
-	CommitB   *PairCommit `dynamodbav:"commitB,omitempty"`
-	ExpiresAt int64       `dynamodbav:"expiresAt"`
+	PairID        string      `dynamodbav:"pairId"`
+	Locator       string      `dynamodbav:"locator,omitempty"`
+	JoinTokenHash string      `dynamodbav:"joinTokenHash,omitempty"`
+	Status        string      `dynamodbav:"status"`
+	SideA         PairSide    `dynamodbav:"sideA"`
+	SideB         *PairSide   `dynamodbav:"sideB,omitempty"`
+	CommitA       *PairCommit `dynamodbav:"commitA,omitempty"`
+	CommitB       *PairCommit `dynamodbav:"commitB,omitempty"`
+	ExpiresAt     int64       `dynamodbav:"expiresAt"`
 }
 
 type Link struct {

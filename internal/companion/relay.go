@@ -347,7 +347,7 @@ func newSecureChannel(config Config, sessionID string) (*secureChannel, error) {
 			channel.recordSuccessfulPageCommand(operation, time.Now())
 		}
 		return result, err
-	})
+	}, grantedPermissions(config.PermissionMask))
 	return channel, nil
 }
 

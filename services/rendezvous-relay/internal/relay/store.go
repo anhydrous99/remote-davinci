@@ -28,7 +28,7 @@ type Store interface {
 	RateLimit(context.Context, string, string, int64, int64) error
 	CreatePair(context.Context, Pair) error
 	PairByID(context.Context, string, int64) (Pair, error)
-	JoinPair(context.Context, string, PairSide, int64) (Pair, error)
+	JoinPair(context.Context, string, string, PairSide, int64) (Pair, error)
 	CommitPair(context.Context, string, PairCommit, int64) (CommitPairResult, error)
 	CancelPair(context.Context, string, string, int64) (*Pair, error)
 	Link(context.Context, string) (*Link, error)
@@ -429,17 +429,27 @@ func (s *DynamoStore) rateLimit(ctx context.Context, sourceKey, action string, l
 }
 
 type pairPointer struct {
-	PairID    string `dynamodbav:"pairId"`
-	Locator   string `dynamodbav:"locator"`
-	ExpiresAt int64  `dynamodbav:"expiresAt"`
+	PairID        string `dynamodbav:"pairId"`
+	Locator       string `dynamodbav:"locator,omitempty"`
+	JoinTokenHash string `dynamodbav:"joinTokenHash,omitempty"`
+	ExpiresAt     int64  `dynamodbav:"expiresAt"`
 }
 
 func (s *DynamoStore) CreatePair(ctx context.Context, pair Pair) error {
+	if (pair.Locator == "") == (pair.JoinTokenHash == "") {
+		return serviceError(protocol.InvalidMessage)
+	}
 	pairItem, err := marshalItem("pair", pair.PairID, pair)
 	if err != nil {
 		return err
 	}
-	pointerItem, err := marshalItem("locator", pair.Locator, pairPointer{PairID: pair.PairID, Locator: pair.Locator, ExpiresAt: pair.ExpiresAt})
+	pointerKind, pointerID := "locator", pair.Locator
+	if pair.JoinTokenHash != "" {
+		pointerKind, pointerID = "join", pair.JoinTokenHash
+	}
+	pointerItem, err := marshalItem(pointerKind, pointerID, pairPointer{
+		PairID: pair.PairID, Locator: pair.Locator, JoinTokenHash: pair.JoinTokenHash, ExpiresAt: pair.ExpiresAt,
+	})
 	if err != nil {
 		return err
 	}
@@ -464,8 +474,16 @@ func (s *DynamoStore) CreatePair(ctx context.Context, pair Pair) error {
 }
 
 func (s *DynamoStore) PairByLocator(ctx context.Context, locator string, now int64) (Pair, error) {
+	return s.pairByAdmission(ctx, "LOCATOR", locator, now)
+}
+
+func (s *DynamoStore) pairByJoinTokenHash(ctx context.Context, joinTokenHash string, now int64) (Pair, error) {
+	return s.pairByAdmission(ctx, "JOIN", joinTokenHash, now)
+}
+
+func (s *DynamoStore) pairByAdmission(ctx context.Context, kind, value string, now int64) (Pair, error) {
 	var pointer pairPointer
-	found, err := s.get(ctx, "LOCATOR", locator, &pointer)
+	found, err := s.get(ctx, kind, value, &pointer)
 	if err != nil {
 		return Pair{}, err
 	}
@@ -476,7 +494,9 @@ func (s *DynamoStore) PairByLocator(ctx context.Context, locator string, now int
 	if err != nil {
 		return Pair{}, err
 	}
-	if pair.Locator != locator {
+	legacy := kind == "LOCATOR"
+	if legacy && (pointer.Locator != value || pair.Locator != value || pointer.JoinTokenHash != "" || pair.JoinTokenHash != "") ||
+		!legacy && (pointer.JoinTokenHash != value || pair.JoinTokenHash != value || pointer.Locator != "" || pair.Locator != "") {
 		return Pair{}, serviceError(protocol.PairUnavailable)
 	}
 	return pair, nil
@@ -497,15 +517,32 @@ func (s *DynamoStore) PairByID(ctx context.Context, pairID string, now int64) (P
 	return pair, nil
 }
 
-func (s *DynamoStore) JoinPair(ctx context.Context, locator string, side PairSide, now int64) (Pair, error) {
-	pair, err := s.PairByLocator(ctx, locator, now)
+func (s *DynamoStore) JoinPair(ctx context.Context, locator, joinTokenHash string, side PairSide, now int64) (Pair, error) {
+	if (locator == "") == (joinTokenHash == "") {
+		return Pair{}, serviceError(protocol.InvalidMessage)
+	}
+	var pair Pair
+	var err error
+	if locator != "" {
+		pair, err = s.PairByLocator(ctx, locator, now)
+	} else {
+		pair, err = s.pairByJoinTokenHash(ctx, joinTokenHash, now)
+	}
 	if err != nil {
 		return Pair{}, err
 	}
 	if pair.Status != "OPEN" || pair.SideB != nil {
 		return Pair{}, serviceError(protocol.PairFull)
 	}
-	updateValues, err := values(map[string]any{":side": side, ":ready": "READY", ":open": "OPEN", ":now": now})
+	admission := locator
+	admissionCondition := "locator = :admission AND attribute_not_exists(joinTokenHash)"
+	if joinTokenHash != "" {
+		admission = joinTokenHash
+		admissionCondition = "joinTokenHash = :admission AND attribute_not_exists(locator)"
+	}
+	updateValues, err := values(map[string]any{
+		":side": side, ":ready": "READY", ":open": "OPEN", ":now": now, ":admission": admission,
+	})
 	if err != nil {
 		return Pair{}, err
 	}
@@ -517,7 +554,7 @@ func (s *DynamoStore) JoinPair(ctx context.Context, locator string, side PairSid
 		{Update: &types.Update{
 			TableName: aws.String(s.tableName), Key: key("PAIR", pair.PairID),
 			UpdateExpression:         aws.String("SET sideB = :side, #status = :ready"),
-			ConditionExpression:      aws.String("#status = :open AND expiresAt > :now AND attribute_not_exists(sideB)"),
+			ConditionExpression:      aws.String("#status = :open AND expiresAt > :now AND attribute_not_exists(sideB) AND " + admissionCondition),
 			ExpressionAttributeNames: map[string]string{"#status": "status"}, ExpressionAttributeValues: updateValues,
 		}},
 		{Update: &types.Update{
