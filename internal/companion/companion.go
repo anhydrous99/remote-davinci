@@ -560,20 +560,23 @@ func monitorResolvePages(ctx context.Context, run resolvePageMonitorRun) <-chan 
 	pages := make(chan resolvePageObservation)
 	go func() {
 		defer close(pages)
-		emit := func(observation resolvePageObservation) error {
-			select {
-			case pages <- observation:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
+		var retryDelay time.Duration
 		for ctx.Err() == nil {
-			_ = run(ctx, emit)
+			observed := false
+			_ = run(ctx, func(observation resolvePageObservation) error {
+				select {
+				case pages <- observation:
+					observed = true
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
 			if ctx.Err() != nil {
 				return
 			}
-			timer := time.NewTimer(time.Second)
+			retryDelay = resolvePageMonitorRetryDelay(retryDelay, observed)
+			timer := time.NewTimer(retryDelay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -583,6 +586,13 @@ func monitorResolvePages(ctx context.Context, run resolvePageMonitorRun) <-chan 
 		}
 	}()
 	return pages
+}
+
+func resolvePageMonitorRetryDelay(previous time.Duration, observed bool) time.Duration {
+	if observed || previous == 0 {
+		return time.Second
+	}
+	return min(previous*2, 15*time.Minute)
 }
 
 func runResolvePageMonitor(ctx context.Context, emit func(resolvePageObservation) error) error {

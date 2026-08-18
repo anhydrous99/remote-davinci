@@ -343,14 +343,17 @@ func newSecureChannel(config Config, sessionID string) (*secureChannel, error) {
 	channel.processor = newControlProcessor(func(ctx context.Context, operation string) (map[string]any, error) {
 		result, err := ExecuteOperation(ctx, operation)
 		if err == nil {
-			if page, ok := resolvePageForOperation(operation); ok {
-				channel.lastPageCommandAt = time.Now()
-				channel.lastResolvePage = page
-			}
+			channel.recordSuccessfulPageCommand(operation, time.Now())
 		}
 		return result, err
 	})
 	return channel, nil
+}
+
+func (channel *secureChannel) recordSuccessfulPageCommand(operation string, completedAt time.Time) {
+	if _, ok := resolvePageForOperation(operation); ok {
+		channel.lastPageCommandAt = completedAt
+	}
 }
 
 func (channel *secureChannel) receive(ctx context.Context, sequence int64, encoded string) ([][]byte, bool, error) {

@@ -214,6 +214,23 @@ func TestResolvePageMonitorRestartsAndReaps(t *testing.T) {
 	}
 }
 
+func TestResolvePageMonitorBackoff(t *testing.T) {
+	delay := time.Duration(0)
+	for attempt, want := range []time.Duration{
+		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+		16 * time.Second, 32 * time.Second, 64 * time.Second, 128 * time.Second,
+		256 * time.Second, 512 * time.Second, 15 * time.Minute, 15 * time.Minute,
+	} {
+		delay = resolvePageMonitorRetryDelay(delay, false)
+		if delay != want {
+			t.Fatalf("retry %d delay = %s, want %s", attempt+1, delay, want)
+		}
+	}
+	if reset := resolvePageMonitorRetryDelay(delay, true); reset != time.Second {
+		t.Fatalf("delay after a valid sample = %s, want 1s", reset)
+	}
+}
+
 func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 	suite := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
 	controllerKey, err := suite.GenerateKeypair(rand.Reader)
@@ -325,18 +342,17 @@ func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 			t.Fatalf("control response = %s, error = %v", response, err)
 		}
 	}
-	commandCompleted := time.Now()
-	channel.lastPageCommandAt = commandCompleted
 	channel.lastResolvePage = "color"
+	commandCompleted := time.Now()
+	channel.recordSuccessfulPageCommand("resolve.page.edit", commandCompleted)
+	if !channel.lastPageCommandAt.Equal(commandCompleted) || channel.lastResolvePage != "color" {
+		t.Fatalf("successful page command state = %s/%q", channel.lastPageCommandAt, channel.lastResolvePage)
+	}
 	stalePacket, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(-time.Millisecond)})
 	if err != nil || stalePacket != nil {
 		t.Fatalf("stale page event packet = %x, error = %v", stalePacket, err)
 	}
-	duplicatePacket, err := channel.pageChangedEvent(resolvePageObservation{page: "color", observedAt: commandCompleted.Add(time.Millisecond)})
-	if err != nil || duplicatePacket != nil {
-		t.Fatalf("duplicate page event packet = %x, error = %v", duplicatePacket, err)
-	}
-	eventPacket, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(2 * time.Millisecond)})
+	eventPacket, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(time.Millisecond)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +369,7 @@ func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 		eventBody.Data.(map[string]any)["page"] != "edit" {
 		t.Fatalf("page event body = %#v", eventBody)
 	}
-	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(3 * time.Millisecond)}); err != nil || packet != nil {
+	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(2 * time.Millisecond)}); err != nil || packet != nil {
 		t.Fatalf("repeated page event packet = %x, error = %v", packet, err)
 	}
 	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "media", observedAt: commandCompleted.Add(4 * time.Millisecond)}); err != nil || packet != nil {
