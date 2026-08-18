@@ -7,7 +7,6 @@ export interface DeploymentConfig {
   readonly account?: string;
   readonly accessLogs?: boolean;
   readonly alarmTopicArn?: string;
-  readonly peakCapacity?: boolean;
   readonly region: string;
 }
 
@@ -50,7 +49,6 @@ export function deploymentConfig(
   }
 
   const accessLogs = booleanContext(app, 'accessLogs');
-  const peakCapacity = booleanContext(app, 'peakCapacity');
   const alarmTopicArn = stringContext(app, 'alarmTopicArn');
   if (environment === 'prod') {
     const account = requiredStringContext(app, 'productionAccount');
@@ -70,7 +68,6 @@ export function deploymentConfig(
       account,
       alarmTopicArn: productionAlarmTopicArn,
       environment,
-      ...(peakCapacity === undefined ? {} : { peakCapacity }),
       region,
     };
   }
@@ -83,7 +80,6 @@ export function deploymentConfig(
     ...(accessLogs === undefined ? {} : { accessLogs }),
     ...(alarmTopicArn === undefined ? {} : { alarmTopicArn }),
     environment,
-    ...(peakCapacity === undefined ? {} : { peakCapacity }),
     region,
   };
 }
@@ -100,9 +96,6 @@ export function main(): void {
     env: config.account
       ? { account: config.account, region: config.region }
       : { region: config.region },
-    ...(config.peakCapacity === undefined
-      ? {}
-      : { peakCapacity: config.peakCapacity }),
   });
 }
 

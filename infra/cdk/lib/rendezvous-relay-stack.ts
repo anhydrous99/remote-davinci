@@ -23,7 +23,6 @@ export interface RendezvousRelayStackProps extends StackProps {
   readonly environment: 'dev' | 'prod';
   readonly accessLogs?: boolean;
   readonly alarmTopicArn?: string;
-  readonly peakCapacity?: boolean;
 }
 
 export class RendezvousRelayStack extends Stack {
@@ -32,7 +31,6 @@ export class RendezvousRelayStack extends Stack {
 
     const production = props.environment === 'prod';
     const accessLogging = props.accessLogs ?? true;
-    const peakCapacity = production && (props.peakCapacity ?? false);
     const relayRejectionsNamespace = `RemoteDavinci/${props.environment}`;
     const removalPolicy = production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
     const alarmTopicArn = props.alarmTopicArn;
@@ -88,16 +86,8 @@ export class RendezvousRelayStack extends Stack {
       encryption: dynamodb.TableEncryption.AWS_MANAGED,
       ...(production
         ? {
-            maxReadRequestUnits: peakCapacity ? 60_000 : 30_000,
-            maxWriteRequestUnits: peakCapacity ? 30_000 : 8_000,
-          }
-        : {}),
-      ...(peakCapacity
-        ? {
-            warmThroughput: {
-              readUnitsPerSecond: 60_000,
-              writeUnitsPerSecond: 30_000,
-            },
+            maxReadRequestUnits: 30_000,
+            maxWriteRequestUnits: 8_000,
           }
         : {}),
       partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
@@ -117,7 +107,6 @@ export class RendezvousRelayStack extends Stack {
       ...(production
         ? {
             applicationLogLevelV2: lambda.ApplicationLogLevel.WARN,
-            reservedConcurrentExecutions: peakCapacity ? 4_500 : 200,
             systemLogLevelV2: lambda.SystemLogLevel.WARN,
           }
         : {}),
@@ -242,8 +231,8 @@ export class RendezvousRelayStack extends Stack {
       '$disconnect': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
       'pair.frame': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
       'session.frame': routeSettings(
-        peakCapacity ? 25_000 : production ? 4_000 : 50,
-        peakCapacity ? 50_000 : production ? 5_000 : 100,
+        production ? 4_000 : 50,
+        production ? 5_000 : 100,
       ),
     };
 

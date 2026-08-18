@@ -13,7 +13,7 @@ capacity.
 
 - 100,000 simultaneous pairs and 200,000 WebSocket connections.
 - At most 1,000 control round trips per second sustained.
-- A five-minute peak of 10,000 control round trips per second.
+- A five-minute peak of 2,000 control round trips per second.
 - Backend forwarding latency below 150 ms p95 and 300 ms p99.
 - Unexpected steady-state errors below 0.1% and no service throttles.
 
@@ -26,30 +26,15 @@ at most 4 KiB and each rate-limit item remains at most 1 KiB.
 | Load | Frames/s | API requests/s | Lambda invokes/s | Strong reads/s | Writes/s |
 |---|---:|---:|---:|---:|---:|
 | Sustained | 2,000 | 4,000 | 2,000 | 4,000 | 2,000 |
-| Peak | 20,000 | 40,000 | 20,000 | 40,000 | 20,000 |
+| Peak | 4,000 | 8,000 | 4,000 | 8,000 | 4,000 |
 
-The default production profile caps the on-demand table at 30,000 reads and
-8,000 writes per second, reserves 200 Lambda concurrency, and throttles
-`session.frame` at 4,000 messages per second with a 5,000-message burst. This
-profile leaves write headroom for connection, pairing, default, and disconnect
-routes alongside the frame limiter. Obtain at least 300 regional Lambda
-concurrency before deployment so the reservation can leave the service-required
-100 concurrency unreserved.
-
-The opt-in peak profile reserves 4,500 Lambda concurrency, pre-warms the table
-for 60,000 reads and 30,000 writes per second, and raises `session.frame` to
-25,000 messages per second with a 50,000-message burst. The 20% headroom covers
-the route's two strong reads and one rate-limit write per frame. Enable it with
-CDK context `peakCapacity=true` only after AWS has approved at least 60,000
-regional API Gateway requests per second, 6,000 regional Lambda concurrency,
-60,000 DynamoDB reads per second, and 30,000 DynamoDB writes per second, before
-deployment. API Gateway counts inbound WebSocket requests and management
-callbacks against its regional throttle; current quotas are documented in the
-[API Gateway quota guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html).
-The effective account burst is service-determined, so obtain written
-confirmation for the 50,000-message burst as part of that approval. If AWS
-approves less, change the configured peak profile to that approved value and
-retain the required 60-second client/load-test ramp.
+The production stack caps the on-demand table at 30,000 reads and
+8,000 writes per second, uses regional unreserved Lambda concurrency, and
+throttles `session.frame` at 4,000 messages per second with a 5,000-message
+burst. This leaves write headroom for connection, pairing, default, and
+disconnect routes alongside the frame limiter. Before load testing, size the
+regional Lambda concurrency quota from measured duration and other functions;
+the stack does not reserve it.
 
 The [API Gateway WebSocket quota table](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-execution-service-websocket-limits-table.html)
 lists a 500-new-connections-per-second default, a two-hour connection duration,
@@ -65,8 +50,8 @@ Always refresh prices from the official [API Gateway](https://aws.amazon.com/api
 and [CloudWatch](https://aws.amazon.com/cloudwatch/pricing/) pages before making
 a purchasing decision. The reference profile below excludes free tiers, taxes,
 Internet transfer, lifecycle writes, DynamoDB storage and point-in-time
-recovery, CloudWatch alarms and log ingestion (including default access logs),
-and the peak profile's one-time DynamoDB pre-warm charge.
+recovery, and CloudWatch alarms and log ingestion (including default access
+logs).
 
 For `F` one-way frames and `C` connection-minutes:
 
@@ -134,7 +119,7 @@ Run these only in an isolated, quota-approved performance stack:
    followed by a 130-minute reconnect soak.
 2. Hold 200,000 simultaneous sockets.
 3. Sustain 1,000 round trips per second for 60 minutes.
-4. Ramp from 1,000 to 10,000 round trips per second over 60 seconds and hold for
+4. Ramp from 1,000 to 2,000 round trips per second over 60 seconds and hold for
    five minutes.
 5. Spread a 200,000-client recovery over 15 minutes.
 6. Inject Gone peers and race session opening/forwarding against link and

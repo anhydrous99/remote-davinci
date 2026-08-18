@@ -14,7 +14,6 @@ const testAlarmTopicArn = `arn:aws:sns:${testRegion}:${testAccount}:remote-davin
 function template(
   environment: 'dev' | 'prod' = 'dev',
   accessLogs?: boolean,
-  peakCapacity?: boolean,
 ): Template {
   const app = new App();
   return Template.fromStack(
@@ -23,7 +22,6 @@ function template(
       ...(environment === 'prod' ? { alarmTopicArn: testAlarmTopicArn } : {}),
       environment,
       env: { account: testAccount, region: testRegion },
-      ...(peakCapacity === undefined ? {} : { peakCapacity }),
     }),
   );
 }
@@ -337,7 +335,7 @@ describe('RendezvousRelayStack', () => {
     assert.equal(tables[0]?.Properties.WarmThroughput, undefined);
     const functions = Object.values(stack.findResources('AWS::Lambda::Function'));
     assert.equal(functions.length, 1);
-    assert.equal(functions[0]?.Properties.ReservedConcurrentExecutions, 200);
+    assert.equal(functions[0]?.Properties.ReservedConcurrentExecutions, undefined);
     const stages = Object.values(stack.findResources('AWS::ApiGatewayV2::Stage'));
     assert.equal(stages.length, 1);
     const accessLogSettings = stages[0]?.Properties.AccessLogSettings;
@@ -358,33 +356,6 @@ describe('RendezvousRelayStack', () => {
     )) {
       assert.deepEqual(alarm.Properties.AlarmActions, [testAlarmTopicArn]);
     }
-  });
-
-  it('enables peak capacity only when requested for production', () => {
-    const stack = template('prod', undefined, true);
-    stack.hasResourceProperties('AWS::DynamoDB::Table', {
-      OnDemandThroughput: {
-        MaxReadRequestUnits: 60_000,
-        MaxWriteRequestUnits: 30_000,
-      },
-      WarmThroughput: {
-        ReadUnitsPerSecond: 60_000,
-        WriteUnitsPerSecond: 30_000,
-      },
-    });
-    stack.hasResourceProperties('AWS::Lambda::Function', {
-      ReservedConcurrentExecutions: 4_500,
-    });
-    stack.hasResourceProperties('AWS::ApiGatewayV2::Stage', {
-      RouteSettings: Match.objectLike({
-        'session.frame': {
-          DataTraceEnabled: false,
-          DetailedMetricsEnabled: false,
-          ThrottlingBurstLimit: 50_000,
-          ThrottlingRateLimit: 25_000,
-        },
-      }),
-    });
   });
 
   it('can disable production access logging only when explicitly requested', () => {

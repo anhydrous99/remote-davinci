@@ -214,9 +214,9 @@ region resolved by the CDK toolkit. Before deployment, confirm the SNS topic
 has at least one subscribed operator and test delivery. API Gateway access logs
 are enabled by default with metadata-only fields and seven-day production
 retention; configure the account-level API Gateway CloudWatch Logs role first.
-Use `-c accessLogs=false` only as an explicit exception. The normal production
-profile reserves 200 Lambda concurrency; [`docs/capacity.md`](docs/capacity.md)
-lists the quota prerequisites.
+Use `-c accessLogs=false` only as an explicit exception. The production stack
+uses regional unreserved Lambda concurrency;
+[`docs/capacity.md`](docs/capacity.md) lists the capacity prerequisites.
 
 ## AWS architecture
 
