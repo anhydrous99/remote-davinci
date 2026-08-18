@@ -20,6 +20,70 @@ struct RemoteDavinciControllerApp: App {
 
 struct ControllerView: View {
     @ObservedObject var model: ControllerModel
+    @State private var showingSettings = false
+
+    private var pageSelection: Binding<ResolvePage> {
+        Binding(
+            get: { model.selectedPage },
+            set: { model.requestPage($0) }
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            TabView(selection: pageSelection) {
+                ForEach(ResolvePage.allCases, id: \.self) { page in
+                    Color.clear
+                        .accessibilityElement()
+                        .accessibilityLabel("\(page.rawValue.capitalized) page")
+                        .tabItem {
+                            Label(page.rawValue.capitalized, systemImage: page.systemImage)
+                        }
+                        .tag(page)
+                }
+            }
+            .navigationTitle("Remote DaVinci")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingSettings = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    .accessibilityHint("Opens enrollment, connection, and host controls")
+                }
+            }
+        }
+        .sheet(isPresented: $showingSettings) {
+            ControllerSettingsView(model: model)
+        }
+        .onAppear {
+            if !model.isEnrolled {
+                showingSettings = true
+            }
+        }
+        .onChange(of: model.isEnrolled) { _, isEnrolled in
+            if !isEnrolled {
+                showingSettings = true
+            }
+        }
+    }
+}
+
+private extension ResolvePage {
+    var systemImage: String {
+        switch self {
+        case .cut: "scissors"
+        case .edit: "slider.horizontal.3"
+        case .fusion: "wand.and.stars"
+        case .color: "circle.hexagongrid.fill"
+        }
+    }
+}
+
+private struct ControllerSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: ControllerModel
     @State private var showingReenrollConfirmation = false
     @State private var showingLocalForgetConfirmation = false
 
@@ -97,16 +161,9 @@ struct ControllerView: View {
                         .accessibilityLabel("Connection status: \(model.connectionStatus)")
                 }
 
-                Section("Controls") {
-                    Button("Open Resolve Edit Page") {
-                        model.perform("resolve.page.edit")
-                    }
-                    .disabled(!model.canSend("resolve.page.edit"))
-                    .accessibilityLabel("Open DaVinci Resolve Edit page")
-                    .accessibilityHint("Sends the Resolve Edit page command to the enrolled Mac")
-
+                Section("Host control") {
                     Button("Toggle Host Volume Mute") {
-                        model.perform("host.volume.toggle-mute")
+                        model.toggleHostMute()
                     }
                     .disabled(!model.canSend("host.volume.toggle-mute"))
                     .accessibilityLabel("Toggle Mac volume mute")
@@ -119,7 +176,14 @@ struct ControllerView: View {
                     }
                 }
             }
-            .navigationTitle("Remote DaVinci")
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
             .confirmationDialog(
                 "Revoke this controller?",
                 isPresented: $showingReenrollConfirmation,

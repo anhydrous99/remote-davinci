@@ -346,7 +346,10 @@ func TestSessionFrameUsesOnlySessionAuthority(t *testing.T) {
 		ControllerConnectionID: "controller", CompanionConnectionID: "companion", Status: "ACTIVE", ExpiresAt: 1000,
 	}
 	reads := 0
-	var target string
+	var sent []struct {
+		target  string
+		message Message
+	}
 	handler := testHandler(&fakeStore{session: func(_ context.Context, id string, _ int64) (Session, error) {
 		reads++
 		if id != session.SessionID {
@@ -354,17 +357,34 @@ func TestSessionFrameUsesOnlySessionAuthority(t *testing.T) {
 		}
 		return session, nil
 	}}, func(_ context.Context, connectionID string, message Message, _ WebSocketEvent) error {
-		target = connectionID
 		if message.Type != "session.frame" {
 			t.Fatalf("message = %#v", message)
 		}
+		sent = append(sent, struct {
+			target  string
+			message Message
+		}{connectionID, message})
 		return nil
 	})
-	response, err := handler.Handle(context.Background(), socketEvent("controller", "session.frame", envelope("session.frame", map[string]any{
-		"sessionId": session.SessionID, "seq": 1, "payload": "AQID", "future": true,
-	})))
-	if err != nil || response.Body != "" || reads != 1 || target != "companion" {
-		t.Fatalf("reads = %d, target = %s, response = %#v, error = %v", reads, target, response, err)
+	for index, test := range []struct {
+		from, to, payload string
+	}{
+		{"controller", "companion", "AQID"},
+		{"companion", "controller", "BAUG"},
+	} {
+		response, err := handler.Handle(context.Background(), socketEvent(test.from, "session.frame", envelope("session.frame", map[string]any{
+			"sessionId": session.SessionID, "seq": index + 1, "payload": test.payload, "future": test.from,
+		})))
+		if err != nil || response.Body != "" || len(sent) != index+1 || sent[index].target != test.to {
+			t.Fatalf("sent = %#v, response = %#v, error = %v", sent, response, err)
+		}
+		body := decodedMessageBody(t, sent[index].message)
+		if body["payload"] != test.payload || body["future"] != test.from {
+			t.Fatalf("body = %#v", body)
+		}
+	}
+	if reads != 2 {
+		t.Fatalf("session reads = %d", reads)
 	}
 }
 

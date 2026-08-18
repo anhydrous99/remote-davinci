@@ -134,7 +134,7 @@ The independently versioned inner envelope is:
   "type": "request",
   "id": "20000000-0000-4000-8000-000000000001",
   "body": {
-    "operation": "resolve.transport.play",
+    "operation": "resolve.page.color",
     "args": {},
     "sentAt": 1786723200000,
     "expiresAt": 1786723205000
@@ -146,6 +146,29 @@ The independently versioned inner envelope is:
 - `request { operation, args, sentAt, expiresAt }` uses semantic operation names. Expired requests are not executed.
 - `response` adds `replyTo` and contains either `{ ok: true, result }` or `{ ok: false, error }`.
 - `event { name, data }` is best effort.
+
+### Fixed Resolve page synchronization
+
+V1 accepts four zero-argument Resolve page operations:
+
+| Operation | Resolve page | Successful `result` |
+| --- | --- | --- |
+| `resolve.page.cut` | `cut` | `{ "page": "cut" }` |
+| `resolve.page.edit` | `edit` | `{ "page": "edit" }` |
+| `resolve.page.fusion` | `fusion` | `{ "page": "fusion" }` |
+| `resolve.page.color` | `color` | `{ "page": "color" }` |
+
+The companion returns success only after Resolve reports the requested page.
+Once the encrypted session is ready, it emits an initial supported-page
+snapshot and then emits only changes as
+`event { name: "resolve.page.changed", data: { page } }`. A fresh session gets
+a fresh snapshot; events are neither queued nor replayed.
+
+The controller treats a successful response or page event as authoritative.
+Receiving an event updates the selected tab without sending another request.
+Resolve pages outside Cut, Edit, Fusion, and Color produce no event, leave the
+last supported app tab selected, and are never changed by the controller merely
+to force synchronization.
 
 Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The companion checks each operation against the authenticated peer and locally stored grant. Within a session, duplicate request IDs return the cached response without executing twice.
 

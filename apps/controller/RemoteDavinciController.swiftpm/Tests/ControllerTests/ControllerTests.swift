@@ -212,6 +212,69 @@ final class ControllerTests: XCTestCase {
         XCTAssertTrue(window.contains(String(LateResponseWindow.maximumCount)))
     }
 
+    func testResolvePageOperationsAreFixed() {
+        XCTAssertEqual(
+            ResolvePage.allCases.map(\.operation),
+            [
+                "resolve.page.cut",
+                "resolve.page.edit",
+                "resolve.page.fusion",
+                "resolve.page.color",
+            ]
+        )
+        XCTAssertEqual(ResolvePage(operation: "resolve.page.cut"), .cut)
+        XCTAssertNil(ResolvePage(operation: "resolve.page.media"))
+        XCTAssertNil(ResolvePage(operation: "host.volume.toggle-mute"))
+    }
+
+    func testResolvePageResponseRequiresMatchingReadback() throws {
+        XCTAssertEqual(
+            try ResolvePageControl.responsePage(
+                operation: "resolve.page.color",
+                result: ["page": "color"]
+            ),
+            .color
+        )
+        XCTAssertNil(try ResolvePageControl.responsePage(
+            operation: "host.volume.toggle-mute",
+            result: ["muted": true]
+        ))
+        XCTAssertThrowsError(try ResolvePageControl.responsePage(
+            operation: "resolve.page.color",
+            result: ["page": "edit"]
+        )) { error in
+            XCTAssertEqual(error as? ControllerProtocolError, .invalidMessage)
+        }
+        XCTAssertThrowsError(try ResolvePageControl.responsePage(
+            operation: "resolve.page.color",
+            result: [:]
+        ))
+    }
+
+    func testResolvePageEventParsesKnownAndIgnoresUnknown() throws {
+        XCTAssertEqual(
+            try ResolvePageControl.eventPage(body: [
+                "name": "resolve.page.changed",
+                "data": ["page": "fusion"],
+            ]),
+            .fusion
+        )
+        XCTAssertNil(try ResolvePageControl.eventPage(body: [
+            "name": "resolve.transport.changed",
+            "data": ["playing": true],
+        ]))
+        XCTAssertThrowsError(try ResolvePageControl.eventPage(body: [
+            "name": "resolve.page.changed",
+            "data": ["page": "media"],
+        ])) { error in
+            XCTAssertEqual(error as? ControllerProtocolError, .invalidMessage)
+        }
+        XCTAssertThrowsError(try ResolvePageControl.eventPage(body: [
+            "name": "resolve.page.changed",
+            "data": [:],
+        ]))
+    }
+
     func testStoredEnrollmentDecodesWithoutRevocationCheckpoint() throws {
         let json = """
         {

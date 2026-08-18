@@ -404,7 +404,7 @@ func exerciseLiveNoiseSession(
 			return nil, &operationError{code: "operation.unsupported"}
 		}
 		*executions++
-		return map[string]any{"canary": true}, nil
+		return map[string]any{"page": "edit"}, nil
 	}
 	companionKey, err := decode32(enrollment.CompanionNoiseKey)
 	if err != nil {
@@ -565,7 +565,42 @@ func exerciseLiveNoiseSession(
 	}
 	var body protocol.ControlSuccessBody
 	if response.DecodeBody(&body) != nil || !body.OK {
-		return errors.New("companion rejected the no-op canary")
+		return errors.New("companion rejected the page canary")
+	}
+	result, ok := body.Result.(map[string]any)
+	if !ok || result["page"] != "edit" {
+		return errors.New("companion returned an invalid page result")
+	}
+	eventPacket, err := host.pageChangedEvent(resolvePageObservation{page: "color", observedAt: time.Now()})
+	if err != nil || eventPacket == nil {
+		return errors.New("companion failed to create the page event")
+	}
+	if err := sendLiveFrame(ctx, companion, sessionID, 4, eventPacket); err != nil {
+		return err
+	}
+	eventFrame, err := receiveLiveFrame(ctx, controller, sessionID, 4)
+	if err != nil {
+		return err
+	}
+	eventPacket, err = decodeLivePacket(eventFrame.Payload)
+	if err != nil {
+		return err
+	}
+	plaintext, err = controllerReceive.Decrypt(nil, nil, eventPacket)
+	if err != nil {
+		return errors.New("controller failed to decrypt the page event")
+	}
+	event, err := protocol.ParseControl(plaintext)
+	if err != nil || event.Type != "event" {
+		return errors.New("companion sent an invalid page event")
+	}
+	var eventBody protocol.ControlEventBody
+	if event.DecodeBody(&eventBody) != nil || eventBody.Name != "resolve.page.changed" {
+		return errors.New("companion sent an invalid page event")
+	}
+	eventData, ok := eventBody.Data.(map[string]any)
+	if !ok || eventData["page"] != "color" {
+		return errors.New("companion sent an invalid page event")
 	}
 	return nil
 }

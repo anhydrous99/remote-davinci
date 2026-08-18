@@ -127,80 +127,150 @@ func runRelayConnection(parent context.Context, config Config, update func(Relay
 	}()
 	pingFailure := make(chan error, 1)
 	go pingRelay(ctx, connection, pingFailure)
+	relayMessages := readRelay(ctx, connection, peer.pending)
+	peer.pending = nil
 
 	update(RelayStatus{Connected: true, Message: "Relay connected; waiting for controller"})
 	var secure *secureChannel
-	for {
-		select {
-		case err := <-pingFailure:
-			return err
-		default:
-		}
-		var raw json.RawMessage
-		if len(peer.pending) != 0 {
-			raw, peer.pending = peer.pending[0], peer.pending[1:]
-		} else {
-			if err := wsjson.Read(ctx, connection, &raw); err != nil {
-				return err
-			}
-		}
-		envelope, err := protocol.ParseServer(raw)
-		if err != nil {
-			return err
-		}
-		switch envelope.Type {
-		case "session.opened":
-			var opened struct {
-				SessionID      string `json:"sessionId"`
-				LinkID         string `json:"linkId"`
-				PeerEndpointID string `json:"peerEndpointId"`
-			}
-			if envelope.DecodeBody(&opened) != nil || opened.LinkID != config.LinkID || opened.PeerEndpointID != config.ControllerEndpointID {
-				return errors.New("relay opened an unexpected session")
-			}
-			secure, err = newSecureChannel(config, opened.SessionID)
-			if err != nil {
-				return err
-			}
-			update(RelayStatus{Connected: true, Message: "Controller connected; securing session…"})
-		case "session.frame":
-			if secure == nil {
-				return errors.New("received a frame outside a session")
-			}
-			var frame protocol.SessionFrameBody
-			if envelope.DecodeBody(&frame) != nil || frame.SessionID != secure.sessionID {
-				return errors.New("received a frame for an unexpected session")
-			}
-			packets, ready, err := secure.receive(ctx, frame.Seq, frame.Payload)
-			if err != nil {
-				return err
-			}
-			for _, packet := range packets {
-				if err := secure.sendPacket(ctx, connection, packet); err != nil {
-					return err
+	var pageEvents <-chan resolvePageObservation
+	var stopPageMonitor context.CancelFunc
+	stopMonitoring := func() {
+		if stopPageMonitor != nil {
+			stopPageMonitor()
+			if pageEvents != nil {
+				for range pageEvents {
 				}
 			}
-			if ready {
-				update(RelayStatus{Connected: true, Secure: true, Message: "Secure controller session"})
-			}
-		case "session.closed":
-			var closed struct {
-				SessionID string `json:"sessionId"`
-			}
-			if envelope.DecodeBody(&closed) != nil {
-				return errors.New("relay closed an invalid session")
-			}
-			if secure == nil || closed.SessionID != secure.sessionID {
+			stopPageMonitor = nil
+		}
+		pageEvents = nil
+	}
+	defer stopMonitoring()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-pingFailure:
+			return err
+		case observation, ok := <-pageEvents:
+			if !ok {
+				pageEvents = nil
 				continue
 			}
-			secure = nil
-			update(RelayStatus{Connected: true, Message: "Relay connected; waiting for controller"})
-		case "link.revoked":
-			return fmt.Errorf("%w: controller link was revoked", errEnrollmentTerminal)
-		case "error":
-			return errors.New("relay rejected a session message")
+			packet, err := secure.pageChangedEvent(observation)
+			if err != nil {
+				return err
+			}
+			if packet == nil {
+				continue
+			}
+			if err := secure.sendPacket(ctx, connection, packet); err != nil {
+				return err
+			}
+		case received, ok := <-relayMessages:
+			if !ok {
+				return errors.New("relay reader stopped")
+			}
+			if received.err != nil {
+				return received.err
+			}
+			envelope, err := protocol.ParseServer(received.raw)
+			if err != nil {
+				return err
+			}
+			switch envelope.Type {
+			case "session.opened":
+				var opened struct {
+					SessionID      string `json:"sessionId"`
+					LinkID         string `json:"linkId"`
+					PeerEndpointID string `json:"peerEndpointId"`
+				}
+				if envelope.DecodeBody(&opened) != nil || opened.LinkID != config.LinkID || opened.PeerEndpointID != config.ControllerEndpointID {
+					return errors.New("relay opened an unexpected session")
+				}
+				stopMonitoring()
+				secure, err = newSecureChannel(config, opened.SessionID)
+				if err != nil {
+					return err
+				}
+				update(RelayStatus{Connected: true, Message: "Controller connected; securing session…"})
+			case "session.frame":
+				if secure == nil {
+					return errors.New("received a frame outside a session")
+				}
+				var frame protocol.SessionFrameBody
+				if envelope.DecodeBody(&frame) != nil || frame.SessionID != secure.sessionID {
+					return errors.New("received a frame for an unexpected session")
+				}
+				packets, ready, err := secure.receive(ctx, frame.Seq, frame.Payload)
+				if err != nil {
+					return err
+				}
+				for _, packet := range packets {
+					if err := secure.sendPacket(ctx, connection, packet); err != nil {
+						return err
+					}
+				}
+				if ready {
+					if pageEvents == nil {
+						monitorContext, cancelMonitor := context.WithCancel(ctx)
+						stopPageMonitor = cancelMonitor
+						pageEvents = monitorResolvePages(monitorContext, runResolvePageMonitor)
+					}
+					update(RelayStatus{Connected: true, Secure: true, Message: "Secure controller session"})
+				}
+			case "session.closed":
+				var closed struct {
+					SessionID string `json:"sessionId"`
+				}
+				if envelope.DecodeBody(&closed) != nil {
+					return errors.New("relay closed an invalid session")
+				}
+				if secure == nil || closed.SessionID != secure.sessionID {
+					continue
+				}
+				stopMonitoring()
+				secure = nil
+				update(RelayStatus{Connected: true, Message: "Relay connected; waiting for controller"})
+			case "link.revoked":
+				return fmt.Errorf("%w: controller link was revoked", errEnrollmentTerminal)
+			case "error":
+				return errors.New("relay rejected a session message")
+			}
 		}
 	}
+}
+
+type relayRead struct {
+	raw json.RawMessage
+	err error
+}
+
+func readRelay(ctx context.Context, connection *websocket.Conn, pending []json.RawMessage) <-chan relayRead {
+	reads := make(chan relayRead, 1)
+	go func() {
+		defer close(reads)
+		for _, raw := range pending {
+			select {
+			case reads <- relayRead{raw: raw}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		for {
+			var raw json.RawMessage
+			err := wsjson.Read(ctx, connection, &raw)
+			select {
+			case reads <- relayRead{raw: raw, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return reads
 }
 
 func pingRelay(ctx context.Context, connection *websocket.Conn, failure chan<- error) {
@@ -227,16 +297,18 @@ func pingRelay(ctx context.Context, connection *websocket.Conn, failure chan<- e
 }
 
 type secureChannel struct {
-	sessionID     string
-	expectedIn    int64
-	nextOut       int64
-	peerKey       []byte
-	handshake     *noise.HandshakeState
-	sendCipher    *noise.CipherState
-	receiveCipher *noise.CipherState
-	processor     *controlProcessor
-	pending       map[int64][]byte
-	pendingBytes  int
+	sessionID         string
+	expectedIn        int64
+	nextOut           int64
+	peerKey           []byte
+	handshake         *noise.HandshakeState
+	sendCipher        *noise.CipherState
+	receiveCipher     *noise.CipherState
+	processor         *controlProcessor
+	pending           map[int64][]byte
+	pendingBytes      int
+	lastPageCommandAt time.Time
+	lastResolvePage   string
 }
 
 func newSecureChannel(config Config, sessionID string) (*secureChannel, error) {
@@ -264,10 +336,24 @@ func newSecureChannel(config Config, sessionID string) (*secureChannel, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &secureChannel{
+	channel := &secureChannel{
 		sessionID: sessionID, expectedIn: 1, nextOut: 1, peerKey: peerKey,
-		handshake: handshake, processor: newControlProcessor(ExecuteOperation), pending: make(map[int64][]byte),
-	}, nil
+		handshake: handshake, pending: make(map[int64][]byte),
+	}
+	channel.processor = newControlProcessor(func(ctx context.Context, operation string) (map[string]any, error) {
+		result, err := ExecuteOperation(ctx, operation)
+		if err == nil {
+			channel.recordSuccessfulPageCommand(operation, time.Now())
+		}
+		return result, err
+	})
+	return channel, nil
+}
+
+func (channel *secureChannel) recordSuccessfulPageCommand(operation string, completedAt time.Time) {
+	if _, ok := resolvePageForOperation(operation); ok {
+		channel.lastPageCommandAt = completedAt
+	}
 }
 
 func (channel *secureChannel) receive(ctx context.Context, sequence int64, encoded string) ([][]byte, bool, error) {
@@ -354,6 +440,34 @@ func (channel *secureChannel) receivePacket(ctx context.Context, packet []byte) 
 		return nil, false, err
 	}
 	return [][]byte{encrypted}, channel.processor.peerHello, nil
+}
+
+func (channel *secureChannel) pageChangedEvent(observation resolvePageObservation) ([]byte, error) {
+	if channel.sendCipher == nil || !channel.processor.peerHello || observation.page == "" || observation.observedAt.IsZero() {
+		return nil, errors.New("cannot send Resolve page event")
+	}
+	if !observation.observedAt.After(channel.lastPageCommandAt) {
+		return nil, nil
+	}
+	if observation.page == channel.lastResolvePage {
+		return nil, nil
+	}
+	channel.lastResolvePage = observation.page
+	if !supportedResolvePage(observation.page) {
+		return nil, nil
+	}
+	id, err := randomUUID()
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := json.Marshal(wireEnvelope{
+		Protocol: protocol.ControlProtocolName, V: protocol.ControlProtocolVersion, Type: "event", ID: id,
+		Body: protocol.ControlEventBody{Name: "resolve.page.changed", Data: map[string]any{"page": observation.page}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return channel.sendCipher.Encrypt(nil, nil, plaintext)
 }
 
 func (channel *secureChannel) sendPacket(ctx context.Context, connection *websocket.Conn, packet []byte) error {

@@ -496,9 +496,51 @@ struct LateResponseWindow {
     }
 }
 
+public enum ResolvePage: String, CaseIterable, Sendable {
+    case cut
+    case edit
+    case fusion
+    case color
+
+    public var operation: String { "resolve.page.\(rawValue)" }
+
+    init?(operation: String) {
+        guard operation.hasPrefix("resolve.page.") else { return nil }
+        self.init(rawValue: String(operation.dropFirst("resolve.page.".count)))
+    }
+}
+
+enum ResolvePageControl {
+    static func responsePage(operation: String, result: Any) throws -> ResolvePage? {
+        guard let expected = ResolvePage(operation: operation) else { return nil }
+        guard let result = result as? [String: Any],
+              let rawPage = result["page"] as? String,
+              let page = ResolvePage(rawValue: rawPage),
+              page == expected
+        else {
+            throw ControllerProtocolError.invalidMessage
+        }
+        return page
+    }
+
+    static func eventPage(body: [String: Any]) throws -> ResolvePage? {
+        guard let name = body["name"] as? String else {
+            throw ControllerProtocolError.invalidMessage
+        }
+        guard name == "resolve.page.changed" else { return nil }
+        guard let data = body["data"] as? [String: Any],
+              let rawPage = data["page"] as? String,
+              let page = ResolvePage(rawValue: rawPage)
+        else {
+            throw ControllerProtocolError.invalidMessage
+        }
+        return page
+    }
+}
+
 @MainActor
 public final class ControllerModel: ObservableObject {
-    public static let operations = ["resolve.page.edit", "host.volume.toggle-mute"]
+    public static let operations = ResolvePage.allCases.map(\.operation) + ["host.volume.toggle-mute"]
 
     @Published public var deviceLabel = UIDevice.current.name
     @Published public var enrollmentResponseJSON = ""
@@ -513,6 +555,7 @@ public final class ControllerModel: ObservableObject {
     @Published public private(set) var isReady = false
     @Published public private(set) var isResetting = false
     @Published public private(set) var companionCapabilities = Set<String>()
+    @Published public private(set) var selectedPage: ResolvePage = .edit
 
     private struct PendingCommand {
         let id: String
@@ -625,8 +668,12 @@ public final class ControllerModel: ObservableObject {
         stopMaintainingConnection(status: "Disconnected", feedback: "Disconnected")
     }
 
-    public func perform(_ operation: String) {
-        Task { await sendCommand(operation) }
+    public func requestPage(_ page: ResolvePage) {
+        Task { await sendCommand(page.operation) }
+    }
+
+    public func toggleHostMute() {
+        Task { await sendCommand("host.volume.toggle-mute") }
     }
 
     public func revokeAndReenroll() {
@@ -910,7 +957,12 @@ public final class ControllerModel: ObservableObject {
             return
         }
 
-        if type == "event" { return }
+        if type == "event" {
+            if let page = try ResolvePageControl.eventPage(body: body) {
+                selectedPage = page
+            }
+            return
+        }
         guard type == "response",
               let replyTo = envelope["replyTo"] as? String,
               isCanonicalUUID(replyTo)
@@ -930,7 +982,13 @@ public final class ControllerModel: ObservableObject {
             return
         }
 
-        if jsonBool(body["ok"]) == true, body["result"] != nil {
+        if jsonBool(body["ok"]) == true, let result = body["result"] {
+            if let page = try ResolvePageControl.responsePage(
+                operation: pendingCommand.operation,
+                result: result
+            ) {
+                selectedPage = page
+            }
             feedback = "\(pendingCommand.operation) succeeded"
         } else if jsonBool(body["ok"]) == false,
                   let error = body["error"] as? [String: Any],
