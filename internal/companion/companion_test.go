@@ -114,7 +114,7 @@ func TestControlProcessorValidatesAndDeduplicates(t *testing.T) {
 }
 
 func TestResolvePageOperationsRequireAuthoritativeReadback(t *testing.T) {
-	pages := []string{"cut", "edit", "fusion", "color"}
+	pages := []string{"media", "cut", "edit", "fusion", "color", "fairlight", "deliver"}
 	for _, page := range pages {
 		t.Run(page, func(t *testing.T) {
 			called := false
@@ -144,11 +144,19 @@ func TestResolvePageOperationsRequireAuthoritativeReadback(t *testing.T) {
 		t.Fatalf("mismatched readback error = %v", err)
 	}
 	called := false
-	if _, err := executeOperation(t.Context(), "resolve.page.media", func(context.Context, string, ...string) ([]byte, error) {
+	if _, err := executeOperation(t.Context(), "resolve.page.photo", func(context.Context, string, ...string) ([]byte, error) {
 		called = true
 		return nil, nil
 	}); err == nil || err.Error() != "operation.unsupported" || called {
 		t.Fatalf("unsupported operation called = %v, error = %v", called, err)
+	}
+}
+
+func TestNewPagePermissionsUseUnusedBits(t *testing.T) {
+	pages := []string{"resolve.page.media", "resolve.page.fairlight", "resolve.page.deliver"}
+	mask := requestedPermissionMask(pages)
+	if mask != 0b11100000 || !slices.Equal(grantedPermissions(mask), pages) {
+		t.Fatalf("new page permission mask = %08b, grant = %v", mask, grantedPermissions(mask))
 	}
 }
 
@@ -290,7 +298,7 @@ func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 	}
 	var helloBody protocol.ControlHelloBody
 	if parsedHello.DecodeBody(&helloBody) != nil || !reflect.DeepEqual(helloBody.Capabilities,
-		[]string{"resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color", "host.volume.toggle-mute"}) {
+		[]string{"resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color", "host.volume.toggle-mute", "resolve.page.media", "resolve.page.fairlight", "resolve.page.deliver"}) {
 		t.Fatalf("host capabilities = %v", helloBody.Capabilities)
 	}
 
@@ -373,7 +381,7 @@ func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(2 * time.Millisecond)}); err != nil || packet != nil {
 		t.Fatalf("repeated page event packet = %x, error = %v", packet, err)
 	}
-	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "media", observedAt: commandCompleted.Add(4 * time.Millisecond)}); err != nil || packet != nil {
+	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "photo", observedAt: commandCompleted.Add(4 * time.Millisecond)}); err != nil || packet != nil {
 		t.Fatalf("unsupported page event packet = %x, error = %v", packet, err)
 	}
 	returnedPacket, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(5 * time.Millisecond)})

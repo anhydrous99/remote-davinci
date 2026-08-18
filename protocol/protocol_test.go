@@ -330,7 +330,7 @@ func TestPairingWormholeAndControlFixtures(t *testing.T) {
 	if !reflect.DeepEqual(controlTypes, ControlMessageTypes) {
 		t.Fatalf("control types = %v", controlTypes)
 	}
-	pageOperations := []string{"resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color"}
+	pageOperations := []string{"resolve.page.media", "resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color", "resolve.page.fairlight", "resolve.page.deliver"}
 	if !reflect.DeepEqual(hello.Capabilities, pageOperations) || !reflect.DeepEqual(requests, pageOperations) {
 		t.Fatalf("page capabilities = %v, requests = %v", hello.Capabilities, requests)
 	}
