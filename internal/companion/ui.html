@@ -69,10 +69,7 @@
 
   <script>
     const $ = id => document.getElementById(id);
-    const launchToken = new URL(location.href).searchParams.get('token');
-    if (launchToken) sessionStorage.setItem('remote-davinci-token', launchToken);
-    const uiToken = launchToken || sessionStorage.getItem('remote-davinci-token') || '';
-    if (launchToken) history.replaceState(null, '', location.pathname);
+    const uiToken = sessionStorage.getItem('remote-davinci-token') || '';
     let currentState;
     async function jsonFetch(path, options = {}) {
       const headers = new Headers(options.headers);

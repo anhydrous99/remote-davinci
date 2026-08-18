@@ -25,12 +25,13 @@ func main() {
 	relay := flag.String("relay", companion.DefaultRelayURL, "deployed WSS relay URL")
 	openBrowser := flag.Bool("open", true, "open the GUI in the default browser")
 	native := flag.Bool("native", false, "run as the native app helper")
+	allowInsecureFileConfig := flag.Bool("allow-insecure-file-config", false, "allow standalone development mode to store credentials in a file")
 	flag.Parse()
 	var err error
 	if *native {
 		err = runNative(*configPath, *relay)
 	} else {
-		err = run(*listen, *configPath, *relay, *openBrowser)
+		err = run(*listen, *configPath, *relay, *openBrowser, *allowInsecureFileConfig)
 	}
 	if err != nil {
 		slog.Error("companion stopped", "error", err)
@@ -38,7 +39,10 @@ func main() {
 	}
 }
 
-func run(address, configPath, relay string, openBrowser bool) error {
+func run(address, configPath, relay string, openBrowser, allowInsecureFileConfig bool) error {
+	if !allowInsecureFileConfig {
+		return errors.New("standalone file credential storage requires -allow-insecure-file-config")
+	}
 	return runServer(address, configPath, relay, openBrowser, nil, os.Stdout, companion.NewApp)
 }
 
@@ -81,8 +85,10 @@ func runServer(
 		return nativeStartupError(ctx, parent, output, err)
 	}
 	defer listener.Close()
-	url := app.LaunchURL("http://" + listener.Addr().String())
+	baseURL := "http://" + listener.Addr().String()
+	url := app.BrowserLaunchURL(baseURL)
 	if parent != nil {
+		url = app.NativeLaunchURL(baseURL)
 		if err := json.NewEncoder(output).Encode(struct {
 			V       int    `json:"v"`
 			Version string `json:"version"`

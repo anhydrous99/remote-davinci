@@ -6,6 +6,7 @@ import UIKit
 
 struct EnrollmentRequest: Codable, Equatable {
     let v: Int
+    let relayUrl: String
     let controllerEndpointId: String
     let controllerCredentialHash: String
     let controllerNoiseKey: String
@@ -26,6 +27,7 @@ struct StoredEnrollment: Codable, Equatable {
     let controllerSecret: String
     let controllerNoisePrivateKey: String
     let deviceLabel: String
+    var expectedRelayUrl: String? = nil
     var response: EnrollmentResponse?
     var linkRevocationConfirmed: Bool? = nil
 }
@@ -45,6 +47,7 @@ enum EnrollmentError: LocalizedError, Equatable {
     case invalidJSON
     case invalidResponse
     case mismatchedController
+    case mismatchedRelay
     case missingRequest
     case randomFailure
 
@@ -54,6 +57,7 @@ enum EnrollmentError: LocalizedError, Equatable {
         case .invalidJSON: "The enrollment response is not valid JSON."
         case .invalidResponse: "The enrollment response is invalid."
         case .mismatchedController: "The response belongs to another controller."
+        case .mismatchedRelay: "The response selected a different relay than the request."
         case .missingRequest: "Create an enrollment request first."
         case .randomFailure: "Secure random generation failed."
         }
@@ -61,6 +65,8 @@ enum EnrollmentError: LocalizedError, Equatable {
 }
 
 enum Enrollment {
+    static let defaultRelayURL = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
+
     static func create(deviceLabel: String) throws -> (EnrollmentRequest, StoredEnrollment) {
         let label = deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (1...80).contains(label.unicodeScalars.count) else {
@@ -75,6 +81,7 @@ enum Enrollment {
             controllerSecret: Base64URL.encode(secret),
             controllerNoisePrivateKey: Base64URL.encode(noisePrivateKey.rawRepresentation),
             deviceLabel: label,
+            expectedRelayUrl: defaultRelayURL,
             response: nil
         )
         return (request(for: stored), stored)
@@ -86,6 +93,7 @@ enum Enrollment {
             .flatMap { try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: $0) }
         return EnrollmentRequest(
             v: 1,
+            relayUrl: stored.expectedRelayUrl ?? defaultRelayURL,
             controllerEndpointId: stored.controllerEndpointId,
             controllerCredentialHash: Base64URL.encode(Data(SHA256.hash(data: secret))),
             controllerNoiseKey: privateKey.map { Base64URL.encode($0.publicKey.rawRepresentation) } ?? "",
@@ -121,6 +129,10 @@ enum Enrollment {
         guard response.controllerEndpointId == stored.controllerEndpointId else {
             throw EnrollmentError.mismatchedController
         }
+        let expectedRelayURL = stored.expectedRelayUrl ?? defaultRelayURL
+        guard response.relayUrl == expectedRelayURL else {
+            throw EnrollmentError.mismatchedRelay
+        }
         guard Base64URL.decode32(stored.controllerSecret) != nil,
               Base64URL.decode32(stored.controllerNoisePrivateKey) != nil,
               isCanonicalUUID(stored.controllerEndpointId)
@@ -129,6 +141,7 @@ enum Enrollment {
         }
 
         var active = stored
+        active.expectedRelayUrl = expectedRelayURL
         active.response = response
         return active
     }

@@ -28,9 +28,16 @@ func main() {
 	}
 	store := relay.NewDynamoStore(tableName, dynamodb.NewFromConfig(configuration))
 	management := apigatewaymanagementapi.NewFromConfig(configuration)
-	post := func(ctx context.Context, connectionID string, message relay.Message, event relay.WebSocketEvent) error {
+	managementEndpoint := func(event relay.WebSocketEvent) (string, error) {
 		if event.RequestContext.DomainName == "" || event.RequestContext.Stage == "" {
-			return errors.New("missing WebSocket management endpoint")
+			return "", errors.New("missing WebSocket management endpoint")
+		}
+		return "https://" + event.RequestContext.DomainName + "/" + event.RequestContext.Stage, nil
+	}
+	post := func(ctx context.Context, connectionID string, message relay.Message, event relay.WebSocketEvent) error {
+		endpoint, err := managementEndpoint(event)
+		if err != nil {
+			return err
 		}
 		data, err := relay.MarshalMessage(message)
 		if err != nil {
@@ -39,9 +46,21 @@ func main() {
 		_, err = management.PostToConnection(ctx, &apigatewaymanagementapi.PostToConnectionInput{
 			ConnectionId: aws.String(connectionID), Data: data,
 		}, func(options *apigatewaymanagementapi.Options) {
-			options.BaseEndpoint = aws.String("https://" + event.RequestContext.DomainName + "/" + event.RequestContext.Stage)
+			options.BaseEndpoint = aws.String(endpoint)
 		})
 		return err
 	}
-	lambda.Start(relay.NewHandler(relay.HandlerDependencies{Store: store, Post: post}).Handle)
+	drop := func(ctx context.Context, connectionID string, event relay.WebSocketEvent) error {
+		endpoint, err := managementEndpoint(event)
+		if err != nil {
+			return err
+		}
+		_, err = management.DeleteConnection(ctx, &apigatewaymanagementapi.DeleteConnectionInput{
+			ConnectionId: aws.String(connectionID),
+		}, func(options *apigatewaymanagementapi.Options) {
+			options.BaseEndpoint = aws.String(endpoint)
+		})
+		return err
+	}
+	lambda.Start(relay.NewHandler(relay.HandlerDependencies{Store: store, Post: post, Drop: drop}).Handle)
 }

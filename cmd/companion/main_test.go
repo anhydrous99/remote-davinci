@@ -11,11 +11,19 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/anhydrous99/remote-davinci/internal/companion"
 )
+
+func TestStandaloneRequiresExplicitFileStorageOptIn(t *testing.T) {
+	err := run("127.0.0.1:0", filepath.Join(t.TempDir(), "companion.json"), companion.DefaultRelayURL, false, false)
+	if err == nil || !strings.Contains(err.Error(), "-allow-insecure-file-config") {
+		t.Fatalf("standalone opt-in error = %v", err)
+	}
+}
 
 func TestNativeStartupFailureIsSanitized(t *testing.T) {
 	parent, keepalive := io.Pipe()

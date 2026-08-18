@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/netip"
 	"os"
 	"regexp"
 	"slices"
@@ -39,6 +40,7 @@ type Post func(context.Context, string, Message, WebSocketEvent) error
 type HandlerDependencies struct {
 	Store   Store
 	Post    Post
+	Drop    func(context.Context, string, WebSocketEvent) error
 	Now     func() int64
 	ID      func() string
 	Locator func() string
@@ -48,6 +50,7 @@ type HandlerDependencies struct {
 type Handler struct {
 	store   Store
 	post    Post
+	drop    func(context.Context, string, WebSocketEvent) error
 	now     func() int64
 	id      func() string
 	locator func() string
@@ -66,9 +69,18 @@ var (
 	requestIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
+const (
+	pairingConnectsPerMinute  = int64(30)
+	sessionFramesPerMinute    = int64(3_600)
+	endpointMessagesPerMinute = int64(600)
+)
+
 func NewHandler(dependencies HandlerDependencies) *Handler {
 	if dependencies.Now == nil {
 		dependencies.Now = func() int64 { return time.Now().Unix() }
+	}
+	if dependencies.Drop == nil {
+		dependencies.Drop = func(context.Context, string, WebSocketEvent) error { return nil }
 	}
 	if dependencies.ID == nil {
 		dependencies.ID = randomUUID
@@ -80,7 +92,7 @@ func NewHandler(dependencies HandlerDependencies) *Handler {
 		dependencies.Logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	}
 	return &Handler{
-		store: dependencies.Store, post: dependencies.Post, now: dependencies.Now,
+		store: dependencies.Store, post: dependencies.Post, drop: dependencies.Drop, now: dependencies.Now,
 		id: dependencies.ID, locator: dependencies.Locator, logger: dependencies.Logger,
 	}
 }
@@ -138,6 +150,14 @@ func sessionPeer(session Session, connectionID string) (string, error) {
 }
 
 func SourceKey(sourceIP string) string {
+	if address, err := netip.ParseAddr(sourceIP); err == nil {
+		address = address.Unmap()
+		if address.Is6() {
+			sourceIP = netip.PrefixFrom(address, 64).Masked().String()
+		} else {
+			sourceIP = address.String()
+		}
+	}
 	digest := sha256.Sum256([]byte(sourceIP))
 	return base64.RawURLEncoding.EncodeToString(digest[:])
 }
@@ -199,8 +219,8 @@ func (h *Handler) notifyOpenedSession(ctx context.Context, session Session, even
 		connectionID   string
 		peerEndpointID string
 	}{
-		{session.ControllerConnectionID, session.CompanionID},
 		{session.CompanionConnectionID, session.ControllerID},
+		{session.ControllerConnectionID, session.CompanionID},
 	} {
 		delivered, err := h.notify(ctx, target.connectionID, response("session.opened", map[string]any{
 			"sessionId": session.SessionID, "linkId": session.LinkID, "peerEndpointId": target.peerEndpointID,
@@ -215,8 +235,49 @@ func (h *Handler) notifyOpenedSession(ctx context.Context, session Session, even
 	return nil
 }
 
-func (h *Handler) closeAndNotify(ctx context.Context, sessionID, endpointID, reason string, event WebSocketEvent, skipConnectionID string) (*CloseSessionResult, error) {
-	result, err := h.store.CloseSession(ctx, sessionID, endpointID, h.now())
+func serviceCode(err error) protocol.ErrorCode {
+	var service *ServiceError
+	if errors.As(err, &service) {
+		return service.Code
+	}
+	return ""
+}
+
+func validationFailure(err error) bool {
+	var validation *protocol.ValidationError
+	return errors.As(err, &validation)
+}
+
+func shouldDropFrame(route string, err error) bool {
+	frameRoute := route == "pair.frame" || route == "session.frame"
+	if frameRoute && validationFailure(err) {
+		return true
+	}
+	code := serviceCode(err)
+	return code == protocol.RateLimited || frameRoute && code == protocol.InvalidMessage ||
+		route == "session.frame" && (code == protocol.Unauthenticated || code == protocol.Forbidden)
+}
+
+func shouldDropDefault(err error) bool {
+	code := serviceCode(err)
+	return validationFailure(err) || code == protocol.RateLimited || code == protocol.Unauthenticated
+}
+
+func (h *Handler) dropAndCleanup(ctx context.Context, event WebSocketEvent) error {
+	dropErr := h.drop(ctx, event.RequestContext.ConnectionID, event)
+	if gone(dropErr) {
+		dropErr = nil
+	}
+	return errors.Join(dropErr, h.cleanup(ctx, event.RequestContext.ConnectionID, "peer-disconnected", event, true))
+}
+
+func (h *Handler) rejectAndDrop(ctx context.Context, requestID string, rejection error, event WebSocketEvent) error {
+	_, notifyErr := h.notify(ctx, event.RequestContext.ConnectionID, failure(requestID, rejection, h.id()), event)
+	return errors.Join(notifyErr, h.dropAndCleanup(ctx, event))
+}
+
+func (h *Handler) closeAndNotify(ctx context.Context, sessionID, endpointID, connectionID, reason string, event WebSocketEvent, skipConnectionID string) (*CloseSessionResult, error) {
+	result, err := h.store.CloseSession(ctx, sessionID, endpointID, connectionID, h.now())
 	if err != nil {
 		return result, err
 	}
@@ -287,9 +348,18 @@ func (h *Handler) relaySessionFrame(ctx context.Context, message protocol.Client
 	if err := message.DecodeBody(&frame); err != nil {
 		return err
 	}
-	// ponytail: one authority read preserves immediate revocation; add an edge
-	// per-session limiter only if the documented 60 fps client cap is abused.
-	session, err := h.store.Session(ctx, frame.SessionID, h.now())
+	timestamp := h.now()
+	connection, err := h.store.Connection(ctx, event.RequestContext.ConnectionID, timestamp)
+	if err != nil {
+		return err
+	}
+	if connection.AuthMode != "endpoint" || connection.EndpointID == "" {
+		return serviceError(protocol.Forbidden)
+	}
+	if err := h.store.RateLimit(ctx, connection.EndpointID, message.Type, sessionFramesPerMinute, timestamp); err != nil {
+		return err
+	}
+	session, err := h.store.Session(ctx, frame.SessionID, timestamp)
 	if err != nil {
 		return err
 	}
@@ -457,7 +527,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err := message.DecodeBody(&body); err != nil {
 			return nil, err
 		}
-		revoked, err := h.store.RevokeLink(ctx, body.LinkID, connection.EndpointID, timestamp)
+		revoked, err := h.store.RevokeLink(ctx, body.LinkID, connection.EndpointID, connection.ConnectionID, timestamp)
 		if err != nil {
 			return nil, err
 		}
@@ -480,7 +550,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err := message.DecodeBody(&body); err != nil {
 			return nil, err
 		}
-		if err := h.store.RotateEndpoint(ctx, connection.EndpointID, body.CredentialHash, timestamp); err != nil {
+		if err := h.store.RotateEndpoint(ctx, connection.EndpointID, connection.ConnectionID, body.CredentialHash, timestamp); err != nil {
 			return nil, err
 		}
 		return map[string]any{"rotated": true}, nil
@@ -488,7 +558,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if connection.EndpointID == "" {
 			return nil, serviceError(protocol.Forbidden)
 		}
-		revoked, err := h.store.RevokeEndpoint(ctx, connection.EndpointID, timestamp)
+		revoked, err := h.store.RevokeEndpoint(ctx, connection.EndpointID, connection.ConnectionID, timestamp)
 		if err != nil {
 			return nil, err
 		}
@@ -519,7 +589,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 			return nil, err
 		}
 		if notifyErr := h.notifyOpenedSession(ctx, session, event); notifyErr != nil {
-			_, closeErr := h.closeAndNotify(ctx, session.SessionID, "", "peer-disconnected", event, "")
+			_, closeErr := h.closeAndNotify(ctx, session.SessionID, "", "", "peer-disconnected", event, "")
 			return nil, errors.Join(notifyErr, closeErr)
 		}
 		return map[string]any{"sessionId": session.SessionID}, nil
@@ -531,7 +601,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err := message.DecodeBody(&body); err != nil {
 			return nil, err
 		}
-		if _, err := h.closeAndNotify(ctx, body.SessionID, connection.EndpointID, "requested", event, ""); err != nil {
+		if _, err := h.closeAndNotify(ctx, body.SessionID, connection.EndpointID, connection.ConnectionID, "requested", event, ""); err != nil {
 			return nil, err
 		}
 		return map[string]any{"closed": true}, nil
@@ -565,7 +635,13 @@ func (h *Handler) handleConnect(ctx context.Context, event WebSocketEvent) (WebS
 		SourceKey:   SourceKey(sourceIP(event.RequestContext.Identity.SourceIP)),
 		ConnectedAt: timestamp, ExpiresAt: timestamp + 2*60*60 + 5*60,
 	}
-	closed, err := h.store.Connect(ctx, connection, credentialHash)
+	var closed *CloseSessionResult
+	if authMode == "pairing" {
+		err = h.store.RateLimit(ctx, connection.SourceKey, "pairing.connect", pairingConnectsPerMinute, timestamp)
+	}
+	if err == nil {
+		closed, err = h.store.Connect(ctx, connection, credentialHash)
+	}
 	if err != nil {
 		var service *ServiceError
 		code, status := protocol.Internal, 500
@@ -608,7 +684,11 @@ func (h *Handler) handleFrame(ctx context.Context, event WebSocketEvent) (WebSoc
 	}
 	if err != nil {
 		h.logRejected(ctx, event, err)
-		if _, notifyErr := h.notify(ctx, event.RequestContext.ConnectionID, failure(requestID, err, h.id()), event); notifyErr != nil {
+		if shouldDropFrame(event.RequestContext.RouteKey, err) {
+			if dropErr := h.rejectAndDrop(ctx, requestID, err, event); dropErr != nil {
+				return WebSocketResponse{}, dropErr
+			}
+		} else if _, notifyErr := h.notify(ctx, event.RequestContext.ConnectionID, failure(requestID, err, h.id()), event); notifyErr != nil {
 			return WebSocketResponse{}, notifyErr
 		}
 	}
@@ -622,8 +702,19 @@ func (h *Handler) handleDefault(ctx context.Context, event WebSocketEvent) (WebS
 	if err == nil {
 		var connection Connection
 		connection, err = h.store.Connection(ctx, event.RequestContext.ConnectionID, h.now())
-		if err == nil && connection.AuthMode == "pairing" {
-			err = h.store.RateLimit(ctx, connection.SourceKey, "pairing.message", 120, h.now())
+		if err == nil {
+			switch connection.AuthMode {
+			case "pairing":
+				err = h.store.RateLimit(ctx, connection.SourceKey, "pairing.message", 120, h.now())
+			case "endpoint":
+				if connection.EndpointID == "" {
+					err = serviceError(protocol.Unauthenticated)
+				} else {
+					err = h.store.RateLimit(ctx, connection.EndpointID, "endpoint.message", endpointMessagesPerMinute, h.now())
+				}
+			default:
+				err = serviceError(protocol.Unauthenticated)
+			}
 		}
 		if err == nil {
 			var result map[string]any
@@ -637,6 +728,9 @@ func (h *Handler) handleDefault(ctx context.Context, event WebSocketEvent) (WebS
 	}
 	if err != nil {
 		h.logRejected(ctx, event, err)
+		if shouldDropDefault(err) {
+			return WebSocketResponse{StatusCode: 200}, h.rejectAndDrop(ctx, requestID, err, event)
+		}
 		reply = failure(requestID, err, h.id())
 	}
 	body, err := MarshalMessage(reply)

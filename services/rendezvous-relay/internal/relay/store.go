@@ -13,7 +13,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-const meta = "META"
+const (
+	meta                    = "META"
+	pairActivationsPerDay   = int64(10_000)
+	minuteRateWindowSeconds = int64(60)
+	dailyRateWindowSeconds  = int64(24 * 60 * 60)
+)
 
 type Store interface {
 	GetEndpoint(context.Context, string) (*Endpoint, error)
@@ -27,12 +32,12 @@ type Store interface {
 	CommitPair(context.Context, string, PairCommit, int64) (CommitPairResult, error)
 	CancelPair(context.Context, string, string, int64) (*Pair, error)
 	Link(context.Context, string) (*Link, error)
-	RevokeLink(context.Context, string, string, int64) (RevokeLinkResult, error)
-	RotateEndpoint(context.Context, string, string, int64) error
-	RevokeEndpoint(context.Context, string, int64) (RevokeEndpointResult, error)
+	RevokeLink(context.Context, string, string, string, int64) (RevokeLinkResult, error)
+	RotateEndpoint(context.Context, string, string, string, int64) error
+	RevokeEndpoint(context.Context, string, string, int64) (RevokeEndpointResult, error)
 	OpenSession(context.Context, string, string, string, string, int64) (Session, error)
 	Session(context.Context, string, int64) (Session, error)
-	CloseSession(context.Context, string, string, int64) (*CloseSessionResult, error)
+	CloseSession(context.Context, string, string, string, int64) (*CloseSessionResult, error)
 }
 
 type DynamoAPI interface {
@@ -116,6 +121,20 @@ func (s *DynamoStore) GetEndpoint(ctx context.Context, endpointID string) (*Endp
 		return nil, err
 	}
 	return &endpoint, nil
+}
+
+func (s *DynamoStore) currentEndpoint(ctx context.Context, endpointID, connectionID string) (*Endpoint, error) {
+	if endpointID == "" || connectionID == "" {
+		return nil, serviceError(protocol.Unauthenticated)
+	}
+	endpoint, err := s.GetEndpoint(ctx, endpointID)
+	if err != nil {
+		return nil, err
+	}
+	if endpoint == nil || endpoint.RevokedAt != 0 || endpoint.ConnectionID != connectionID {
+		return nil, serviceError(protocol.Unauthenticated)
+	}
+	return endpoint, nil
 }
 
 func (s *DynamoStore) Connect(ctx context.Context, connection Connection, credentialHash string) (*CloseSessionResult, error) {
@@ -214,7 +233,7 @@ func (s *DynamoStore) Connect(ctx context.Context, connection Connection, creden
 			(session.ControllerID == endpoint.EndpointID || session.CompanionID == endpoint.EndpointID) {
 			closed, err := s.transactSessionTransition(ctx, session, connection.ConnectedAt, operations, map[string]bool{
 				itemKey("ENDPOINT", endpoint.EndpointID): true,
-			})
+			}, nil)
 			if conditionalFailure(err) {
 				continue
 			}
@@ -323,7 +342,7 @@ func (s *DynamoStore) Disconnect(ctx context.Context, connectionID string, now i
 		if found && (session.ControllerConnectionID == connectionID || session.CompanionConnectionID == connectionID) {
 			closed, err := s.transactSessionTransition(ctx, session, now, operations, map[string]bool{
 				itemKey("ENDPOINT", connection.EndpointID): true,
-			})
+			}, nil)
 			if conditionalFailure(err) {
 				continue
 			}
@@ -353,34 +372,29 @@ func (s *DynamoStore) Connection(ctx context.Context, connectionID string, now i
 	if !found || connection.ExpiresAt <= now {
 		return Connection{}, serviceError(protocol.Unauthenticated)
 	}
-	if connection.EndpointID != "" {
-		endpoint, err := s.GetEndpoint(ctx, connection.EndpointID)
-		if err != nil {
-			return Connection{}, err
-		}
-		if endpoint == nil || endpoint.RevokedAt != 0 || endpoint.ConnectionID != connectionID {
-			return Connection{}, serviceError(protocol.Unauthenticated)
-		}
-	}
 	return connection, nil
 }
 
 func (s *DynamoStore) RateLimit(ctx context.Context, sourceKey, action string, limit, now int64) error {
-	minute := now / 60
+	return s.rateLimit(ctx, sourceKey, action, limit, minuteRateWindowSeconds, now)
+}
+
+func (s *DynamoStore) rateLimit(ctx context.Context, sourceKey, action string, limit, windowSeconds, now int64) error {
+	bucket := now / windowSeconds
 	expressionValues, err := values(map[string]any{
-		":expiresAt": (minute + 2) * 60, ":one": int64(1), ":limit": limit,
+		":expiresAt": (bucket + 2) * windowSeconds, ":one": int64(1), ":limit": limit,
 	})
 	if err != nil {
 		return err
 	}
 	_, err = s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(s.tableName), Key: key("RATE", fmt.Sprintf("%s#%s#%d", sourceKey, action, minute)),
+		TableName: aws.String(s.tableName), Key: key("RATE", fmt.Sprintf("%s#%s#%d", sourceKey, action, bucket)),
 		UpdateExpression:         aws.String("SET expiresAt = :expiresAt ADD #count :one"),
 		ConditionExpression:      aws.String("attribute_not_exists(#count) OR #count < :limit"),
 		ExpressionAttributeNames: map[string]string{"#count": "count"}, ExpressionAttributeValues: expressionValues,
 	})
 	if conditionalFailure(err) {
-		retryAfter := int64(60_000)
+		retryAfter := min(((bucket+1)*windowSeconds-now)*1_000, int64(3_600_000))
 		return &ServiceError{Code: protocol.RateLimited, Retryable: true, RetryAfterMS: &retryAfter}
 	}
 	return err
@@ -587,6 +601,9 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 	if err != nil {
 		return CommitPairResult{}, err
 	}
+	if err := s.rateLimit(ctx, "global", "pair.activate", pairActivationsPerDay, dailyRateWindowSeconds, now); err != nil {
+		return CommitPairResult{}, err
+	}
 	endpoints := []Endpoint{
 		{EndpointID: first.Self.EndpointID, CredentialHash: first.Self.CredentialHash, Role: first.Self.Role, CreatedAt: now, UpdatedAt: now},
 		{EndpointID: second.Self.EndpointID, CredentialHash: second.Self.CredentialHash, Role: second.Self.Role, CreatedAt: now, UpdatedAt: now},
@@ -687,8 +704,23 @@ func (s *DynamoStore) Link(ctx context.Context, linkID string) (*Link, error) {
 	return &link, nil
 }
 
-func (s *DynamoStore) RevokeLink(ctx context.Context, linkID, endpointID string, now int64) (RevokeLinkResult, error) {
+func (s *DynamoStore) endpointFence(endpointID, connectionID string) (types.TransactWriteItem, error) {
+	expressionValues, err := values(map[string]any{":connectionId": connectionID})
+	if err != nil {
+		return types.TransactWriteItem{}, err
+	}
+	return types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+		TableName: aws.String(s.tableName), Key: key("ENDPOINT", endpointID),
+		ConditionExpression:       aws.String("connectionId = :connectionId AND attribute_not_exists(revokedAt)"),
+		ExpressionAttributeValues: expressionValues,
+	}}, nil
+}
+
+func (s *DynamoStore) RevokeLink(ctx context.Context, linkID, endpointID, connectionID string, now int64) (RevokeLinkResult, error) {
 	for attempt := 0; attempt < 5; attempt++ {
+		if _, err := s.currentEndpoint(ctx, endpointID, connectionID); err != nil {
+			return RevokeLinkResult{}, err
+		}
 		link, err := s.Link(ctx, linkID)
 		if err != nil {
 			return RevokeLinkResult{}, err
@@ -699,7 +731,7 @@ func (s *DynamoStore) RevokeLink(ctx context.Context, linkID, endpointID string,
 		result := RevokeLinkResult{Link: *link}
 		if link.Status == "REVOKED" {
 			if link.ActiveSessionID != "" {
-				closed, err := s.CloseSession(ctx, link.ActiveSessionID, endpointID, now)
+				closed, err := s.CloseSession(ctx, link.ActiveSessionID, endpointID, connectionID, now)
 				if err != nil {
 					return RevokeLinkResult{}, err
 				}
@@ -729,7 +761,11 @@ func (s *DynamoStore) RevokeLink(ctx context.Context, linkID, endpointID string,
 			ExpressionAttributeNames: map[string]string{"#status": "status"}, ExpressionAttributeValues: expressionValues,
 		}}
 		if link.ActiveSessionID == "" {
-			_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{revoke}})
+			fence, fenceErr := s.endpointFence(endpointID, connectionID)
+			if fenceErr != nil {
+				return RevokeLinkResult{}, fenceErr
+			}
+			_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{revoke, fence}})
 			if conditionalFailure(err) {
 				continue
 			}
@@ -753,7 +789,7 @@ func (s *DynamoStore) RevokeLink(ctx context.Context, linkID, endpointID string,
 		}
 		closed, err := s.transactSessionTransition(ctx, session, now, []types.TransactWriteItem{revoke}, map[string]bool{
 			itemKey("LINK", linkID): true,
-		})
+		}, map[string]string{endpointID: connectionID})
 		if conditionalFailure(err) {
 			continue
 		}
@@ -769,15 +805,17 @@ func (s *DynamoStore) RevokeLink(ctx context.Context, linkID, endpointID string,
 	return RevokeLinkResult{}, retryableError(protocol.Conflict)
 }
 
-func (s *DynamoStore) RotateEndpoint(ctx context.Context, endpointID, credentialHash string, now int64) error {
-	expressionValues, err := values(map[string]any{":credentialHash": credentialHash, ":now": now})
+func (s *DynamoStore) RotateEndpoint(ctx context.Context, endpointID, connectionID, credentialHash string, now int64) error {
+	expressionValues, err := values(map[string]any{
+		":connectionId": connectionID, ":credentialHash": credentialHash, ":now": now,
+	})
 	if err != nil {
 		return err
 	}
 	_, err = s.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.tableName), Key: key("ENDPOINT", endpointID),
 		UpdateExpression:          aws.String("SET credentialHash = :credentialHash, updatedAt = :now"),
-		ConditionExpression:       aws.String("attribute_exists(pk) AND attribute_not_exists(revokedAt)"),
+		ConditionExpression:       aws.String("attribute_exists(pk) AND attribute_not_exists(revokedAt) AND connectionId = :connectionId"),
 		ExpressionAttributeValues: expressionValues,
 	})
 	if conditionalFailure(err) {
@@ -786,35 +824,17 @@ func (s *DynamoStore) RotateEndpoint(ctx context.Context, endpointID, credential
 	return err
 }
 
-func (s *DynamoStore) RevokeEndpoint(ctx context.Context, endpointID string, now int64) (RevokeEndpointResult, error) {
+func (s *DynamoStore) RevokeEndpoint(ctx context.Context, endpointID, connectionID string, now int64) (RevokeEndpointResult, error) {
 	for attempt := 0; attempt < 5; attempt++ {
-		endpoint, err := s.GetEndpoint(ctx, endpointID)
+		endpoint, err := s.currentEndpoint(ctx, endpointID, connectionID)
 		if err != nil {
 			return RevokeEndpointResult{}, err
 		}
-		if endpoint == nil {
-			return RevokeEndpointResult{}, serviceError(protocol.Unauthenticated)
-		}
-		if endpoint.RevokedAt != 0 {
-			result := RevokeEndpointResult{Endpoint: *endpoint}
-			if endpoint.ActiveSessionID != "" {
-				closed, err := s.CloseSession(ctx, endpoint.ActiveSessionID, endpointID, now)
-				if err != nil {
-					return RevokeEndpointResult{}, err
-				}
-				if closed != nil && closed.ClosedNow {
-					result.Session = closed
-				}
-				_ = s.clearIfEqual(ctx, "ENDPOINT", endpointID, "activeSessionId", endpoint.ActiveSessionID)
-				result.Endpoint.ActiveSessionID = ""
-			}
-			return result, nil
-		}
 
-		condition := "attribute_not_exists(revokedAt) AND attribute_not_exists(activeSessionId)"
-		input := map[string]any{":now": now}
+		condition := "attribute_not_exists(revokedAt) AND connectionId = :connectionId AND attribute_not_exists(activeSessionId)"
+		input := map[string]any{":connectionId": connectionID, ":now": now}
 		if endpoint.ActiveSessionID != "" {
-			condition = "attribute_not_exists(revokedAt) AND activeSessionId = :sessionId"
+			condition = "attribute_not_exists(revokedAt) AND connectionId = :connectionId AND activeSessionId = :sessionId"
 			input[":sessionId"] = endpoint.ActiveSessionID
 		}
 		expressionValues, err := values(input)
@@ -827,9 +847,12 @@ func (s *DynamoStore) RevokeEndpoint(ctx context.Context, endpointID string, now
 			ConditionExpression:       aws.String(condition),
 			ExpressionAttributeValues: expressionValues,
 		}}
+		deleteConnection := types.TransactWriteItem{Delete: &types.Delete{
+			TableName: aws.String(s.tableName), Key: key("CONNECTION", connectionID),
+		}}
 		result := RevokeEndpointResult{Endpoint: *endpoint}
 		if endpoint.ActiveSessionID == "" {
-			_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{revoke}})
+			_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{revoke, deleteConnection}})
 			if conditionalFailure(err) {
 				continue
 			}
@@ -847,7 +870,7 @@ func (s *DynamoStore) RevokeEndpoint(ctx context.Context, endpointID string, now
 			return RevokeEndpointResult{}, err
 		}
 		if !found || session.ControllerID != endpointID && session.CompanionID != endpointID {
-			_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{revoke}})
+			_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{revoke, deleteConnection}})
 			if conditionalFailure(err) {
 				continue
 			}
@@ -855,9 +878,9 @@ func (s *DynamoStore) RevokeEndpoint(ctx context.Context, endpointID string, now
 				return RevokeEndpointResult{}, err
 			}
 		} else {
-			closed, err := s.transactSessionTransition(ctx, session, now, []types.TransactWriteItem{revoke}, map[string]bool{
+			closed, err := s.transactSessionTransition(ctx, session, now, []types.TransactWriteItem{revoke, deleteConnection}, map[string]bool{
 				itemKey("ENDPOINT", endpointID): true,
-			})
+			}, nil)
 			if conditionalFailure(err) {
 				continue
 			}
@@ -983,13 +1006,13 @@ func (s *DynamoStore) repairStaleSession(ctx context.Context, sessionID string, 
 		return false, nil
 	}
 	if found {
-		_, err := s.CloseSession(ctx, sessionID, "", now)
+		_, err := s.CloseSession(ctx, sessionID, "", "", now)
 		return true, err
 	}
 	_, err = s.transactSessionTransition(ctx, Session{
 		SessionID: sessionID, LinkID: link.LinkID, ControllerID: link.ControllerID,
 		CompanionID: link.CompanionID, Status: "CLOSED",
-	}, now, nil, nil)
+	}, now, nil, nil, nil)
 	if conditionalFailure(err) {
 		return true, nil
 	}
@@ -1006,7 +1029,7 @@ func (s *DynamoStore) Session(ctx context.Context, sessionID string, now int64) 
 		return Session{}, serviceError(protocol.SessionNotFound)
 	}
 	if session.ExpiresAt <= now {
-		if _, err := s.CloseSession(ctx, sessionID, "", now); err != nil {
+		if _, err := s.CloseSession(ctx, sessionID, "", "", now); err != nil {
 			return Session{}, err
 		}
 		return Session{}, serviceError(protocol.SessionNotFound)
@@ -1014,8 +1037,15 @@ func (s *DynamoStore) Session(ctx context.Context, sessionID string, now int64) 
 	return session, nil
 }
 
-func (s *DynamoStore) CloseSession(ctx context.Context, sessionID, endpointID string, now int64) (*CloseSessionResult, error) {
+func (s *DynamoStore) CloseSession(ctx context.Context, sessionID, endpointID, connectionID string, now int64) (*CloseSessionResult, error) {
 	for attempt := 0; attempt < 5; attempt++ {
+		if endpointID != "" {
+			if _, err := s.currentEndpoint(ctx, endpointID, connectionID); err != nil {
+				return nil, err
+			}
+		} else if connectionID != "" {
+			return nil, serviceError(protocol.Unauthenticated)
+		}
 		var session Session
 		found, err := s.get(ctx, "SESSION", sessionID, &session)
 		if err != nil || !found {
@@ -1024,7 +1054,11 @@ func (s *DynamoStore) CloseSession(ctx context.Context, sessionID, endpointID st
 		if endpointID != "" && session.ControllerID != endpointID && session.CompanionID != endpointID {
 			return nil, serviceError(protocol.Forbidden)
 		}
-		closed, err := s.transactSessionTransition(ctx, session, now, nil, nil)
+		var fences map[string]string
+		if endpointID != "" {
+			fences = map[string]string{endpointID: connectionID}
+		}
+		closed, err := s.transactSessionTransition(ctx, session, now, nil, nil, fences)
 		if conditionalFailure(err) {
 			continue
 		}
@@ -1050,6 +1084,7 @@ func (s *DynamoStore) transactSessionTransition(
 	now int64,
 	prefix []types.TransactWriteItem,
 	omit map[string]bool,
+	fences map[string]string,
 ) (bool, error) {
 	operations := append([]types.TransactWriteItem(nil), prefix...)
 	closing := session.Status == "ACTIVE"
@@ -1082,6 +1117,7 @@ func (s *DynamoStore) transactSessionTransition(
 			}})
 		}
 	}
+	fenced := make(map[string]bool, len(fences))
 	for _, endpointID := range []string{session.ControllerID, session.CompanionID} {
 		if endpointID == "" || omit[itemKey("ENDPOINT", endpointID)] {
 			continue
@@ -1091,12 +1127,32 @@ func (s *DynamoStore) transactSessionTransition(
 			return false, err
 		}
 		if endpoint != nil && endpoint.ActiveSessionID == session.SessionID {
+			condition := "activeSessionId = :sessionId"
+			expressionValues := pointerValues
+			if connectionID := fences[endpointID]; connectionID != "" {
+				expressionValues, err = values(map[string]any{":sessionId": session.SessionID, ":connectionId": connectionID})
+				if err != nil {
+					return false, err
+				}
+				condition += " AND connectionId = :connectionId AND attribute_not_exists(revokedAt)"
+				fenced[endpointID] = true
+			}
 			operations = append(operations, types.TransactWriteItem{Update: &types.Update{
 				TableName: aws.String(s.tableName), Key: key("ENDPOINT", endpointID),
-				UpdateExpression: aws.String("REMOVE activeSessionId"), ConditionExpression: aws.String("activeSessionId = :sessionId"),
-				ExpressionAttributeValues: pointerValues,
+				UpdateExpression: aws.String("REMOVE activeSessionId"), ConditionExpression: aws.String(condition),
+				ExpressionAttributeValues: expressionValues,
 			}})
 		}
+	}
+	for endpointID, connectionID := range fences {
+		if connectionID == "" || fenced[endpointID] || omit[itemKey("ENDPOINT", endpointID)] {
+			continue
+		}
+		fence, err := s.endpointFence(endpointID, connectionID)
+		if err != nil {
+			return false, err
+		}
+		operations = append(operations, fence)
 	}
 	if len(operations) == 0 {
 		return false, nil

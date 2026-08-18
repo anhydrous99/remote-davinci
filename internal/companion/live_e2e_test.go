@@ -108,6 +108,7 @@ func TestLiveRelayLifecycle(t *testing.T) {
 	cleaned := false
 	config, enrollment, err := Provision(ctx, relay, EnrollmentRequest{
 		V:                        1,
+		RelayURL:                 relay,
 		ControllerEndpointID:     controllerID,
 		ControllerCredentialHash: base64.RawURLEncoding.EncodeToString(credentialHash[:]),
 		ControllerNoiseKey:       base64.RawURLEncoding.EncodeToString(controllerKey.Public),

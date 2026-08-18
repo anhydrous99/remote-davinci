@@ -129,6 +129,7 @@ func runRelayConnection(parent context.Context, config Config, update func(Relay
 	go pingRelay(ctx, connection, pingFailure)
 	relayMessages := readRelay(ctx, connection, peer.pending)
 	peer.pending = nil
+	peer.pendingBytes = 0
 
 	update(RelayStatus{Connected: true, Message: "Relay connected; waiting for controller"})
 	var secure *secureChannel

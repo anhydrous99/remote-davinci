@@ -29,8 +29,11 @@ import (
 )
 
 const (
-	DefaultRelayURL = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
-	maxFrameBytes   = 32 * 1024
+	DefaultRelayURL              = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
+	maxFrameBytes                = 32 * 1024
+	maxPendingRelayResponses     = 32
+	maxPendingRelayResponseBytes = protocol.MaxRelayReorderBytes
+	relayRequestTimeout          = 15 * time.Second
 )
 
 var Version = "0.1.0"
@@ -41,6 +44,7 @@ var x25519ValidationPrivate = [32]byte{1}
 
 type EnrollmentRequest struct {
 	V                        int    `json:"v"`
+	RelayURL                 string `json:"relayUrl"`
 	ControllerEndpointID     string `json:"controllerEndpointId"`
 	ControllerCredentialHash string `json:"controllerCredentialHash"`
 	ControllerNoiseKey       string `json:"controllerNoiseKey"`
@@ -113,6 +117,9 @@ func contributoryX25519PublicKey(publicKey, privateKey []byte) bool {
 func validateEnrollment(request EnrollmentRequest) error {
 	if request.V != 1 || !uuidPattern.MatchString(request.ControllerEndpointID) ||
 		utf8.RuneCountInString(request.DeviceLabel) < 1 || utf8.RuneCountInString(request.DeviceLabel) > 80 {
+		return errors.New("invalid enrollment request")
+	}
+	if _, err := relayURL(request.RelayURL); err != nil {
 		return errors.New("invalid enrollment request")
 	}
 	if _, err := decode32(request.ControllerCredentialHash); err != nil {
@@ -193,8 +200,9 @@ type wireEnvelope struct {
 }
 
 type relayPeer struct {
-	connection *websocket.Conn
-	pending    []json.RawMessage
+	connection   *websocket.Conn
+	pending      []json.RawMessage
+	pendingBytes int
 }
 
 type relayUpgradeError struct{ status int }
@@ -233,6 +241,9 @@ func (peer *relayPeer) close() {
 }
 
 func (peer *relayPeer) request(ctx context.Context, messageType string, body any, result any) error {
+	ctx, cancel := context.WithTimeout(ctx, relayRequestTimeout)
+	defer cancel()
+
 	id, err := randomUUID()
 	if err != nil {
 		return err
@@ -251,7 +262,9 @@ func (peer *relayPeer) request(ctx context.Context, messageType string, body any
 			return errors.New("relay returned an invalid response")
 		}
 		if envelope.ReplyTo != id {
-			peer.pending = append(peer.pending, append(json.RawMessage(nil), raw...))
+			if err := peer.queuePending(raw); err != nil {
+				return err
+			}
 			continue
 		}
 		if envelope.Type == "error" {
@@ -276,6 +289,15 @@ func (peer *relayPeer) request(ctx context.Context, messageType string, body any
 		}
 		return json.Unmarshal(success.Result, result)
 	}
+}
+
+func (peer *relayPeer) queuePending(raw json.RawMessage) error {
+	if len(peer.pending) >= maxPendingRelayResponses || peer.pendingBytes+len(raw) > maxPendingRelayResponseBytes {
+		return errors.New("relay returned too many unmatched responses")
+	}
+	peer.pending = append(peer.pending, append(json.RawMessage(nil), raw...))
+	peer.pendingBytes += len(raw)
+	return nil
 }
 
 // RevokeEnrollment checkpoints the irreversible link revocation before making
@@ -343,6 +365,9 @@ func Provision(ctx context.Context, relay string, request EnrollmentRequest, per
 	}
 	if err := validateEnrollment(request); err != nil {
 		return Config{}, EnrollmentResponse{}, err
+	}
+	if request.RelayURL != relay {
+		return Config{}, EnrollmentResponse{}, errors.New("enrollment request relay does not match this companion")
 	}
 	companionEndpointID, err := randomUUID()
 	if err != nil {
@@ -490,7 +515,7 @@ if current != requested:
     current = resolve.GetCurrentPage()
 print(current or "")
 `
-		readback, err := output(commandContext, "/usr/bin/python3", "-c", script, page)
+		readback, err := output(commandContext, "/usr/bin/python3", "-I", "-c", script, page)
 		if err != nil || strings.TrimSpace(string(readback)) != page {
 			return nil, &operationError{code: "resolve.unavailable"}
 		}
@@ -596,7 +621,7 @@ func resolvePageMonitorRetryDelay(previous time.Duration, observed bool) time.Du
 }
 
 func runResolvePageMonitor(ctx context.Context, emit func(resolvePageObservation) error) error {
-	command := exec.CommandContext(ctx, "/usr/bin/python3", "-u", "-c", resolvePageMonitorScript)
+	command := exec.CommandContext(ctx, "/usr/bin/python3", "-I", "-u", "-c", resolvePageMonitorScript)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return err

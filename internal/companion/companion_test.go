@@ -119,13 +119,13 @@ func TestResolvePageOperationsRequireAuthoritativeReadback(t *testing.T) {
 			called := false
 			result, err := executeOperation(t.Context(), "resolve.page."+page, func(_ context.Context, name string, args ...string) ([]byte, error) {
 				called = true
-				if name != "/usr/bin/python3" || len(args) != 3 || args[0] != "-c" || args[2] != page {
+				if name != "/usr/bin/python3" || len(args) != 4 || args[0] != "-I" || args[1] != "-c" || args[3] != page {
 					t.Fatalf("command = %s %#v", name, args)
 				}
-				get := strings.Index(args[1], "current = resolve.GetCurrentPage()")
-				guard := strings.Index(args[1], "if current != requested:")
-				open := strings.Index(args[1], "resolve.OpenPage(requested)")
-				readback := strings.LastIndex(args[1], "current = resolve.GetCurrentPage()")
+				get := strings.Index(args[2], "current = resolve.GetCurrentPage()")
+				guard := strings.Index(args[2], "if current != requested:")
+				open := strings.Index(args[2], "resolve.OpenPage(requested)")
+				readback := strings.LastIndex(args[2], "current = resolve.GetCurrentPage()")
 				if get < 0 || guard <= get || open <= guard || readback <= open {
 					t.Fatal("Resolve command does not short-circuit and read back the selected page")
 				}
@@ -516,7 +516,7 @@ func TestEnrollmentValidationRejectsNonCanonicalCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := EnrollmentRequest{
-		V: 1, ControllerEndpointID: testControllerID,
+		V: 1, RelayURL: DefaultRelayURL, ControllerEndpointID: testControllerID,
 		ControllerCredentialHash: base64.RawURLEncoding.EncodeToString(hash[:]),
 		ControllerNoiseKey:       base64.RawURLEncoding.EncodeToString(key.Public), DeviceLabel: "Test iPad",
 	}
@@ -524,12 +524,21 @@ func TestEnrollmentValidationRejectsNonCanonicalCredentials(t *testing.T) {
 	if _, err := ParseEnrollmentRequest(data); err != nil {
 		t.Fatal(err)
 	}
+	request.RelayURL = "https://relay.example/v1"
+	data, _ = json.Marshal(request)
+	if _, err := ParseEnrollmentRequest(data); err == nil {
+		t.Fatal("accepted a non-WSS enrollment relay")
+	}
+	request.RelayURL = DefaultRelayURL
 	request.ControllerCredentialHash += "="
 	data, _ = json.Marshal(request)
 	if _, err := ParseEnrollmentRequest(data); err == nil {
 		t.Fatal("accepted padded/non-canonical credential hash")
 	}
 	request.ControllerCredentialHash = base64.RawURLEncoding.EncodeToString(hash[:])
+	if _, _, err := Provision(t.Context(), "wss://different.example/v1", request); err == nil || !strings.Contains(err.Error(), "relay does not match") {
+		t.Fatalf("mismatched enrollment relay error = %v", err)
+	}
 	for _, lowOrder := range [][]byte{make([]byte, 32), append([]byte{1}, make([]byte, 31)...)} {
 		request.ControllerNoiseKey = base64.RawURLEncoding.EncodeToString(lowOrder)
 		data, _ = json.Marshal(request)
@@ -711,6 +720,7 @@ func TestProvisionCompletesRelayPairing(t *testing.T) {
 	http.DefaultClient = server.Client()
 	defer func() { http.DefaultClient = originalClient }()
 	relay := "wss" + strings.TrimPrefix(server.URL, "https")
+	request.RelayURL = relay
 
 	config, enrollment, err := Provision(ctx, relay, request, func(config Config) error {
 		persisted <- config
@@ -785,7 +795,7 @@ func TestGUIRejectsDNSRebinding(t *testing.T) {
 	}
 }
 
-func TestGUIRequiresLaunchScopedTokenForAPIs(t *testing.T) {
+func TestGUIUsesOneTimeBrowserBootstrapAndLaunchScopedToken(t *testing.T) {
 	first, err := NewApp(t.Context(), filepath.Join(t.TempDir(), "first.json"), DefaultRelayURL)
 	if err != nil {
 		t.Fatal(err)
@@ -800,12 +810,34 @@ func TestGUIRequiresLaunchScopedTokenForAPIs(t *testing.T) {
 	if err != nil || len(decoded) != 32 || first.uiToken == second.uiToken {
 		t.Fatalf("launch tokens are not independent 32-byte values")
 	}
-	if launchURL := first.LaunchURL("http://127.0.0.1:7314"); !strings.Contains(launchURL, "?token="+first.uiToken) {
-		t.Fatalf("launch URL does not carry the UI token: %s", launchURL)
+	bootstrap := first.bootstrapToken
+	decodedBootstrap, err := base64.RawURLEncoding.DecodeString(bootstrap)
+	if err != nil || len(decodedBootstrap) != 32 || bootstrap == first.uiToken {
+		t.Fatalf("browser bootstrap is not an independent 32-byte value")
+	}
+	baseURL := "http://127.0.0.1:7314"
+	if launchURL := first.NativeLaunchURL(baseURL); !strings.Contains(launchURL, "?token="+first.uiToken) {
+		t.Fatalf("native launch URL does not carry the private-pipe UI token: %s", launchURL)
+	}
+	browserURL := first.BrowserLaunchURL(baseURL)
+	if strings.Contains(browserURL, first.uiToken) || !strings.Contains(browserURL, "?bootstrap="+bootstrap) {
+		t.Fatalf("browser launch URL exposes the UI token or omits the bootstrap: %s", browserURL)
+	}
+	request := httptest.NewRequest(http.MethodGet, browserURL, nil)
+	response := httptest.NewRecorder()
+	first.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), first.uiToken) {
+		t.Fatalf("bootstrap status = %d, body = %s", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, browserURL, nil)
+	response = httptest.NewRecorder()
+	first.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("replayed bootstrap status = %d, want %d", response.Code, http.StatusForbidden)
 	}
 
-	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7314/api/state", nil)
-	response := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7314/api/state", nil)
+	response = httptest.NewRecorder()
 	first.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("tokenless API status = %d, want %d", response.Code, http.StatusForbidden)
@@ -816,6 +848,29 @@ func TestGUIRequiresLaunchScopedTokenForAPIs(t *testing.T) {
 	first.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("authorized API status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRelayPendingResponsesAreBounded(t *testing.T) {
+	peer := &relayPeer{}
+	for range maxPendingRelayResponses {
+		if err := peer.queuePending(json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.queuePending(json.RawMessage(`{}`)); err == nil {
+		t.Fatal("accepted too many unmatched relay responses")
+	}
+
+	peer = &relayPeer{}
+	chunk := json.RawMessage(bytes.Repeat([]byte{'x'}, maxFrameBytes))
+	for peer.pendingBytes+len(chunk) <= maxPendingRelayResponseBytes {
+		if err := peer.queuePending(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.queuePending(json.RawMessage(`x`)); err == nil {
+		t.Fatal("accepted unmatched relay responses beyond the byte limit")
 	}
 }
 
