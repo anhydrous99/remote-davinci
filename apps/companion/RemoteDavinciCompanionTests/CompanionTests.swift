@@ -143,4 +143,35 @@ final class CompanionTests: XCTestCase {
         XCTAssertEqual(state.pairing?.controllerLabel, "My iPhone")
         XCTAssertEqual(state.pairing?.requestedPermissions, ["resolve.page.edit"])
     }
+
+    @MainActor
+    func testPairingReplyFromReplacedHelperIsIgnored() throws {
+        let original = CompanionConnection(
+            helperVersion: "0.1.0",
+            baseURL: URL(string: "http://127.0.0.1:43123/")!,
+            token: token
+        )
+        let replacement = CompanionConnection(
+            helperVersion: "0.1.0",
+            baseURL: URL(string: "http://127.0.0.1:43124/")!,
+            token: token
+        )
+        let reply = PairingStartReply(invite: PairingInvite(
+            protocolName: "remote-davinci.pairing-invite",
+            v: 1,
+            relayURL: "wss://relay.example/v1",
+            pairID: "11111111-1111-4111-8111-111111111111",
+            creatorSideID: "22222222-2222-4222-8222-222222222222",
+            linkID: "33333333-3333-4333-8333-333333333333",
+            joinToken: token,
+            psk: token,
+            expiresAt: 1_800_000_000
+        ))
+
+        XCTAssertNil(try CompanionModel.pairingImage(
+            for: reply,
+            responseConnection: original,
+            currentConnection: replacement
+        ))
+    }
 }

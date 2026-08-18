@@ -35,6 +35,7 @@ const (
 	MaxPairingPlaintextBytes = (MaxRelayPayloadBytes-23)/2 - 40
 	MaxPairingInviteBytes    = 2 * 1024
 	PairingTTLSeconds        = 5 * 60
+	PairingClockSkewSeconds  = 60
 	LocatorDigits            = 6
 	PairingWords             = 4
 )
@@ -280,7 +281,7 @@ func ValidatePairingInviteAt(invite PairingInvite, now int64) error {
 	if _, err := ParsePairingInvite(invite); err != nil {
 		return err
 	}
-	if now < 0 || invite.ExpiresAt <= now || invite.ExpiresAt-now > PairingTTLSeconds {
+	if now < 0 || invite.ExpiresAt <= now || invite.ExpiresAt-now > PairingTTLSeconds+PairingClockSkewSeconds {
 		return validationError(PairExpired, "Pairing invite is expired or outside its lifetime")
 	}
 	return nil

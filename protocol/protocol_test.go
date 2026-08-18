@@ -159,8 +159,13 @@ func TestQRPairingInviteAndTokenAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireCode(t, PairExpired, ValidatePairingInviteAt(parsed, 300))
+	withClockLag := parsed
+	withClockLag.ExpiresAt = 361
+	if err := ValidatePairingInviteAt(withClockLag, 1); err != nil {
+		t.Fatalf("invite within clock-skew tolerance: %v", err)
+	}
 	tooFar := parsed
-	tooFar.ExpiresAt = 302
+	tooFar.ExpiresAt = 362
 	requireCode(t, PairExpired, ValidatePairingInviteAt(tooFar, 1))
 	prologue, err := PairingNoisePrologue(parsed.RelayURL, pairID, creatorSideID, joinerSideID, linkID, parsed.ExpiresAt)
 	if err != nil || string(prologue) != "remote-davinci/pair-qr/v1\nwss://relay.example/v1\n"+pairID+"\n"+creatorSideID+"\n"+joinerSideID+"\n"+linkID+"\n300" {

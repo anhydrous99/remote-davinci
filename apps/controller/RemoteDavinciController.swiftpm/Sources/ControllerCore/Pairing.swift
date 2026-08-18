@@ -5,6 +5,7 @@ struct PairingInvite: Codable, Equatable, Sendable {
     static let protocolName = "remote-davinci.pairing-invite"
     static let maximumBytes = 2 * 1_024
     static let maximumLifetimeSeconds: Int64 = 5 * 60
+    static let clockSkewToleranceSeconds: Int64 = 60
 
     let protocolName: String
     let v: Int
@@ -57,7 +58,7 @@ struct PairingInvite: Codable, Equatable, Sendable {
         }
         guard now >= 0,
               invite.expiresAt > now,
-              invite.expiresAt - now <= maximumLifetimeSeconds
+              invite.expiresAt - now <= maximumLifetimeSeconds + clockSkewToleranceSeconds
         else {
             throw PairingError.expiredInvite
         }
@@ -305,6 +306,7 @@ enum PairingClient {
                 pending.grantedPermissions = companion.permissions
                 pending.companionNoiseFingerprint = companion.noiseFingerprint
                 pending.pairingProtocol = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
+                pending.pairingExpiresAt = invite.expiresAt
                 do {
                     try KeychainStore.save(pending)
                     pendingSaved = true
@@ -343,6 +345,7 @@ enum PairingClient {
                 )
 
                 pending.activationPending = false
+                pending.pairingExpiresAt = nil
                 do {
                     try KeychainStore.save(pending)
                 } catch {

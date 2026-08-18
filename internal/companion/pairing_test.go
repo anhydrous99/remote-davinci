@@ -485,6 +485,62 @@ func TestPairingLoopbackAPIReportsStateAndAcceptsOneDecision(t *testing.T) {
 	default:
 		t.Fatal("cancel API did not cancel the active attempt")
 	}
+
+	ctx, cancel = context.WithCancel(t.Context())
+	defer cancel()
+	attempt = &pairingAttempt{
+		ctx: ctx, cancel: cancel, invite: protocol.PairingInvite{PairID: testPairingPairID},
+		decision: make(chan bool, 1), done: make(chan struct{}),
+		state: PairingState{Phase: pairingCommitting, PairID: testPairingPairID},
+	}
+	app.pairing = attempt
+	cancelResponse = pairingAPIRequest(app, "/api/pairing/cancel", `{"pairId":"`+testPairingPairID+`"}`)
+	if cancelResponse.Code != http.StatusConflict || attempt.snapshot().Phase != pairingCommitting {
+		t.Fatalf("commit cancel status = %d, phase = %q", cancelResponse.Code, attempt.snapshot().Phase)
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("cancel API interrupted an attempt that had started committing")
+	default:
+	}
+}
+
+func TestPairingCancelAndCommitTransitionAreAtomic(t *testing.T) {
+	for range 100 {
+		ctx, cancel := context.WithCancel(t.Context())
+		attempt := &pairingAttempt{
+			ctx: ctx, cancel: cancel, invite: protocol.PairingInvite{PairID: testPairingPairID},
+			state: PairingState{Phase: pairingAwaitingApproval, PairID: testPairingPairID},
+		}
+		start := make(chan struct{})
+		var stopped, committing bool
+		var wait sync.WaitGroup
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			<-start
+			stopped = attempt.stop(testPairingPairID) == nil
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			committing = attempt.beginCommit(PairingState{Phase: pairingCommitting, PairID: testPairingPairID})
+		}()
+		close(start)
+		wait.Wait()
+
+		if stopped == committing {
+			t.Fatalf("cancelled = %v, committing = %v", stopped, committing)
+		}
+		wantPhase := pairingCommitting
+		if stopped {
+			wantPhase = pairingCancelled
+		}
+		if phase := attempt.snapshot().Phase; phase != wantPhase {
+			t.Fatalf("phase = %q, want %q", phase, wantPhase)
+		}
+		cancel()
+	}
 }
 
 func TestGrantedPermissionsAreEnforcedInLiveSessions(t *testing.T) {

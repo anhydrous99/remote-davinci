@@ -95,6 +95,8 @@ The QR document is the closed `pairing-invite-v1.schema.json` object:
 
 Both peers run `Noise_NNpsk0_25519_ChaChaPoly_SHA256` with empty handshake payloads and the QR `psk`. The prologue is UTF-8 `remote-davinci/pair-qr/v1`, followed by newline-delimited `relayUrl`, `pairId`, creator side ID, joiner side ID, `linkId`, and decimal `expiresAt`. After the handshake, the controller sends the first encrypted pairing identity transport frame and the companion replies only after local approval. Durable sessions continue to use the existing Noise IK profile.
 
+The relay's `expiresAt` remains the authoritative five-minute deadline. Invite parsers allow at most 60 seconds of client clock lag when checking that upper bound.
+
 ## Enrollment boundary
 
 The QR profile is the normal live onboarding path. The existing two-document

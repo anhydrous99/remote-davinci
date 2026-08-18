@@ -142,7 +142,7 @@ final class ControllerTests: XCTestCase {
         }
     }
 
-    func testPairingInvitePinsRelayAndEnforcesExactLifetime() throws {
+    func testPairingInvitePinsRelayAndAllowsBoundedClockLag() throws {
         let relay = "wss://relay.example/v1"
         XCTAssertNoThrow(try parsePairingInvite(
             pairingInviteObject(expiresAt: 301),
@@ -157,8 +157,13 @@ final class ControllerTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? PairingError, .expiredInvite)
         }
+        XCTAssertNoThrow(try parsePairingInvite(
+            pairingInviteObject(expiresAt: 361),
+            relay: relay,
+            now: 1
+        ))
         XCTAssertThrowsError(try parsePairingInvite(
-            pairingInviteObject(expiresAt: 302),
+            pairingInviteObject(expiresAt: 362),
             relay: relay,
             now: 1
         )) { error in
@@ -278,6 +283,70 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(model.enrollmentStatus, EnrollmentError.invalidRelay.localizedDescription)
     }
 
+    @MainActor
+    func testCheckpointReadFailureBlocksUntilSavedEnrollmentIsReadable() throws {
+        let (_, savedRequest) = try Enrollment.create(
+            deviceLabel: "Saved iPad",
+            relayURL: "wss://saved-relay.example/v1"
+        )
+        var readableCheckpoint: StoredEnrollment?
+        let model = ControllerModel(
+            relayURL: "wss://relay.example/v1",
+            keychainLoad: { readableCheckpoint }
+        )
+        XCTAssertTrue(model.canStartPairing)
+
+        XCTAssertFalse(model.adoptPairingCheckpointIfPresent(
+            fallbackStatus: "Pairing failed",
+            load: { throw KeychainError.status(-25_308) }
+        ))
+
+        XCTAssertTrue(model.hasLocalEnrollment)
+        XCTAssertFalse(model.canStartPairing)
+        XCTAssertTrue(model.enrollmentStatus.contains("could not be read"))
+
+        model.pair(inviteJSON: "{}")
+        XCTAssertFalse(model.isPairing)
+        XCTAssertEqual(
+            model.enrollmentStatus,
+            "Resolve the current enrollment or pairing attempt first."
+        )
+
+        readableCheckpoint = savedRequest
+        model.refreshCredentialStoreIfNeeded()
+        XCTAssertTrue(model.hasLocalEnrollment)
+        XCTAssertEqual(model.enrollmentStatus, "Request ready")
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                EnrollmentRequest.self,
+                from: Data(model.enrollmentRequestJSON.utf8)
+            ),
+            try Enrollment.request(for: savedRequest)
+        )
+        XCTAssertTrue(model.canStartPairing, "A readable unfinished request may be replaced")
+    }
+
+    func testPendingActivationReconnectIsBoundedByPersistedExpiry() {
+        XCTAssertEqual(
+            ControllerModel.pendingActivationReconnectDelay(
+                proposedDelay: 30,
+                expiresAt: 120,
+                now: 100
+            ),
+            20
+        )
+        XCTAssertNil(ControllerModel.pendingActivationReconnectDelay(
+            proposedDelay: 1,
+            expiresAt: 100,
+            now: 100
+        ))
+        XCTAssertNil(ControllerModel.pendingActivationReconnectDelay(
+            proposedDelay: 1,
+            expiresAt: nil,
+            now: 100
+        ))
+    }
+
     func testEnrollmentResponseValidation() throws {
         let controllerID = "11111111-1111-4111-8111-111111111111"
         let controllerPrivate = Data(0..<32)
@@ -322,6 +391,7 @@ final class ControllerTests: XCTestCase {
         activationPending.grantedPermissions = ["resolve.page.edit"]
         activationPending.companionNoiseFingerprint = "sha256:test"
         activationPending.pairingProtocol = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
+        activationPending.pairingExpiresAt = 300
         XCTAssertEqual(
             try Enrollment.active(from: activationPending).linkID,
             response.linkId,

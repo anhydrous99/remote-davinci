@@ -20,8 +20,11 @@ struct RemoteDavinciControllerApp: App {
                         if model.isConnectionDesired {
                             model.disconnect()
                         }
-                    } else if phase == .active, model.hasPendingPairingActivation {
-                        model.connect()
+                    } else if phase == .active {
+                        model.refreshCredentialStoreIfNeeded()
+                        if model.shouldAutomaticallyReconcilePendingActivation {
+                            model.connect()
+                        }
                     }
                 }
         }

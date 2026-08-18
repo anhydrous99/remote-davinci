@@ -765,14 +765,30 @@ final class CompanionModel: ObservableObject {
     func startPairing() {
         mutate { [weak self] api in
             let reply = try await api.startPairing()
-            let payload = try reply.invite.qrPayload()
-            guard let image = QRCodeRenderer.image(for: payload) else {
-                throw CompanionFailure.invalidResponse
-            }
-            self?.pairingInvite = reply.invite
-            self?.pairingQRCode = image
-            self?.feedback = "Scan this code with Remote DaVinci on iPhone or iPad."
+            guard let self,
+                  let image = try Self.pairingImage(
+                    for: reply,
+                    responseConnection: api.connection,
+                    currentConnection: self.connection
+                  )
+            else { return }
+            pairingInvite = reply.invite
+            pairingQRCode = image
+            feedback = "Scan this code with Remote DaVinci on iPhone or iPad."
         }
+    }
+
+    static func pairingImage(
+        for reply: PairingStartReply,
+        responseConnection: CompanionConnection,
+        currentConnection: CompanionConnection?
+    ) throws -> NSImage? {
+        guard currentConnection == responseConnection else { return nil }
+        let payload = try reply.invite.qrPayload()
+        guard let image = QRCodeRenderer.image(for: payload) else {
+            throw CompanionFailure.invalidResponse
+        }
+        return image
     }
 
     func approvePairing() {

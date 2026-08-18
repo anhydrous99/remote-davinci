@@ -186,12 +186,31 @@ func (attempt *pairingAttempt) decide(approve bool, pairID string) error {
 }
 
 func (attempt *pairingAttempt) stop(pairID string) error {
+	attempt.mu.Lock()
 	if pairID == "" || pairID != attempt.invite.PairID {
+		attempt.mu.Unlock()
 		return errors.New("pairing attempt did not match")
 	}
-	attempt.setState(PairingState{Phase: pairingCancelled, PairID: attempt.invite.PairID})
+	switch attempt.state.Phase {
+	case pairingShowingQR, pairingHandshaking, pairingAwaitingApproval:
+	default:
+		attempt.mu.Unlock()
+		return errors.New("pairing can no longer be cancelled")
+	}
+	attempt.state = PairingState{Phase: pairingCancelled, PairID: attempt.invite.PairID}
+	attempt.mu.Unlock()
 	attempt.cancel()
 	return nil
+}
+
+func (attempt *pairingAttempt) beginCommit(state PairingState) bool {
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	if attempt.state.Phase != pairingAwaitingApproval {
+		return false
+	}
+	attempt.state = state
+	return true
 }
 
 func (attempt *pairingAttempt) finished() bool {
@@ -314,11 +333,15 @@ func (attempt *pairingAttempt) run() (Config, bool, error) {
 		attempt.setState(PairingState{Phase: pairingRejected, PairID: attempt.invite.PairID})
 		return Config{}, false, errPairingRejected
 	}
-	attempt.setState(PairingState{
+	if !attempt.beginCommit(PairingState{
 		Phase: pairingCommitting, PairID: attempt.invite.PairID, ExpiresAt: attempt.invite.ExpiresAt,
 		ControllerLabel: controller.Body.DeviceLabel, ControllerFingerprint: controller.Body.NoiseFingerprint,
 		RequestedPermissions: append([]string(nil), controller.Body.Permissions...),
-	})
+	}) {
+		err = errPairingCancelled
+		attempt.finishWithError(err)
+		return Config{}, false, err
+	}
 
 	secretDigest := sha256.Sum256(attempt.secret)
 	config := Config{

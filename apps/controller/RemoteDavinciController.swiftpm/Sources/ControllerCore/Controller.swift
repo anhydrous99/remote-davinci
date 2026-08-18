@@ -33,6 +33,7 @@ struct StoredEnrollment: Codable, Equatable {
     var grantedPermissions: [String]? = nil
     var companionNoiseFingerprint: String? = nil
     var pairingProtocol: String? = nil
+    var pairingExpiresAt: Int64? = nil
 }
 
 struct ActiveEnrollment {
@@ -667,8 +668,15 @@ public final class ControllerModel: ObservableObject {
     private var pendingCommand: PendingCommand?
     private var lateResponses = LateResponseWindow()
     private var reconnectAttempt = 0
+    private var credentialStoreUnavailable = false
+    private let keychainLoad: () throws -> StoredEnrollment?
 
-    public init(relayURL: String? = nil) {
+    public convenience init(relayURL: String? = nil) {
+        self.init(relayURL: relayURL, keychainLoad: KeychainStore.load)
+    }
+
+    init(relayURL: String?, keychainLoad: @escaping () throws -> StoredEnrollment?) {
+        self.keychainLoad = keychainLoad
         do {
             enrollmentRelayURL = try Enrollment.deploymentRelayURL(relayURL)
         } catch {
@@ -678,48 +686,14 @@ public final class ControllerModel: ObservableObject {
         }
 
         do {
-            guard let deploymentRelayURL = enrollmentRelayURL else {
-                throw EnrollmentError.invalidRelay
-            }
-            guard let loaded = try KeychainStore.load() else { return }
-            let stored = try Enrollment.migrateLegacy(
-                loaded,
-                deploymentRelayURL: deploymentRelayURL
-            )
-            let request = try Enrollment.request(for: stored)
-            let requestJSON = try request.jsonString()
-            let replacementRelayURL = try Enrollment.replacementRelayURL(
-                stored: stored,
-                deploymentRelayURL: deploymentRelayURL
-            )
-            let status: String
-            let active = stored.response != nil && stored.activationPending != true
-            if active {
-                _ = try Enrollment.active(from: stored)
-                status = stored.linkRevocationConfirmed == true
-                    ? "Link revoked; finish re-enrollment"
-                    : "Enrolled"
-            } else if stored.activationPending == true {
-                _ = try Enrollment.active(from: stored)
-                status = "Pairing activation is unconfirmed; reconnecting securely"
-            } else {
-                status = "Request ready"
-            }
-            if stored != loaded {
-                try KeychainStore.save(stored)
-            }
-            storedEnrollment = stored
-            enrollmentRelayURL = replacementRelayURL
-            hasLocalEnrollment = true
-            enrollmentRequestJSON = requestJSON
-            isEnrolled = active
-            grantedPermissions = Set(stored.grantedPermissions ?? Self.operations)
-            enrollmentStatus = status
-            if stored.activationPending == true {
+            guard let loaded = try keychainLoad() else { return }
+            _ = try restoreStoredEnrollment(loaded)
+            if shouldAutomaticallyReconcilePendingActivation {
                 Task { [weak self] in self?.connect() }
             }
         } catch {
             hasLocalEnrollment = true
+            credentialStoreUnavailable = true
             enrollmentStatus = error.localizedDescription
         }
     }
@@ -783,15 +757,31 @@ public final class ControllerModel: ObservableObject {
     }
 
     public var canStartPairing: Bool {
-        !isEnrolled && storedEnrollment?.activationPending != true && !isResetting && !isPairing
+        !isEnrolled && storedEnrollment?.activationPending != true && !credentialStoreUnavailable &&
+            !isResetting && !isPairing
     }
 
     public var hasPendingPairingActivation: Bool {
         storedEnrollment?.activationPending == true
     }
 
+    public var shouldAutomaticallyReconcilePendingActivation: Bool {
+        hasPendingPairingActivation && Self.pendingActivationReconnectDelay(
+            proposedDelay: 0,
+            expiresAt: storedEnrollment?.pairingExpiresAt,
+            now: Date().timeIntervalSince1970
+        ) != nil
+    }
+
+    public func refreshCredentialStoreIfNeeded() {
+        guard credentialStoreUnavailable else { return }
+        _ = adoptPairingCheckpointIfPresent(fallbackStatus: "Not enrolled", load: keychainLoad)
+    }
+
     public func pair(inviteJSON: String) {
-        guard !isEnrolled, storedEnrollment?.activationPending != true, !isResetting, !isPairing else {
+        guard !isEnrolled, storedEnrollment?.activationPending != true, !credentialStoreUnavailable,
+              !isResetting, !isPairing
+        else {
             enrollmentStatus = "Resolve the current enrollment or pairing attempt first."
             return
         }
@@ -857,7 +847,7 @@ public final class ControllerModel: ObservableObject {
                     ? "Pairing cancelled"
                     : error.localizedDescription
                 let activeWasSaved = adoptPairingCheckpointIfPresent(fallbackStatus: status)
-                pairingStatus = activeWasSaved ? "Paired" : status
+                pairingStatus = activeWasSaved ? "Paired" : enrollmentStatus
                 pairingAttemptID = nil
                 pairingTask = nil
                 isPairing = false
@@ -1316,6 +1306,7 @@ public final class ControllerModel: ObservableObject {
     private func clearLocalEnrollment() {
         storedEnrollment = nil
         hasLocalEnrollment = false
+        credentialStoreUnavailable = false
         isEnrolled = false
         enrollmentRequestJSON = ""
         enrollmentResponseJSON = ""
@@ -1323,25 +1314,82 @@ public final class ControllerModel: ObservableObject {
     }
 
     @discardableResult
-    private func adoptPairingCheckpointIfPresent(fallbackStatus: String) -> Bool {
-        guard let loaded = try? KeychainStore.load(), loaded.response != nil,
-              (try? Enrollment.active(from: loaded)) != nil
-        else {
-            enrollmentStatus = fallbackStatus
+    private func restoreStoredEnrollment(_ loaded: StoredEnrollment) throws -> Bool {
+        guard let deploymentRelayURL = enrollmentRelayURL else {
+            throw EnrollmentError.invalidRelay
+        }
+        let stored = try Enrollment.migrateLegacy(
+            loaded,
+            deploymentRelayURL: deploymentRelayURL
+        )
+        let requestJSON = try Enrollment.request(for: stored).jsonString()
+        let replacementRelayURL = try Enrollment.replacementRelayURL(
+            stored: stored,
+            deploymentRelayURL: deploymentRelayURL
+        )
+        let active = stored.response != nil && stored.activationPending != true
+        let status: String
+        if active {
+            _ = try Enrollment.active(from: stored)
+            status = stored.linkRevocationConfirmed == true
+                ? "Link revoked; finish re-enrollment"
+                : "Enrolled"
+        } else if stored.activationPending == true {
+            _ = try Enrollment.active(from: stored)
+            status = Self.pendingActivationReconnectDelay(
+                proposedDelay: 0,
+                expiresAt: stored.pairingExpiresAt,
+                now: Date().timeIntervalSince1970
+            ) == nil
+                ? "Pairing activation deadline passed; recovery required"
+                : "Pairing activation is unconfirmed; reconnecting securely"
+        } else {
+            status = "Request ready"
+        }
+        if stored != loaded {
+            try KeychainStore.save(stored)
+        }
+        storedEnrollment = stored
+        enrollmentRelayURL = replacementRelayURL
+        hasLocalEnrollment = true
+        credentialStoreUnavailable = false
+        enrollmentRequestJSON = requestJSON
+        isEnrolled = active
+        grantedPermissions = Set(stored.grantedPermissions ?? Self.operations)
+        enrollmentStatus = status
+        return active
+    }
+
+    @discardableResult
+    func adoptPairingCheckpointIfPresent(
+        fallbackStatus: String,
+        load: () throws -> StoredEnrollment? = KeychainStore.load
+    ) -> Bool {
+        let loaded: StoredEnrollment
+        do {
+            guard let checkpoint = try load() else {
+                credentialStoreUnavailable = false
+                if storedEnrollment == nil {
+                    hasLocalEnrollment = false
+                }
+                enrollmentStatus = fallbackStatus
+                return false
+            }
+            loaded = checkpoint
+        } catch {
+            hasLocalEnrollment = true
+            credentialStoreUnavailable = true
+            enrollmentStatus = "Saved pairing credentials could not be read: \(error.localizedDescription)"
             return false
         }
-        storedEnrollment = loaded
-        hasLocalEnrollment = true
-        grantedPermissions = Set(loaded.grantedPermissions ?? Self.operations)
-        enrollmentRequestJSON = (try? Enrollment.request(for: loaded).jsonString()) ?? ""
-        if loaded.activationPending != true {
-            isEnrolled = true
-            enrollmentStatus = "Enrolled"
-            return true
+        do {
+            return try restoreStoredEnrollment(loaded)
+        } catch {
+            hasLocalEnrollment = true
+            credentialStoreUnavailable = true
+            enrollmentStatus = "Saved pairing credentials could not be restored: \(error.localizedDescription)"
+            return false
         }
-        isEnrolled = false
-        enrollmentStatus = "Pairing activation is unconfirmed; reconnect to verify it"
-        return false
     }
 
     private func createReplacementRequest(status: String) throws {
@@ -1385,6 +1433,7 @@ public final class ControllerModel: ObservableObject {
         guard var stored = storedEnrollment, stored.activationPending == true else { return }
         _ = try Enrollment.active(from: stored)
         stored.activationPending = false
+        stored.pairingExpiresAt = nil
         try KeychainStore.save(stored)
         storedEnrollment = stored
         isEnrolled = true
@@ -1513,7 +1562,7 @@ public final class ControllerModel: ObservableObject {
 
     private func scheduleReconnect(immediately: Bool = false) {
         guard isConnectionDesired, !isResetting, reconnectTask == nil else { return }
-        let delay: Double
+        var delay: Double
         if immediately {
             delay = 0
         } else {
@@ -1522,6 +1571,21 @@ public final class ControllerModel: ObservableObject {
                 randomUnit: Double.random(in: 0...1)
             )
             reconnectAttempt += 1
+        }
+        if hasPendingPairingActivation {
+            guard let boundedDelay = Self.pendingActivationReconnectDelay(
+                proposedDelay: delay,
+                expiresAt: storedEnrollment?.pairingExpiresAt,
+                now: Date().timeIntervalSince1970
+            ) else {
+                enrollmentStatus = "Pairing activation could not be confirmed before the pairing code expired"
+                stopMaintainingConnection(
+                    status: "Recovery required",
+                    feedback: "Credentials were kept in case activation completed. Retry Connect, or forget local credentials and pair again."
+                )
+                return
+            }
+            delay = boundedDelay
         }
         connectionStatus = "Reconnecting in \(Int(ceil(delay)))s"
         reconnectTask = Task { [weak self] in
@@ -1537,6 +1601,17 @@ public final class ControllerModel: ObservableObject {
     private func resumeReconnect() async {
         reconnectTask = nil
         await connectNow()
+    }
+
+    nonisolated static func pendingActivationReconnectDelay(
+        proposedDelay: Double,
+        expiresAt: Int64?,
+        now: TimeInterval
+    ) -> Double? {
+        guard let expiresAt else { return nil }
+        let remaining = TimeInterval(expiresAt) - now
+        guard remaining > 0 else { return nil }
+        return min(proposedDelay, remaining)
     }
 
     private func startRotation(for task: URLSessionWebSocketTask) {
