@@ -227,6 +227,7 @@ describe('RendezvousRelayStack', () => {
     const rendered = JSON.stringify(policies);
 
     assert.match(rendered, /execute-api:ManageConnections/);
+    assert.match(rendered, /dynamodb:ConditionCheckItem/);
     assert.match(rendered, /dynamodb:DeleteItem/);
     assert.match(rendered, /dynamodb:GetItem/);
     assert.match(rendered, /dynamodb:PutItem/);

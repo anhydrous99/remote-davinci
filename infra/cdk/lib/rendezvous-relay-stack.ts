@@ -148,6 +148,7 @@ export class RendezvousRelayStack extends Stack {
 
     table.grant(
       relayHandler,
+      'dynamodb:ConditionCheckItem',
       'dynamodb:DeleteItem',
       'dynamodb:GetItem',
       'dynamodb:PutItem',

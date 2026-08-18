@@ -534,12 +534,11 @@ func (s *DynamoStore) JoinPair(ctx context.Context, locator, joinTokenHash strin
 	if pair.Status != "OPEN" || pair.SideB != nil {
 		return Pair{}, serviceError(protocol.PairFull)
 	}
-	admission := locator
-	admissionCondition := "locator = :admission AND attribute_not_exists(joinTokenHash)"
+	admission, admissionName, otherAdmissionName := locator, "locator", "joinTokenHash"
 	if joinTokenHash != "" {
-		admission = joinTokenHash
-		admissionCondition = "joinTokenHash = :admission AND attribute_not_exists(locator)"
+		admission, admissionName, otherAdmissionName = joinTokenHash, "joinTokenHash", "locator"
 	}
+	admissionCondition := "#admission = :admission AND attribute_not_exists(#otherAdmission)"
 	updateValues, err := values(map[string]any{
 		":side": side, ":ready": "READY", ":open": "OPEN", ":now": now, ":admission": admission,
 	})
@@ -553,9 +552,12 @@ func (s *DynamoStore) JoinPair(ctx context.Context, locator, joinTokenHash strin
 	_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: aws.String(s.tableName), Key: key("PAIR", pair.PairID),
-			UpdateExpression:         aws.String("SET sideB = :side, #status = :ready"),
-			ConditionExpression:      aws.String("#status = :open AND expiresAt > :now AND attribute_not_exists(sideB) AND " + admissionCondition),
-			ExpressionAttributeNames: map[string]string{"#status": "status"}, ExpressionAttributeValues: updateValues,
+			UpdateExpression:    aws.String("SET sideB = :side, #status = :ready"),
+			ConditionExpression: aws.String("#status = :open AND expiresAt > :now AND attribute_not_exists(sideB) AND " + admissionCondition),
+			ExpressionAttributeNames: map[string]string{
+				"#admission": admissionName, "#otherAdmission": otherAdmissionName, "#status": "status",
+			},
+			ExpressionAttributeValues: updateValues,
 		}},
 		{Update: &types.Update{
 			TableName: aws.String(s.tableName), Key: key("CONNECTION", side.ConnectionID),

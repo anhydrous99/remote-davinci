@@ -182,21 +182,21 @@ func TestTokenPairStorageAndAdmissionProfiles(t *testing.T) {
 	}
 
 	for _, test := range []struct {
-		name      string
-		pair      Pair
-		kind      string
-		pointerID string
-		pointer   pairPointer
-		locator   string
-		hash      string
-		want      protocol.ErrorCode
-		condition string
+		name                              string
+		pair                              Pair
+		kind                              string
+		pointerID                         string
+		pointer                           pairPointer
+		locator                           string
+		hash                              string
+		want                              protocol.ErrorCode
+		admissionName, otherAdmissionName string
 	}{
-		{"token", pair, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 400}, "", joinHash, "", "joinTokenHash = :admission AND attribute_not_exists(locator)"},
-		{"legacy", Pair{PairID: pairID, Locator: "123456", Status: "OPEN", SideA: creator, ExpiresAt: 400}, "LOCATOR", "123456", pairPointer{PairID: pairID, Locator: "123456", ExpiresAt: 400}, "123456", "", "", "locator = :admission AND attribute_not_exists(joinTokenHash)"},
-		{"reuse", Pair{PairID: pairID, JoinTokenHash: joinHash, Status: "READY", SideA: creator, SideB: &joiner, ExpiresAt: 400}, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 400}, "", joinHash, protocol.PairFull, ""},
-		{"expired", pair, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 100}, "", joinHash, protocol.PairExpired, ""},
-		{"profile mismatch", pair, "LOCATOR", "123456", pairPointer{PairID: pairID, Locator: "123456", ExpiresAt: 400}, "123456", "", protocol.PairUnavailable, ""},
+		{"token", pair, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 400}, "", joinHash, "", "joinTokenHash", "locator"},
+		{"legacy", Pair{PairID: pairID, Locator: "123456", Status: "OPEN", SideA: creator, ExpiresAt: 400}, "LOCATOR", "123456", pairPointer{PairID: pairID, Locator: "123456", ExpiresAt: 400}, "123456", "", "", "locator", "joinTokenHash"},
+		{"reuse", Pair{PairID: pairID, JoinTokenHash: joinHash, Status: "READY", SideA: creator, SideB: &joiner, ExpiresAt: 400}, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 400}, "", joinHash, protocol.PairFull, "", ""},
+		{"expired", pair, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 100}, "", joinHash, protocol.PairExpired, "", ""},
+		{"profile mismatch", pair, "LOCATOR", "123456", pairPointer{PairID: pairID, Locator: "123456", ExpiresAt: 400}, "123456", "", protocol.PairUnavailable, "", ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := newDB(test.pair, test.kind, test.pointerID, test.pointer)
@@ -208,8 +208,11 @@ func TestTokenPairStorageAndAdmissionProfiles(t *testing.T) {
 			if err != nil || got.Status != "READY" || got.SideB == nil || got.SideB.SideID != joiner.SideID || len(db.transactions) != 1 {
 				t.Fatalf("pair = %#v, transactions = %d, error = %v", got, len(db.transactions), err)
 			}
-			if condition := *db.transactions[0].TransactItems[0].Update.ConditionExpression; !strings.Contains(condition, test.condition) {
-				t.Fatalf("condition = %s", condition)
+			update := db.transactions[0].TransactItems[0].Update
+			if condition := *update.ConditionExpression; !strings.Contains(condition, "#admission = :admission AND attribute_not_exists(#otherAdmission)") ||
+				update.ExpressionAttributeNames["#admission"] != test.admissionName ||
+				update.ExpressionAttributeNames["#otherAdmission"] != test.otherAdmissionName {
+				t.Fatalf("condition = %s, names = %#v", condition, update.ExpressionAttributeNames)
 			}
 		})
 	}
