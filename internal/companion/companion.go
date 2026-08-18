@@ -38,7 +38,7 @@ const (
 
 var Version = "0.1.0"
 
-const allPermissionBits uint8 = 1<<5 - 1
+const allPermissionBits uint8 = 1<<8 - 1
 
 var supportedOperations = []string{
 	"resolve.page.cut",
@@ -46,6 +46,10 @@ var supportedOperations = []string{
 	"resolve.page.fusion",
 	"resolve.page.color",
 	"host.volume.toggle-mute",
+	// Keep new operations after the original five so stored permission bits stay stable.
+	"resolve.page.media",
+	"resolve.page.fairlight",
+	"resolve.page.deliver",
 }
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -572,7 +576,8 @@ return output muted of (get volume settings)`
 
 func resolvePageForOperation(operation string) (string, bool) {
 	switch operation {
-	case "resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color":
+	case "resolve.page.media", "resolve.page.cut", "resolve.page.edit", "resolve.page.fusion",
+		"resolve.page.color", "resolve.page.fairlight", "resolve.page.deliver":
 		return strings.TrimPrefix(operation, "resolve.page."), true
 	default:
 		return "", false

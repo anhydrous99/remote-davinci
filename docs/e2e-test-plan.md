@@ -244,7 +244,7 @@ endpoints. For each device:
    separately. Require rejection or cryptographic failure with no saved link;
    also reject an expired screenshot and reuse of a successfully scanned QR.
 3. Scan a fresh QR, verify the Mac hides it, compare the displayed controller
-   label/fingerprint and five requested controls, then approve. Reject a separate
+   label/fingerprint and eight requested controls, then approve. Reject a separate
    fresh attempt once and verify neither device persists it.
 4. Verify both sides report a secure session and matching peer, and that the
    controller connects automatically only after activation.
@@ -281,14 +281,16 @@ real suspension/network behavior, with zero replay or unauthorized execution.
 3. Put Resolve on Cut before connecting. Connect and verify the initial
    `resolve.page.changed` snapshot selects Cut in the app without asking Resolve
    to change pages.
-4. Tap Cut, Edit, Fusion, and Color in the app. For each tab, verify
+4. Tap Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver in the app. For
+   each tab, verify
    `GetCurrentPage()` returns the matching lowercase page and the correlated
    success result contains that page.
-5. Select Cut, Edit, Fusion, and Color inside Resolve. For each change, verify
+5. Select Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver inside
+   Resolve. For each change, verify
    the app follows within two 500 ms polls plus relay latency (target under 1.5
    seconds on a healthy connection) and sends no echo request.
-6. Select Media, Fairlight, and Deliver inside Resolve. Verify the app retains
-   its last supported tab and sends no corrective command. Return to a
+6. If Resolve exposes the optional Photo page, select it and verify the app
+   retains its last supported tab and sends no corrective command. Return to a
    supported page and verify synchronization resumes.
 7. Exercise rapid app and Resolve page changes. Verify one command remains in
    flight, the final state converges to Resolve, and no event/request loop or

@@ -251,10 +251,13 @@ private struct PairingSection: View {
 
     private func permissionLabel(_ permission: String) -> String {
         switch permission {
+        case "resolve.page.media": return "Open Resolve Media page"
         case "resolve.page.cut": return "Open Resolve Cut page"
         case "resolve.page.edit": return "Open Resolve Edit page"
         case "resolve.page.fusion": return "Open Resolve Fusion page"
         case "resolve.page.color": return "Open Resolve Color page"
+        case "resolve.page.fairlight": return "Open Resolve Fairlight page"
+        case "resolve.page.deliver": return "Open Resolve Deliver page"
         case "host.volume.toggle-mute": return "Toggle Mac mute"
         default: return permission
         }

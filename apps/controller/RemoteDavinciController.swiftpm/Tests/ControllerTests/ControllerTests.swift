@@ -590,14 +590,18 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(
             ResolvePage.allCases.map(\.operation),
             [
+                "resolve.page.media",
                 "resolve.page.cut",
                 "resolve.page.edit",
                 "resolve.page.fusion",
                 "resolve.page.color",
+                "resolve.page.fairlight",
+                "resolve.page.deliver",
             ]
         )
-        XCTAssertEqual(ResolvePage(operation: "resolve.page.cut"), .cut)
-        XCTAssertNil(ResolvePage(operation: "resolve.page.media"))
+        XCTAssertEqual(ResolvePage(operation: "resolve.page.media"), .media)
+        XCTAssertEqual(ResolvePage(operation: "resolve.page.deliver"), .deliver)
+        XCTAssertNil(ResolvePage(operation: "resolve.page.photo"))
         XCTAssertNil(ResolvePage(operation: "host.volume.toggle-mute"))
     }
 
@@ -640,9 +644,9 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(
             try ResolvePageControl.eventPage(body: [
                 "name": "resolve.page.changed",
-                "data": ["page": "fusion"],
+                "data": ["page": "fairlight"],
             ]),
-            .fusion
+            .fairlight
         )
         XCTAssertNil(try ResolvePageControl.eventPage(body: [
             "name": "resolve.transport.changed",
@@ -650,7 +654,7 @@ final class ControllerTests: XCTestCase {
         ]))
         XCTAssertThrowsError(try ResolvePageControl.eventPage(body: [
             "name": "resolve.page.changed",
-            "data": ["page": "media"],
+            "data": ["page": "photo"],
         ])) { error in
             XCTAssertEqual(error as? ControllerProtocolError, .invalidMessage)
         }

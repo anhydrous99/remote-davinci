@@ -76,7 +76,7 @@ enrolled.
 
 1. On iOS, keep or edit **Device label**, then tap **Scan Mac QR Code**.
 2. Allow camera access and scan the one-time code shown by the Mac companion.
-3. When the Mac shows the controller label, security fingerprint, and five
+3. When the Mac shows the controller label, security fingerprint, and eight
    requested controls, verify the device and click **Approve**.
 4. Both apps save the pairing in Keychain and the controller connects
    automatically. Success is **Connected** with **Ready** on iOS and
@@ -85,7 +85,7 @@ enrolled.
 The code expires after five minutes and contains independent 256-bit relay
 admission and Noise PSK secrets. The relay stores only the admission-token hash
 and never receives the PSK. The apps authenticate the exchange with
-`Noise_NNpsk0_25519_ChaChaPoly_SHA256`; approval grants only the five fixed V1
+`Noise_NNpsk0_25519_ChaChaPoly_SHA256`; approval grants only the eight fixed V1
 controls.
 
 If the camera is unavailable, expand **Advanced Manual Enrollment** on iOS and
@@ -95,11 +95,12 @@ Clipboard. This fallback is for one trusted operator, not remote onboarding.
 
 ### 5. Control the Mac
 
-Tap **Done**, then select the Cut, Edit, Fusion, or Color tab. The tab body is
-intentionally blank: selecting the tab itself asks Resolve to open that page.
+Tap **Done**, then select the Media, Cut, Edit, Fusion, Color, Fairlight, or
+Deliver tab. The tab body is intentionally blank: selecting the tab itself asks
+Resolve to open that page.
 Changing to one of those pages inside Resolve updates the selected iOS tab.
-Media, Fairlight, and Deliver are outside this V1 controller and leave the last
-supported tab selected.
+Existing QR pairings retain their original grant; pair again once to approve
+the newly added page controls.
 
 Mac mute remains under **Settings > Host control**. Controls stay disabled until
 the secure session is ready. Backgrounding the iOS app intentionally

@@ -103,13 +103,14 @@ The QR profile is the normal live onboarding path. The existing two-document
 manual bootstrap remains an advanced fallback while physical-device validation
 is pending. The PAKE/manual-code profile below is still deferred.
 
-The QR controller requests from the current five fixed operations
-(`resolve.page.cut`, `resolve.page.edit`, `resolve.page.fusion`,
-`resolve.page.color`, and `host.volume.toggle-mute`). After local approval, the
+The QR controller requests from the current eight fixed operations
+(`resolve.page.media`, `resolve.page.cut`, `resolve.page.edit`,
+`resolve.page.fusion`, `resolve.page.color`, `resolve.page.fairlight`,
+`resolve.page.deliver`, and `host.volume.toggle-mute`). After local approval, the
 companion returns and persists only its supported intersection; both runtimes
 persist that grant and the companion enforces it before dispatch. The current
-controller requests all five. Legacy manual enrollment has no negotiated grant
-field and migrates as the same five-operation V1 grant.
+controller requests all eight. Legacy manual enrollment has no negotiated grant
+field and migrates as the same eight-operation V1 grant.
 
 ## Deferred manual-code PAKE profile
 
@@ -186,14 +187,17 @@ The independently versioned inner envelope is:
 
 ### Fixed Resolve page synchronization
 
-V1 accepts four zero-argument Resolve page operations:
+V1 accepts seven zero-argument Resolve page operations:
 
 | Operation | Resolve page | Successful `result` |
 | --- | --- | --- |
+| `resolve.page.media` | `media` | `{ "page": "media" }` |
 | `resolve.page.cut` | `cut` | `{ "page": "cut" }` |
 | `resolve.page.edit` | `edit` | `{ "page": "edit" }` |
 | `resolve.page.fusion` | `fusion` | `{ "page": "fusion" }` |
 | `resolve.page.color` | `color` | `{ "page": "color" }` |
+| `resolve.page.fairlight` | `fairlight` | `{ "page": "fairlight" }` |
+| `resolve.page.deliver` | `deliver` | `{ "page": "deliver" }` |
 
 The companion returns success only after Resolve reports the requested page.
 Once the encrypted session is ready, it emits an initial supported-page
@@ -203,11 +207,11 @@ a fresh snapshot; events are neither queued nor replayed.
 
 The controller treats a successful response or page event as authoritative.
 Receiving an event updates the selected tab without sending another request.
-Resolve pages outside Cut, Edit, Fusion, and Color produce no event, leave the
-last supported app tab selected, and are never changed by the controller merely
-to force synchronization.
+Resolve pages outside Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver
+produce no event, leave the last supported app tab selected, and are never
+changed by the controller merely to force synchronization.
 
-Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The current companion accepts requests only after the enrolled controller completes Noise IK, then authorizes against both the fixed five-operation allowlist and the stored pairing grant before dispatch. Within a session, duplicate request IDs return the cached response without executing twice.
+Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The current companion accepts requests only after the enrolled controller completes Noise IK, then authorizes against both the fixed eight-operation allowlist and the stored pairing grant before dispatch. Within a session, duplicate request IDs return the cached response without executing twice.
 
 ## Delivery and lifecycle semantics
 

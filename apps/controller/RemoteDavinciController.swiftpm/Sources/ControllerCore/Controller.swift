@@ -578,10 +578,13 @@ struct LateResponseWindow {
 }
 
 public enum ResolvePage: String, CaseIterable, Sendable {
+    case media
     case cut
     case edit
     case fusion
     case color
+    case fairlight
+    case deliver
 
     public var operation: String { "resolve.page.\(rawValue)" }
 

@@ -96,10 +96,13 @@ struct ControllerView: View {
 private extension ResolvePage {
     var systemImage: String {
         switch self {
+        case .media: "photo"
         case .cut: "scissors"
         case .edit: "slider.horizontal.3"
         case .fusion: "wand.and.stars"
         case .color: "circle.hexagongrid.fill"
+        case .fairlight: "music.note"
+        case .deliver: "rocket"
         }
     }
 }
