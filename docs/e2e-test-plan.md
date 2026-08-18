@@ -80,6 +80,8 @@ Coverage required:
 - Eight-frame/128 KiB bounded reordering, contiguous drain, and rejection of
   duplicates, stale sequences, oversized gaps, and oversized payloads.
 - One-command-in-flight, expiration, deduplication, and late-response handling.
+- Four fixed Resolve page mappings, initial/change-only page observation,
+  unsupported-page handling, and no request echo from an inbound page event.
 - Full-jitter reconnect ceiling, randomized connection rotation, and no replay.
 - Config atomic write, mode `0600`, localhost token, Host/Origin/media-type
   checks, reset checkpoints, and stale callback protection.
@@ -98,12 +100,13 @@ For both an iPhone and iPad simulator:
 1. Build normally for the simulator so the app receives an ad-hoc signature;
    do not use an unsigned build for Keychain launch validation.
 2. Uninstall any prior app, install the fresh product, and cold launch it.
-3. Verify the initial state says `Not enrolled`, with Connect and both controls
-   disabled.
+3. Verify the initial state says `Not enrolled`, with connection and host
+   controls disabled and the Cut, Edit, Fusion, and Color tab labels visible.
 4. Create an enrollment request, terminate and relaunch, and verify the pending
    request survives in Keychain without exposing its secret in logs.
-5. Inspect portrait phone plus portrait and landscape tablet layouts, Dynamic
-   Type, VoiceOver labels/hints/values, and destructive confirmation dialogs.
+5. Verify all four page bodies are blank, then inspect portrait phone plus
+   portrait and landscape tablet layouts, Dynamic Type, tab VoiceOver labels,
+   and destructive confirmation dialogs.
 6. Exercise explicit local-forget recovery with a deliberately invalid pending
    enrollment; verify it requires its own warning and confirmation.
 
@@ -146,8 +149,9 @@ The canary must prove:
 2. A controller-only session open returns `PEER_OFFLINE`.
 3. Both bearer sockets connect and receive one consistent session.
 4. Noise IK authenticates the stored static keys and exchanges encrypted hello.
-5. One encrypted semantic request executes exactly once and gets a correlated
-   encrypted response.
+5. One encrypted page request executes exactly once and gets a correlated
+   encrypted response; one companion-originated page event traverses the same
+   opaque relay path in the reverse direction.
 6. Frames arriving as sequence 2 then 1 drain in order within the bounded
    window.
 7. A closed session is not reused; an old encrypted frame sent to it returns
@@ -204,8 +208,9 @@ fresh endpoints. For each device:
 1. Confirm controller request details on the trusted Mac and import the returned
    response only on the originating device.
 2. Connect and verify both sides report a secure session and matching peer.
-3. Send each shipped semantic operation once. Require disabled controls while
-   disconnected, handshaking, or another command is in flight.
+3. Tap each page tab and use the host mute control once. Require remote actions
+   to remain unavailable while disconnected or handshaking, and page commands
+   to remain bounded to one in flight.
 4. Confirm success, stable failure code, and unknown-result UI states are
    distinguishable.
 5. Background for 30 seconds, foreground, and reconnect; confirm no prior
@@ -232,11 +237,26 @@ real suspension/network behavior, with zero replay or unauthorized execution.
 1. Confirm Resolve is not already in use, then launch the installed exact app.
 2. Through the documented scripting API, create a uniquely named disposable
    project with no media.
-3. Send `resolve.page.edit` through the encrypted controller path.
-4. Verify `GetCurrentPage()` is `edit` and the response is correlated success.
-5. Close and delete only the disposable project; verify it no longer exists.
-6. Repeat with Resolve closed and require `resolve.unavailable` without launch,
-   focus stealing, keystrokes, or fallback shell execution.
+3. Put Resolve on Cut before connecting. Connect and verify the initial
+   `resolve.page.changed` snapshot selects Cut in the app without asking Resolve
+   to change pages.
+4. Tap Cut, Edit, Fusion, and Color in the app. For each tab, verify
+   `GetCurrentPage()` returns the matching lowercase page and the correlated
+   success result contains that page.
+5. Select Cut, Edit, Fusion, and Color inside Resolve. For each change, verify
+   the app follows within two 500 ms polls plus relay latency (target under 1.5
+   seconds on a healthy connection) and sends no echo request.
+6. Select Media, Fairlight, and Deliver inside Resolve. Verify the app retains
+   its last supported tab and sends no corrective command. Return to a
+   supported page and verify synchronization resumes.
+7. Exercise rapid app and Resolve page changes. Verify one command remains in
+   flight, the final state converges to Resolve, and no event/request loop or
+   stale selection appears.
+8. Close Resolve. A page request must return `resolve.unavailable` without
+   relaunch, focus stealing, keystrokes, or fallback shell execution. Reopen
+   Resolve and verify page observation reattaches and emits a fresh supported
+   snapshot.
+9. Close and delete only the disposable project; verify it no longer exists.
 
 ### Host mute
 
@@ -255,6 +275,8 @@ Run a bounded two-hour soak on a disposable link:
 
 - One native ping/pong interval and one forced 90–110 minute rotation.
 - Periodic no-op encrypted requests below 60 frames/second.
+- Alternating supported Resolve pages plus occasional unsupported pages to
+  exercise observer deduplication and resumption without command echo.
 - Network loss during handshake, during idle read, before request send, after
   execution but before response, and during revocation.
 - Back-to-back frames to exercise real relay reordering.

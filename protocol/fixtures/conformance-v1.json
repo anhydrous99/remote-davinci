@@ -245,8 +245,13 @@
       "noiseKey": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
       "noiseFingerprint": "sha256:MAyclgO5Kks57TlYv5JAEUgE20_TcwEsDKR0MtY0Ja4",
       "deviceLabel": "Alex's iPad",
-      "permissions": ["resolve.transport"],
-      "capabilities": ["resolve.transport.play"]
+      "permissions": ["resolve.page"],
+      "capabilities": [
+        "resolve.page.cut",
+        "resolve.page.edit",
+        "resolve.page.fusion",
+        "resolve.page.color"
+      ]
     }
   },
   "wormhole": [
@@ -271,7 +276,12 @@
       "id": "20000000-0000-4000-8000-000000000001",
       "body": {
         "role": "controller",
-        "capabilities": ["resolve.transport.play"],
+        "capabilities": [
+          "resolve.page.cut",
+          "resolve.page.edit",
+          "resolve.page.fusion",
+          "resolve.page.color"
+        ],
         "appVersion": "1.0.0"
       }
     },
@@ -281,7 +291,43 @@
       "type": "request",
       "id": "20000000-0000-4000-8000-000000000002",
       "body": {
-        "operation": "resolve.transport.play",
+        "operation": "resolve.page.cut",
+        "args": {},
+        "sentAt": 1786723200000,
+        "expiresAt": 1786723205000
+      }
+    },
+    {
+      "protocol": "remote-davinci.control",
+      "v": 1,
+      "type": "request",
+      "id": "20000000-0000-4000-8000-000000000003",
+      "body": {
+        "operation": "resolve.page.edit",
+        "args": {},
+        "sentAt": 1786723200000,
+        "expiresAt": 1786723205000
+      }
+    },
+    {
+      "protocol": "remote-davinci.control",
+      "v": 1,
+      "type": "request",
+      "id": "20000000-0000-4000-8000-000000000004",
+      "body": {
+        "operation": "resolve.page.fusion",
+        "args": {},
+        "sentAt": 1786723200000,
+        "expiresAt": 1786723205000
+      }
+    },
+    {
+      "protocol": "remote-davinci.control",
+      "v": 1,
+      "type": "request",
+      "id": "20000000-0000-4000-8000-000000000005",
+      "body": {
+        "operation": "resolve.page.color",
         "args": {},
         "sentAt": 1786723200000,
         "expiresAt": 1786723205000
@@ -291,16 +337,16 @@
       "protocol": "remote-davinci.control",
       "v": 1,
       "type": "response",
-      "id": "20000000-0000-4000-8000-000000000003",
-      "replyTo": "20000000-0000-4000-8000-000000000002",
-      "body": { "ok": true, "result": { "playing": true } }
+      "id": "20000000-0000-4000-8000-000000000006",
+      "replyTo": "20000000-0000-4000-8000-000000000005",
+      "body": { "ok": true, "result": { "page": "color" } }
     },
     {
       "protocol": "remote-davinci.control",
       "v": 1,
       "type": "event",
-      "id": "20000000-0000-4000-8000-000000000004",
-      "body": { "name": "resolve.transport.changed", "data": { "playing": true } }
+      "id": "20000000-0000-4000-8000-000000000007",
+      "body": { "name": "resolve.page.changed", "data": { "page": "cut" } }
     }
   ],
   "invalidClient": [

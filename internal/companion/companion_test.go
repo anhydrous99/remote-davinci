@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -111,6 +112,108 @@ func TestControlProcessorValidatesAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestResolvePageOperationsRequireAuthoritativeReadback(t *testing.T) {
+	pages := []string{"cut", "edit", "fusion", "color"}
+	for _, page := range pages {
+		t.Run(page, func(t *testing.T) {
+			called := false
+			result, err := executeOperation(t.Context(), "resolve.page."+page, func(_ context.Context, name string, args ...string) ([]byte, error) {
+				called = true
+				if name != "/usr/bin/python3" || len(args) != 3 || args[0] != "-c" || args[2] != page {
+					t.Fatalf("command = %s %#v", name, args)
+				}
+				get := strings.Index(args[1], "current = resolve.GetCurrentPage()")
+				guard := strings.Index(args[1], "if current != requested:")
+				open := strings.Index(args[1], "resolve.OpenPage(requested)")
+				readback := strings.LastIndex(args[1], "current = resolve.GetCurrentPage()")
+				if get < 0 || guard <= get || open <= guard || readback <= open {
+					t.Fatal("Resolve command does not short-circuit and read back the selected page")
+				}
+				return []byte(page + "\n"), nil
+			})
+			if err != nil || !called || result["page"] != page {
+				t.Fatalf("result = %#v, called = %v, error = %v", result, called, err)
+			}
+		})
+	}
+
+	if _, err := executeOperation(t.Context(), "resolve.page.color", func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("edit\n"), nil
+	}); err == nil || err.Error() != "resolve.unavailable" {
+		t.Fatalf("mismatched readback error = %v", err)
+	}
+	called := false
+	if _, err := executeOperation(t.Context(), "resolve.page.media", func(context.Context, string, ...string) ([]byte, error) {
+		called = true
+		return nil, nil
+	}); err == nil || err.Error() != "operation.unsupported" || called {
+		t.Fatalf("unsupported operation called = %v, error = %v", called, err)
+	}
+}
+
+func TestResolvePageMonitorRestartsAndReaps(t *testing.T) {
+	timestamp := strings.Index(resolvePageMonitorScript, "observed_at = time.time_ns()")
+	read := strings.Index(resolvePageMonitorScript, "page = resolve.GetCurrentPage()")
+	write := strings.Index(resolvePageMonitorScript, `print(f"{observed_at}`)
+	if timestamp < 0 || read <= timestamp || write <= read || !strings.Contains(resolvePageMonitorScript, "time.sleep(0.5)") {
+		t.Fatal("Resolve monitor must timestamp before each 500ms page sample")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var runs atomic.Int64
+	var samples atomic.Int64
+	reaped := make(chan struct{})
+	started := time.Now()
+	parsed, err := parseResolvePageObservation(fmt.Sprintf("%d\tedit", started.UnixNano()))
+	if err != nil || parsed.page != "edit" || !parsed.observedAt.Equal(time.Unix(0, started.UnixNano())) {
+		t.Fatalf("parsed observation = %#v, error = %v", parsed, err)
+	}
+	emitPage := func(emit func(resolvePageObservation) error, page string) error {
+		return emit(resolvePageObservation{page: page, observedAt: started.Add(time.Duration(samples.Add(1)) * time.Millisecond)})
+	}
+	pages := monitorResolvePages(ctx, func(ctx context.Context, emit func(resolvePageObservation) error) error {
+		switch runs.Add(1) {
+		case 1:
+			for _, page := range []string{"-", "edit", "edit", "media", "edit"} {
+				if err := emitPage(emit, page); err != nil {
+					return err
+				}
+			}
+			return errors.New("monitor failed")
+		default:
+			for _, page := range []string{"edit", "color"} {
+				if err := emitPage(emit, page); err != nil {
+					return err
+				}
+			}
+			<-ctx.Done()
+			close(reaped)
+			return ctx.Err()
+		}
+	})
+
+	for index, want := range []string{"-", "edit", "edit", "media", "edit", "edit", "color"} {
+		select {
+		case got := <-pages:
+			if got.page != want {
+				t.Fatalf("page %d = %q, want %q", index, got.page, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for page %d", index)
+		}
+	}
+	cancel()
+	for range pages {
+	}
+	select {
+	case <-reaped:
+	default:
+		t.Fatal("monitor closed before its runner was reaped")
+	}
+	if runs.Load() != 2 {
+		t.Fatalf("monitor runs = %d, want 2", runs.Load())
+	}
+}
+
 func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 	suite := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
 	controllerKey, err := suite.GenerateKeypair(rand.Reader)
@@ -163,8 +266,14 @@ func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed, err := protocol.ParseControl(hostHello); err != nil || parsed.Type != "hello" {
+	parsedHello, err := protocol.ParseControl(hostHello)
+	if err != nil || parsedHello.Type != "hello" {
 		t.Fatalf("host hello = %s, error = %v", hostHello, err)
+	}
+	var helloBody protocol.ControlHelloBody
+	if parsedHello.DecodeBody(&helloBody) != nil || !reflect.DeepEqual(helloBody.Capabilities,
+		[]string{"resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color", "host.volume.toggle-mute"}) {
+		t.Fatalf("host capabilities = %v", helloBody.Capabilities)
 	}
 
 	controllerHello := controlMessage(t, "hello", "20000000-0000-4000-8000-000000000010", map[string]any{
@@ -215,6 +324,55 @@ func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 		if err != nil || parsed.Type != "response" || parsed.ReplyTo != requestIDs[index] {
 			t.Fatalf("control response = %s, error = %v", response, err)
 		}
+	}
+	commandCompleted := time.Now()
+	channel.lastPageCommandAt = commandCompleted
+	channel.lastResolvePage = "color"
+	stalePacket, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(-time.Millisecond)})
+	if err != nil || stalePacket != nil {
+		t.Fatalf("stale page event packet = %x, error = %v", stalePacket, err)
+	}
+	duplicatePacket, err := channel.pageChangedEvent(resolvePageObservation{page: "color", observedAt: commandCompleted.Add(time.Millisecond)})
+	if err != nil || duplicatePacket != nil {
+		t.Fatalf("duplicate page event packet = %x, error = %v", duplicatePacket, err)
+	}
+	eventPacket, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(2 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventPlaintext, err := controllerReceive.Decrypt(nil, nil, eventPacket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := protocol.ParseControl(eventPlaintext)
+	if err != nil || event.Type != "event" {
+		t.Fatalf("page event = %s, error = %v", eventPlaintext, err)
+	}
+	var eventBody protocol.ControlEventBody
+	if event.DecodeBody(&eventBody) != nil || eventBody.Name != "resolve.page.changed" ||
+		eventBody.Data.(map[string]any)["page"] != "edit" {
+		t.Fatalf("page event body = %#v", eventBody)
+	}
+	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(3 * time.Millisecond)}); err != nil || packet != nil {
+		t.Fatalf("repeated page event packet = %x, error = %v", packet, err)
+	}
+	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "media", observedAt: commandCompleted.Add(4 * time.Millisecond)}); err != nil || packet != nil {
+		t.Fatalf("unsupported page event packet = %x, error = %v", packet, err)
+	}
+	returnedPacket, err := channel.pageChangedEvent(resolvePageObservation{page: "edit", observedAt: commandCompleted.Add(5 * time.Millisecond)})
+	if err != nil || returnedPacket == nil {
+		t.Fatalf("returning page event packet = %x, error = %v", returnedPacket, err)
+	}
+	returnedPlaintext, err := controllerReceive.Decrypt(nil, nil, returnedPacket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	returnedEvent, err := protocol.ParseControl(returnedPlaintext)
+	if err != nil || returnedEvent.Type != "event" {
+		t.Fatalf("returning page event = %s, error = %v", returnedPlaintext, err)
+	}
+	if packet, err := channel.pageChangedEvent(resolvePageObservation{page: "edit"}); err == nil || packet != nil {
+		t.Fatalf("untimestamped page event packet = %x, error = %v", packet, err)
 	}
 	if _, _, err := channel.receive(context.Background(), 3, base64.RawURLEncoding.EncodeToString(encryptedRequests[0])); err == nil {
 		t.Fatal("accepted an old sequence")

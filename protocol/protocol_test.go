@@ -129,7 +129,7 @@ func TestSchemaValidIntegerSpellings(t *testing.T) {
 			t.Fatalf("%s client = %#v, body = %#v, error = %v", spelling, client, frame, err)
 		}
 
-		controlJSON := strings.ReplaceAll(`{"protocol":"remote-davinci.control","v":NUMBER,"type":"request","id":"20000000-0000-4000-8000-000000000002","body":{"operation":"resolve.transport.play","args":{},"sentAt":NUMBER,"expiresAt":NUMBER}}`, "NUMBER", spelling)
+		controlJSON := strings.ReplaceAll(`{"protocol":"remote-davinci.control","v":NUMBER,"type":"request","id":"20000000-0000-4000-8000-000000000002","body":{"operation":"resolve.page.edit","args":{},"sentAt":NUMBER,"expiresAt":NUMBER}}`, "NUMBER", spelling)
 		control, err := ParseControl(controlJSON)
 		if err != nil || control.V != 1 {
 			t.Fatalf("%s control = %#v, error = %v", spelling, control, err)
@@ -211,15 +211,46 @@ func TestPairingWormholeAndControlFixtures(t *testing.T) {
 		t.Fatalf("phases = %v", phases)
 	}
 	controlTypes := make([]string, 0, len(values.Control))
+	var hello ControlHelloBody
+	var requests []string
+	var response ControlSuccessBody
+	var event ControlEventBody
 	for _, frame := range values.Control {
 		envelope, err := ParseControl(frame)
 		if err != nil {
 			t.Fatal(err)
 		}
-		controlTypes = append(controlTypes, envelope.Type)
+		switch envelope.Type {
+		case "hello":
+			err = envelope.DecodeBody(&hello)
+		case "request":
+			var request ControlRequestBody
+			err = envelope.DecodeBody(&request)
+			requests = append(requests, request.Operation)
+		case "response":
+			err = envelope.DecodeBody(&response)
+		case "event":
+			err = envelope.DecodeBody(&event)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(controlTypes) == 0 || controlTypes[len(controlTypes)-1] != envelope.Type {
+			controlTypes = append(controlTypes, envelope.Type)
+		}
 	}
 	if !reflect.DeepEqual(controlTypes, ControlMessageTypes) {
 		t.Fatalf("control types = %v", controlTypes)
+	}
+	pageOperations := []string{"resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color"}
+	if !reflect.DeepEqual(hello.Capabilities, pageOperations) || !reflect.DeepEqual(requests, pageOperations) {
+		t.Fatalf("page capabilities = %v, requests = %v", hello.Capabilities, requests)
+	}
+	if result, ok := response.Result.(map[string]any); !ok || result["page"] != "color" {
+		t.Fatalf("page response = %#v", response.Result)
+	}
+	if data, ok := event.Data.(map[string]any); !ok || event.Name != "resolve.page.changed" || data["page"] != "cut" {
+		t.Fatalf("page event = %s %#v", event.Name, event.Data)
 	}
 	expired := rawObject(t, values.Control[1])
 	body := expired["body"].(map[string]any)
@@ -312,7 +343,7 @@ func TestMalformedFramesAndPayloadLimits(t *testing.T) {
 	milliseconds["body"].(map[string]any)["sentAt"] = 1786723200000
 	_, err = ParseClient(milliseconds)
 	requireCode(t, InvalidMessage, err)
-	huge := rawObject(t, values.Control[3])
+	huge := rawObject(t, values.Control[len(values.Control)-1])
 	huge["body"].(map[string]any)["data"] = strings.Repeat("x", MaxControlPlaintextBytes)
 	_, err = ParseControl(huge)
 	requireCode(t, PayloadTooLarge, err)

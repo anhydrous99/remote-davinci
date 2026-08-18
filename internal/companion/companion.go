@@ -1,6 +1,7 @@
 package companion
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdh"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -462,24 +464,39 @@ type operationError struct {
 
 func (failure *operationError) Error() string { return failure.code }
 
+type commandOutput func(context.Context, string, ...string) ([]byte, error)
+
 func ExecuteOperation(ctx context.Context, operation string) (map[string]any, error) {
+	return executeOperation(ctx, operation, func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return exec.CommandContext(ctx, name, args...).Output()
+	})
+}
+
+func executeOperation(ctx context.Context, operation string, output commandOutput) (map[string]any, error) {
 	commandContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	switch operation {
-	case "resolve.page.edit":
+	if page, ok := resolvePageForOperation(operation); ok {
 		const script = `import sys
 sys.path.insert(0, "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")
 import DaVinciResolveScript as dvr
+requested = sys.argv[1]
 resolve = dvr.scriptapp("Resolve")
 if resolve is None:
     raise SystemExit(20)
-if not resolve.OpenPage("edit"):
-    raise SystemExit(21)
+current = resolve.GetCurrentPage()
+if current != requested:
+    if not resolve.OpenPage(requested):
+        raise SystemExit(21)
+    current = resolve.GetCurrentPage()
+print(current or "")
 `
-		if err := exec.CommandContext(commandContext, "/usr/bin/python3", "-c", script).Run(); err != nil {
+		readback, err := output(commandContext, "/usr/bin/python3", "-c", script, page)
+		if err != nil || strings.TrimSpace(string(readback)) != page {
 			return nil, &operationError{code: "resolve.unavailable"}
 		}
-		return map[string]any{"page": "edit"}, nil
+		return map[string]any{"page": page}, nil
+	}
+	switch operation {
 	case "host.volume.toggle-mute":
 		const script = `set currentSettings to get volume settings
 try
@@ -490,11 +507,126 @@ end try
 if currentMuted is missing value then return "unsupported"
 set volume output muted not currentMuted
 return output muted of (get volume settings)`
-		output, err := exec.CommandContext(commandContext, "/usr/bin/osascript", "-e", script).Output()
-		return parseMuteResult(output, err)
+		result, err := output(commandContext, "/usr/bin/osascript", "-e", script)
+		return parseMuteResult(result, err)
 	default:
 		return nil, &operationError{code: "operation.unsupported"}
 	}
+}
+
+func resolvePageForOperation(operation string) (string, bool) {
+	switch operation {
+	case "resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color":
+		return strings.TrimPrefix(operation, "resolve.page."), true
+	default:
+		return "", false
+	}
+}
+
+func supportedResolvePage(page string) bool {
+	_, ok := resolvePageForOperation("resolve.page." + page)
+	return ok
+}
+
+type resolvePageObservation struct {
+	page       string
+	observedAt time.Time
+}
+
+type resolvePageMonitorRun func(context.Context, func(resolvePageObservation) error) error
+
+// ponytail: Resolve exposes no page-change callback; replace this 500 ms poll only if the SDK adds one.
+const resolvePageMonitorScript = `import sys
+import time
+sys.path.insert(0, "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")
+import DaVinciResolveScript as dvr
+resolve = None
+while True:
+    observed_at = time.time_ns()
+    try:
+        if resolve is None:
+            resolve = dvr.scriptapp("Resolve")
+        page = resolve.GetCurrentPage() if resolve is not None else None
+        if page is None:
+            resolve = None
+    except Exception:
+        resolve = None
+        page = None
+    print(f"{observed_at}\t{page or '-'}", flush=True)
+    time.sleep(0.5)
+`
+
+func monitorResolvePages(ctx context.Context, run resolvePageMonitorRun) <-chan resolvePageObservation {
+	pages := make(chan resolvePageObservation)
+	go func() {
+		defer close(pages)
+		emit := func(observation resolvePageObservation) error {
+			select {
+			case pages <- observation:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		for ctx.Err() == nil {
+			_ = run(ctx, emit)
+			if ctx.Err() != nil {
+				return
+			}
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}()
+	return pages
+}
+
+func runResolvePageMonitor(ctx context.Context, emit func(resolvePageObservation) error) error {
+	command := exec.CommandContext(ctx, "/usr/bin/python3", "-u", "-c", resolvePageMonitorScript)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := command.Start(); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		observation, err := parseResolvePageObservation(scanner.Text())
+		if err == nil {
+			err = emit(observation)
+		}
+		if err != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+			return err
+		}
+	}
+	scanErr := scanner.Err()
+	waitErr := command.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if scanErr != nil {
+		return scanErr
+	}
+	return waitErr
+}
+
+func parseResolvePageObservation(line string) (resolvePageObservation, error) {
+	parts := strings.SplitN(line, "\t", 2)
+	if len(parts) != 2 {
+		return resolvePageObservation{}, errors.New("invalid Resolve page observation")
+	}
+	nanoseconds, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || nanoseconds <= 0 || strings.TrimSpace(parts[1]) == "" {
+		return resolvePageObservation{}, errors.New("invalid Resolve page observation")
+	}
+	return resolvePageObservation{page: strings.TrimSpace(parts[1]), observedAt: time.Unix(0, nanoseconds)}, nil
 }
 
 func parseMuteResult(output []byte, commandErr error) (map[string]any, error) {
@@ -601,7 +733,7 @@ func controlHello() ([]byte, error) {
 		Protocol: protocol.ControlProtocolName, V: protocol.ControlProtocolVersion, Type: "hello", ID: id,
 		Body: protocol.ControlHelloBody{
 			Role:         protocol.Companion,
-			Capabilities: []string{"resolve.page.edit", "host.volume.toggle-mute"}, AppVersion: Version,
+			Capabilities: []string{"resolve.page.cut", "resolve.page.edit", "resolve.page.fusion", "resolve.page.color", "host.volume.toggle-mute"}, AppVersion: Version,
 		},
 	})
 }

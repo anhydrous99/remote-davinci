@@ -99,12 +99,16 @@ development team and an iPhone or iPad running iOS 17 or later, and Run. Then:
 1. Create an enrollment request on iOS.
 2. Paste it into the companion app and create the link.
 3. Paste the returned response into iOS and import it.
-4. Keep the companion running, tap Connect, then use either control.
+4. Keep the companion running, tap Connect, then use a page tab or the host
+   mute control.
 
-The two shipped operations are deliberately fixed: `resolve.page.edit` opens
-Resolve's Edit page through the documented scripting API, and
-`host.volume.toggle-mute` toggles macOS output mute. Remote raw keys, shell
-commands, and user-authored scripts are not accepted.
+The app has blank Cut, Edit, Fusion, and Color tabs. Tapping one requests the
+matching fixed operation (`resolve.page.cut`, `resolve.page.edit`,
+`resolve.page.fusion`, or `resolve.page.color`); switching to one of those pages
+inside Resolve updates the selected app tab. Unsupported Resolve pages leave
+the last supported tab selected and are not changed automatically.
+`host.volume.toggle-mute` remains the separate fixed macOS control. Remote raw
+keys, shell commands, and user-authored scripts are not accepted.
 
 Enrollment is a trusted, manual, one-operator ceremony for this slice. The iOS
 app uses the device-only Keychain and the native Mac helper uses the login
