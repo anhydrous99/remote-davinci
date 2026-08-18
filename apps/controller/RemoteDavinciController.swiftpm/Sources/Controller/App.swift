@@ -36,7 +36,9 @@ struct ControllerView: View {
                     Color.clear
                         .accessibilityElement()
                         .accessibilityLabel("\(page.rawValue.capitalized) page")
-                        .tabItem { Text(page.rawValue.capitalized) }
+                        .tabItem {
+                            Label(page.rawValue.capitalized, systemImage: page.systemImage)
+                        }
                         .tag(page)
                 }
             }
@@ -64,6 +66,17 @@ struct ControllerView: View {
             if !isEnrolled {
                 showingSettings = true
             }
+        }
+    }
+}
+
+private extension ResolvePage {
+    var systemImage: String {
+        switch self {
+        case .cut: "scissors"
+        case .edit: "slider.horizontal.3"
+        case .fusion: "wand.and.stars"
+        case .color: "circle.hexagongrid.fill"
         }
     }
 }
