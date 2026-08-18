@@ -85,31 +85,8 @@ struct CompanionView: View {
                 .disabled(model.isMutating || model.state == nil)
             }
 
-            Section("Enroll iPhone or iPad") {
-                Text("Paste the enrollment request from the controller, then import the response on that device.")
-                    .foregroundStyle(.secondary)
-
-                TextEditor(text: $model.enrollmentRequest)
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(minHeight: 100)
-                    .accessibilityLabel("Controller enrollment request")
-
-                Button("Create Link") { model.enroll() }
-                    .disabled(
-                        model.isMutating || model.state?.configured == true ||
-                            model.enrollmentRequest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
-                    .accessibilityHint("Creates a trusted link for the pasted controller request")
-
-                if !model.enrollmentResponse.isEmpty {
-                    Text(model.enrollmentResponse)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .accessibilityLabel("Controller enrollment response")
-
-                    Button("Copy Response") { model.copyEnrollmentResponse() }
-                        .accessibilityHint("Copies the enrollment response to the clipboard")
-                }
+            if model.state?.configured != true {
+                PairingSection(model: model)
             }
 
             if model.state?.configured == true {
@@ -171,6 +148,110 @@ struct CompanionView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("The remote relay identity may remain active and must then be revoked separately.")
+        }
+    }
+}
+
+private struct PairingSection: View {
+    @ObservedObject var model: CompanionModel
+
+    var body: some View {
+        Section("Pair iPhone or iPad") {
+            if let pairing = model.state?.pairing, pairing.isAwaitingApproval {
+                Text("Allow this controller?")
+                    .font(.headline)
+                LabeledContent("Controller", value: pairing.controllerLabel ?? "Unknown controller")
+                if let fingerprint = pairing.controllerFingerprint {
+                    LabeledContent("Security fingerprint", value: fingerprint)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                Text("Requested controls")
+                    .font(.subheadline.weight(.semibold))
+                ForEach(pairing.requestedPermissions ?? [], id: \.self) { permission in
+                    Label(permissionLabel(permission), systemImage: "checkmark.circle")
+                }
+                HStack {
+                    Button("Approve") { model.approvePairing() }
+                        .buttonStyle(.borderedProminent)
+                    Button("Reject", role: .destructive) { model.rejectPairing() }
+                }
+                .disabled(model.isMutating)
+            } else if let image = model.pairingQRCode, let invite = model.pairingInvite {
+                Text("On iPhone or iPad, open Remote DaVinci and tap Scan Mac QR Code.")
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 320, height: 320)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityLabel("Remote DaVinci one-time pairing QR code")
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let remaining = max(0, invite.expiresAt - Int64(context.date.timeIntervalSince1970))
+                    Text(String(format: "Code expires in %d:%02d", remaining / 60, remaining % 60))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+                Text("Anyone who scans this code can request pairing for five minutes. Approve only your device.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Cancel Pairing", role: .cancel) { model.cancelPairing() }
+                    .disabled(model.isMutating)
+            } else if let pairing = model.state?.pairing, !pairing.isTerminal {
+                ProgressView(pairingStatus(pairing.phase))
+                Button("Cancel Pairing", role: .cancel) { model.cancelPairing() }
+                    .disabled(model.isMutating || pairing.pairID == nil)
+            } else {
+                Text("Create a one-time code, then scan it with the camera in the Remote DaVinci app.")
+                    .foregroundStyle(.secondary)
+                Button("Generate Pairing QR Code") { model.startPairing() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isMutating || model.state == nil)
+            }
+
+            DisclosureGroup("Manual enrollment (advanced)") {
+                Text("Use this only when the camera is unavailable. Transfer both JSON documents directly between your unlocked devices.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $model.enrollmentRequest)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(minHeight: 80)
+                    .accessibilityLabel("Controller enrollment request")
+                Button("Create Manual Link") { model.enroll() }
+                    .disabled(
+                        model.isMutating ||
+                            model.state?.pairing?.isTerminal == false ||
+                            model.enrollmentRequest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                if !model.enrollmentResponse.isEmpty {
+                    Text(model.enrollmentResponse)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .accessibilityLabel("Controller enrollment response")
+                    Button("Copy Response") { model.copyEnrollmentResponse() }
+                }
+            }
+        }
+    }
+
+    private func pairingStatus(_ phase: String) -> String {
+        switch phase {
+        case "creating": return "Creating one-time code…"
+        case "handshaking", "authenticating": return "Authenticating controller…"
+        case "committing": return "Saving secure pairing…"
+        default: return "Waiting for iPhone or iPad…"
+        }
+    }
+
+    private func permissionLabel(_ permission: String) -> String {
+        switch permission {
+        case "resolve.page.cut": return "Open Resolve Cut page"
+        case "resolve.page.edit": return "Open Resolve Edit page"
+        case "resolve.page.fusion": return "Open Resolve Fusion page"
+        case "resolve.page.color": return "Open Resolve Color page"
+        case "host.volume.toggle-mute": return "Toggle Mac mute"
+        default: return permission
         }
     }
 }

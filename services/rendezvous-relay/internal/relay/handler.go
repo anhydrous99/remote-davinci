@@ -390,18 +390,29 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 	case "system.ping":
 		return map[string]any{"receivedAt": timestamp}, nil
 	case "pair.create":
+		var body protocol.PairCreateBody
+		if err := message.DecodeBody(&body); err != nil {
+			return nil, err
+		}
 		if err := h.store.RateLimit(ctx, connection.SourceKey, message.Type, 5, timestamp); err != nil {
 			return nil, err
 		}
 		for attempt := 0; attempt < 5; attempt++ {
 			pair := Pair{
-				PairID: h.id(), Locator: h.locator(), Status: "OPEN",
+				PairID: h.id(), JoinTokenHash: body.JoinTokenHash, Status: "OPEN",
 				SideA:     PairSide{ConnectionID: connection.ConnectionID, SideID: h.id()},
 				ExpiresAt: timestamp + protocol.PairingTTLSeconds,
 			}
+			if pair.JoinTokenHash == "" {
+				pair.Locator = h.locator()
+			}
 			err := h.store.CreatePair(ctx, pair)
 			if err == nil {
-				return map[string]any{"pairId": pair.PairID, "sideId": pair.SideA.SideID, "locator": pair.Locator, "expiresAt": pair.ExpiresAt}, nil
+				result := map[string]any{"pairId": pair.PairID, "sideId": pair.SideA.SideID, "expiresAt": pair.ExpiresAt}
+				if pair.Locator != "" {
+					result["locator"] = pair.Locator
+				}
+				return result, nil
 			}
 			var service *ServiceError
 			if !errors.As(err, &service) || service.Code != protocol.Conflict || attempt == 4 {
@@ -417,8 +428,16 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err := h.store.RateLimit(ctx, connection.SourceKey, message.Type, 20, timestamp); err != nil {
 			return nil, err
 		}
+		joinTokenHash := ""
+		if body.JoinToken != "" {
+			var err error
+			joinTokenHash, err = protocol.JoinTokenHash(body.JoinToken)
+			if err != nil {
+				return nil, err
+			}
+		}
 		side := PairSide{ConnectionID: connection.ConnectionID, SideID: h.id()}
-		pair, err := h.store.JoinPair(ctx, body.Locator, side, timestamp)
+		pair, err := h.store.JoinPair(ctx, body.Locator, joinTokenHash, side, timestamp)
 		if err != nil {
 			return nil, err
 		}

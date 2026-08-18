@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remote-davinci.dev/schemas/pairing-invite-v1.schema.json",
+  "title": "Remote DaVinci QR pairing invitation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "v",
+    "relayUrl",
+    "pairId",
+    "creatorSideId",
+    "linkId",
+    "joinToken",
+    "psk",
+    "expiresAt"
+  ],
+  "properties": {
+    "protocol": { "const": "remote-davinci.pairing-invite" },
+    "v": { "const": 1 },
+    "relayUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "pairId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "creatorSideId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "linkId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "joinToken": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
+    "psk": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
+    "expiresAt": { "type": "integer", "minimum": 0, "maximum": 253402300799 }
+  }
+}

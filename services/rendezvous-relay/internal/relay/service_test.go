@@ -27,7 +27,7 @@ type fakeStore struct {
 	rateLimit      func(context.Context, string, string, int64, int64) error
 	createPair     func(context.Context, Pair) error
 	pairByID       func(context.Context, string, int64) (Pair, error)
-	joinPair       func(context.Context, string, PairSide, int64) (Pair, error)
+	joinPair       func(context.Context, string, string, PairSide, int64) (Pair, error)
 	commitPair     func(context.Context, string, PairCommit, int64) (CommitPairResult, error)
 	cancelPair     func(context.Context, string, string, int64) (*Pair, error)
 	link           func(context.Context, string) (*Link, error)
@@ -88,11 +88,11 @@ func (f *fakeStore) PairByID(ctx context.Context, id string, now int64) (Pair, e
 	return f.pairByID(ctx, id, now)
 }
 
-func (f *fakeStore) JoinPair(ctx context.Context, locator string, side PairSide, now int64) (Pair, error) {
+func (f *fakeStore) JoinPair(ctx context.Context, locator, joinTokenHash string, side PairSide, now int64) (Pair, error) {
 	if f.joinPair == nil {
 		return Pair{}, unexpected
 	}
-	return f.joinPair(ctx, locator, side, now)
+	return f.joinPair(ctx, locator, joinTokenHash, side, now)
 }
 
 func (f *fakeStore) CommitPair(ctx context.Context, id string, commit PairCommit, now int64) (CommitPairResult, error) {
@@ -359,6 +359,69 @@ func TestPairingConnectRateLimitsNormalizedSourceBeforePersisting(t *testing.T) 
 	response, err = handler.Handle(context.Background(), event)
 	if err != nil || response.StatusCode != 503 || connectCalls != 0 {
 		t.Fatalf("limited response = %#v, calls = %d, error = %v", response, connectCalls, err)
+	}
+}
+
+func TestQRPairCreateAndJoinUseOnlyTokenHashInStorage(t *testing.T) {
+	joinToken := base64.RawURLEncoding.EncodeToString(bytesOf(32, 9))
+	joinTokenHash, err := protocol.JoinTokenHash(joinToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := Connection{ConnectionID: "creator", AuthMode: "pairing", SourceKey: "source", ExpiresAt: 1_000}
+	var created Pair
+	createHandler := testHandler(&fakeStore{
+		rateLimit: func(_ context.Context, source, action string, limit, _ int64) error {
+			if source != "source" || action != "pair.create" || limit != 5 {
+				t.Fatalf("rate limit = %s/%s/%d", source, action, limit)
+			}
+			return nil
+		},
+		createPair: func(_ context.Context, pair Pair) error {
+			created = pair
+			return nil
+		},
+	}, func(context.Context, string, Message, WebSocketEvent) error { return nil })
+	message, err := protocol.ParseClient(envelope("pair.create", map[string]any{"joinTokenHash": joinTokenHash}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := createHandler.dispatch(context.Background(), message, connection, socketEvent("creator", "$default", ""))
+	if err != nil || created.JoinTokenHash != joinTokenHash || created.Locator != "" || result["locator"] != nil {
+		t.Fatalf("pair = %#v, result = %#v, error = %v", created, result, err)
+	}
+
+	pair := Pair{
+		PairID: created.PairID, JoinTokenHash: joinTokenHash, Status: "OPEN", SideA: created.SideA, ExpiresAt: created.ExpiresAt,
+	}
+	posts := 0
+	joinHandler := testHandler(&fakeStore{
+		rateLimit: func(_ context.Context, _, action string, limit, _ int64) error {
+			if action != "pair.join" || limit != 20 {
+				t.Fatalf("rate limit = %s/%d", action, limit)
+			}
+			return nil
+		},
+		joinPair: func(_ context.Context, locator, hash string, side PairSide, _ int64) (Pair, error) {
+			if locator != "" || hash != joinTokenHash || hash == joinToken || side.ConnectionID != "joiner" {
+				t.Fatalf("join admission = %q/%q, side = %#v", locator, hash, side)
+			}
+			pair.SideB, pair.Status = &side, "READY"
+			return pair, nil
+		},
+	}, func(_ context.Context, _ string, _ Message, _ WebSocketEvent) error {
+		posts++
+		return nil
+	})
+	message, err = protocol.ParseClient(envelope("pair.join", map[string]any{"joinToken": joinToken}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = joinHandler.dispatch(context.Background(), message, Connection{
+		ConnectionID: "joiner", AuthMode: "pairing", SourceKey: "join-source", ExpiresAt: 1_000,
+	}, socketEvent("joiner", "$default", ""))
+	if err != nil || posts != 2 || result["pairId"] != pair.PairID || result["expiresAt"] != pair.ExpiresAt {
+		t.Fatalf("posts = %d, result = %#v, error = %v", posts, result, err)
 	}
 }
 

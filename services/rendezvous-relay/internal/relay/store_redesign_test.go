@@ -143,6 +143,84 @@ func TestPairStorageUsesPairIDAndLocatorKeys(t *testing.T) {
 	}
 }
 
+func TestTokenPairStorageAndAdmissionProfiles(t *testing.T) {
+	ctx := context.Background()
+	pairID := storageUUID("000000000020")
+	creator := PairSide{ConnectionID: "creator", SideID: storageUUID("000000000021")}
+	joiner := PairSide{ConnectionID: "joiner", SideID: storageUUID("000000000022")}
+	joinHash := strings.Repeat("A", 43)
+	pair := Pair{PairID: pairID, JoinTokenHash: joinHash, Status: "OPEN", SideA: creator, ExpiresAt: 400}
+
+	db := &storageDynamo{}
+	store := NewDynamoStore("table", db)
+	if err := store.CreatePair(ctx, pair); err != nil {
+		t.Fatal(err)
+	}
+	transaction := db.transactions[0].TransactItems
+	if got := storagePK(transaction[1].Put.Item); got != "JOIN#"+joinHash {
+		t.Fatalf("join key = %s", got)
+	}
+	if _, exists := transaction[0].Put.Item["locator"]; exists {
+		t.Fatal("token pair persisted a locator")
+	}
+	if _, exists := transaction[1].Put.Item["locator"]; exists {
+		t.Fatal("token pointer persisted a locator")
+	}
+
+	newDB := func(pair Pair, pointerKind, pointerID string, pointer pairPointer) *storageDynamo {
+		return &storageDynamo{items: map[string]map[string]types.AttributeValue{
+			pointerKind + "#" + pointerID: storageItem(t, strings.ToLower(pointerKind), pointerID, pointer),
+			"PAIR#" + pair.PairID:         storageItem(t, "pair", pair.PairID, pair),
+		}}
+	}
+	assertCode := func(t *testing.T, err error, want protocol.ErrorCode) {
+		t.Helper()
+		var service *ServiceError
+		if !errors.As(err, &service) || service.Code != want {
+			t.Fatalf("error = %#v, want %s", err, want)
+		}
+	}
+
+	for _, test := range []struct {
+		name      string
+		pair      Pair
+		kind      string
+		pointerID string
+		pointer   pairPointer
+		locator   string
+		hash      string
+		want      protocol.ErrorCode
+		condition string
+	}{
+		{"token", pair, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 400}, "", joinHash, "", "joinTokenHash = :admission AND attribute_not_exists(locator)"},
+		{"legacy", Pair{PairID: pairID, Locator: "123456", Status: "OPEN", SideA: creator, ExpiresAt: 400}, "LOCATOR", "123456", pairPointer{PairID: pairID, Locator: "123456", ExpiresAt: 400}, "123456", "", "", "locator = :admission AND attribute_not_exists(joinTokenHash)"},
+		{"reuse", Pair{PairID: pairID, JoinTokenHash: joinHash, Status: "READY", SideA: creator, SideB: &joiner, ExpiresAt: 400}, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 400}, "", joinHash, protocol.PairFull, ""},
+		{"expired", pair, "JOIN", joinHash, pairPointer{PairID: pairID, JoinTokenHash: joinHash, ExpiresAt: 100}, "", joinHash, protocol.PairExpired, ""},
+		{"profile mismatch", pair, "LOCATOR", "123456", pairPointer{PairID: pairID, Locator: "123456", ExpiresAt: 400}, "123456", "", protocol.PairUnavailable, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := newDB(test.pair, test.kind, test.pointerID, test.pointer)
+			got, err := NewDynamoStore("table", db).JoinPair(ctx, test.locator, test.hash, joiner, 100)
+			if test.want != "" {
+				assertCode(t, err, test.want)
+				return
+			}
+			if err != nil || got.Status != "READY" || got.SideB == nil || got.SideB.SideID != joiner.SideID || len(db.transactions) != 1 {
+				t.Fatalf("pair = %#v, transactions = %d, error = %v", got, len(db.transactions), err)
+			}
+			if condition := *db.transactions[0].TransactItems[0].Update.ConditionExpression; !strings.Contains(condition, test.condition) {
+				t.Fatalf("condition = %s", condition)
+			}
+		})
+	}
+
+	missing := NewDynamoStore("table", &storageDynamo{items: map[string]map[string]types.AttributeValue{}})
+	_, err := missing.JoinPair(ctx, "", strings.Repeat("B", 43), joiner, 100)
+	assertCode(t, err, protocol.PairExpired)
+	_, err = store.JoinPair(ctx, "123456", joinHash, joiner, 100)
+	assertCode(t, err, protocol.InvalidMessage)
+}
+
 func TestPairAndSessionHotPathsEachUseOneStrongRead(t *testing.T) {
 	pairID, sessionID := storageUUID("000000000003"), storageUUID("000000000004")
 	db := &storageDynamo{items: map[string]map[string]types.AttributeValue{

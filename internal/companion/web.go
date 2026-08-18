@@ -15,6 +15,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/anhydrous99/remote-davinci/protocol"
 )
 
 //go:embed ui.html
@@ -30,6 +32,7 @@ type App struct {
 	bootstrapMu    sync.Mutex
 	mu             sync.RWMutex
 	config         *Config
+	pairing        *pairingAttempt
 	status         RelayStatus
 	cancel         context.CancelFunc
 	uiToken        string
@@ -38,14 +41,15 @@ type App struct {
 }
 
 type State struct {
-	Configured      bool   `json:"configured"`
-	RelayURL        string `json:"relayUrl"`
-	EndpointID      string `json:"endpointId,omitempty"`
-	LinkID          string `json:"linkId,omitempty"`
-	ControllerLabel string `json:"controllerLabel,omitempty"`
-	Connected       bool   `json:"connected"`
-	Secure          bool   `json:"secure"`
-	Status          string `json:"status"`
+	Configured      bool          `json:"configured"`
+	RelayURL        string        `json:"relayUrl"`
+	EndpointID      string        `json:"endpointId,omitempty"`
+	LinkID          string        `json:"linkId,omitempty"`
+	ControllerLabel string        `json:"controllerLabel,omitempty"`
+	Connected       bool          `json:"connected"`
+	Secure          bool          `json:"secure"`
+	Status          string        `json:"status"`
+	Pairing         *PairingState `json:"pairing,omitempty"`
 }
 
 func NewApp(ctx context.Context, configPath, relay string) (*App, error) {
@@ -81,7 +85,7 @@ func NewAppWithStore(ctx context.Context, store ConfigStore, relay string) (*App
 	app := &App{
 		ctx: ctx, store: store, relayURL: relay,
 		status:         RelayStatus{Message: "Not enrolled"},
-		uiToken:       base64.RawURLEncoding.EncodeToString(token),
+		uiToken:        base64.RawURLEncoding.EncodeToString(token),
 		bootstrapToken: base64.RawURLEncoding.EncodeToString(bootstrap),
 		revoke:         RevokeEnrollment,
 	}
@@ -105,13 +109,18 @@ func NewAppWithStore(ctx context.Context, store ConfigStore, relay string) (*App
 
 func (app *App) NativeLaunchURL(base string) string { return base + "?token=" + app.uiToken }
 
-func (app *App) BrowserLaunchURL(base string) string { return base + "/?bootstrap=" + app.bootstrapToken }
+func (app *App) BrowserLaunchURL(base string) string {
+	return base + "/?bootstrap=" + app.bootstrapToken
+}
 
 func (app *App) Close() {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 	if app.cancel != nil {
 		app.cancel()
+	}
+	if app.pairing != nil {
+		app.pairing.cancel()
 	}
 }
 
@@ -157,6 +166,10 @@ func (app *App) state() State {
 		state.LinkID = app.config.LinkID
 		state.ControllerLabel = app.config.ControllerLabel
 	}
+	if app.pairing != nil {
+		pairing := app.pairing.snapshot()
+		state.Pairing = &pairing
+	}
 	return state
 }
 
@@ -165,6 +178,10 @@ func (app *App) Handler() http.Handler {
 	mux.HandleFunc("GET /", app.handleIndex)
 	mux.HandleFunc("GET /api/state", app.handleState)
 	mux.HandleFunc("POST /api/enroll", app.handleEnroll)
+	mux.HandleFunc("POST /api/pairing/start", app.handlePairingStart)
+	mux.HandleFunc("POST /api/pairing/approve", app.handlePairingApprove)
+	mux.HandleFunc("POST /api/pairing/reject", app.handlePairingReject)
+	mux.HandleFunc("POST /api/pairing/cancel", app.handlePairingCancel)
 	mux.HandleFunc("POST /api/reset", app.handleReset)
 	mux.HandleFunc("POST /api/forget", app.handleForget)
 	mux.HandleFunc("POST /api/action", app.handleAction)
@@ -243,6 +260,140 @@ func (app *App) handleState(response http.ResponseWriter, _ *http.Request) {
 	writeJSON(response, http.StatusOK, app.state())
 }
 
+func (app *App) handlePairingStart(response http.ResponseWriter, request *http.Request) {
+	var body map[string]json.RawMessage
+	if !decodeJSONBody(response, request, &body, "invalid pairing start request") {
+		return
+	}
+	if body == nil || len(body) != 0 {
+		writeError(response, http.StatusBadRequest, "invalid pairing start request")
+		return
+	}
+
+	app.enrollMu.Lock()
+	defer app.enrollMu.Unlock()
+	app.mu.RLock()
+	configured := app.config != nil
+	current := app.pairing
+	app.mu.RUnlock()
+	if configured {
+		writeError(response, http.StatusConflict, "reset the current enrollment first")
+		return
+	}
+	if current != nil && (!current.finished() || !terminalPairingPhase(current.snapshot().Phase)) {
+		writeError(response, http.StatusConflict, "a pairing attempt is already active")
+		return
+	}
+
+	setup, cancel := context.WithTimeout(request.Context(), relayRequestTimeout)
+	defer cancel()
+	attempt, err := newPairingAttempt(app.ctx, setup, app.relayURL, companionDeviceLabel(), app.store.Save, app.store.Delete)
+	if err != nil {
+		writeError(response, http.StatusBadGateway, "could not create pairing invitation")
+		return
+	}
+	app.mu.Lock()
+	app.pairing = attempt
+	app.status = RelayStatus{Message: pairingStatus(attempt.snapshot().Phase)}
+	app.mu.Unlock()
+	invite := attempt.invite
+	go app.finishPairing(attempt)
+	writeJSON(response, http.StatusOK, map[string]protocol.PairingInvite{"invite": invite})
+}
+
+func (app *App) finishPairing(attempt *pairingAttempt) {
+	config, staged, err := attempt.run()
+	app.mu.Lock()
+	if app.pairing != attempt {
+		app.mu.Unlock()
+		return
+	}
+	if staged && config.V == 1 {
+		app.config = &config
+		app.pairing = nil
+		if err == nil {
+			app.status = RelayStatus{Message: "Controller paired; connecting to relay…"}
+		} else {
+			app.status = RelayStatus{Message: "Pairing activation unconfirmed; reconciling with relay…"}
+		}
+		app.mu.Unlock()
+		app.startRelay(config)
+		return
+	}
+	app.status = RelayStatus{Message: pairingStatus(attempt.snapshot().Phase)}
+	app.mu.Unlock()
+}
+
+func (app *App) handlePairingApprove(response http.ResponseWriter, request *http.Request) {
+	app.handlePairingDecision(response, request, true)
+}
+
+func (app *App) handlePairingReject(response http.ResponseWriter, request *http.Request) {
+	app.handlePairingDecision(response, request, false)
+}
+
+func (app *App) handlePairingDecision(response http.ResponseWriter, request *http.Request, approve bool) {
+	pairID, ok := pairingActionPairID(response, request)
+	if !ok {
+		return
+	}
+	app.mu.RLock()
+	attempt := app.pairing
+	app.mu.RUnlock()
+	if attempt == nil || attempt.finished() || attempt.decide(approve, pairID) != nil {
+		writeError(response, http.StatusConflict, "pairing is not awaiting approval")
+		return
+	}
+	key := "rejected"
+	if approve {
+		key = "approved"
+	}
+	writeJSON(response, http.StatusOK, map[string]bool{key: true})
+}
+
+func (app *App) handlePairingCancel(response http.ResponseWriter, request *http.Request) {
+	pairID, ok := pairingActionPairID(response, request)
+	if !ok {
+		return
+	}
+	app.mu.RLock()
+	attempt := app.pairing
+	app.mu.RUnlock()
+	if attempt == nil || attempt.finished() || attempt.stop(pairID) != nil {
+		writeError(response, http.StatusConflict, "pairing attempt did not match")
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]bool{"cancelled": true})
+}
+
+func pairingActionPairID(response http.ResponseWriter, request *http.Request) (string, bool) {
+	var body struct {
+		PairID string `json:"pairId"`
+	}
+	if !decodeJSONBody(response, request, &body, "invalid pairing action") {
+		return "", false
+	}
+	if !uuidPattern.MatchString(body.PairID) {
+		writeError(response, http.StatusBadRequest, "invalid pairing action")
+		return "", false
+	}
+	return body.PairID, true
+}
+
+func decodeJSONBody(response http.ResponseWriter, request *http.Request, destination any, message string) bool {
+	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, 1024))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(destination) != nil {
+		writeError(response, http.StatusBadRequest, message)
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(response, http.StatusBadRequest, message)
+		return false
+	}
+	return true
+}
+
 func (app *App) handleEnroll(response http.ResponseWriter, request *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, 16*1024))
 	if err != nil {
@@ -258,10 +409,22 @@ func (app *App) handleEnroll(response http.ResponseWriter, request *http.Request
 	defer app.enrollMu.Unlock()
 	app.mu.RLock()
 	configured := app.config != nil
+	pairing := app.pairing
 	app.mu.RUnlock()
 	if configured {
 		writeError(response, http.StatusConflict, "reset the current enrollment first")
 		return
+	}
+	if pairing != nil && (!pairing.finished() || !terminalPairingPhase(pairing.snapshot().Phase)) {
+		writeError(response, http.StatusConflict, "cancel the active pairing attempt first")
+		return
+	}
+	if pairing != nil {
+		app.mu.Lock()
+		if app.pairing == pairing {
+			app.pairing = nil
+		}
+		app.mu.Unlock()
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), 45*time.Second)
 	defer cancel()

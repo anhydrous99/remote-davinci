@@ -1,4 +1,6 @@
 import AppKit
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import Darwin
 import Foundation
 import ServiceManagement
@@ -160,9 +162,10 @@ struct CompanionState: Decodable, Equatable, Sendable {
     let connected: Bool
     let secure: Bool
     let status: String
+    let pairing: PairingSnapshot?
 
     enum CodingKeys: String, CodingKey {
-        case configured, connected, secure, status
+        case configured, connected, secure, status, pairing
         case relayURL = "relayUrl"
         case endpointID = "endpointId"
         case linkID = "linkId"
@@ -173,6 +176,84 @@ struct CompanionState: Decodable, Equatable, Sendable {
         if secure { return "Secure controller session" }
         if connected { return "Connected to relay" }
         return status
+    }
+}
+
+struct PairingSnapshot: Decodable, Equatable, Sendable {
+    let phase: String
+    let pairID: String?
+    let expiresAt: Int64?
+    let controllerLabel: String?
+    let controllerFingerprint: String?
+    let requestedPermissions: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case phase, expiresAt, controllerLabel, controllerFingerprint, requestedPermissions
+        case pairID = "pairId"
+    }
+
+    var isShowingInvite: Bool {
+        phase == "inviting" || phase == "showingQR" || phase == "waiting_for_scan"
+    }
+
+    var isAwaitingApproval: Bool {
+        phase == "awaitingApproval" || phase == "awaiting_approval"
+    }
+
+    var isTerminal: Bool {
+        ["cancelled", "expired", "failed", "rejected"].contains(phase)
+    }
+}
+
+struct PairingInvite: Codable, Equatable, Sendable {
+    let protocolName: String
+    let v: Int
+    let relayURL: String
+    let pairID: String
+    let creatorSideID: String
+    let linkID: String
+    let joinToken: String
+    let psk: String
+    let expiresAt: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case v, joinToken, psk, expiresAt
+        case protocolName = "protocol"
+        case relayURL = "relayUrl"
+        case pairID = "pairId"
+        case creatorSideID = "creatorSideId"
+        case linkID = "linkId"
+    }
+
+    func qrPayload() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let payload = String(data: try encoder.encode(self), encoding: .utf8) else {
+            throw CompanionFailure.invalidResponse
+        }
+        return payload
+    }
+}
+
+struct PairingStartReply: Decodable, Equatable, Sendable {
+    let invite: PairingInvite
+}
+
+enum QRCodeRenderer {
+    static func image(for payload: String) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(payload.utf8)
+        filter.correctionLevel = "M"
+        guard let code = filter.outputImage else { return nil }
+
+        let scale = max(1, floor(300 / code.extent.width))
+        let scaled = code.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let quietZone = 4 * scale
+        let extent = scaled.extent.insetBy(dx: -quietZone, dy: -quietZone)
+        let background = CIImage(color: .white).cropped(to: extent)
+        let composed = scaled.composited(over: background)
+        guard let image = CIContext().createCGImage(composed, from: extent) else { return nil }
+        return NSImage(cgImage: image, size: extent.size)
     }
 }
 
@@ -222,6 +303,14 @@ private struct ActionReply: Decodable {
     let muted: Bool?
 }
 
+private struct PairingActionReply: Decodable {
+    let approved: Bool?
+    let rejected: Bool?
+    let cancelled: Bool?
+
+    var succeeded: Bool { approved == true || rejected == true || cancelled == true }
+}
+
 struct CompanionAPI {
     let connection: CompanionConnection
     private let session: URLSession
@@ -254,6 +343,22 @@ struct CompanionAPI {
         return try await request("/api/enroll", method: "POST", body: body)
     }
 
+    func startPairing() async throws -> PairingStartReply {
+        try await request("/api/pairing/start", method: "POST", body: Data("{}".utf8))
+    }
+
+    func approvePairing(pairID: String) async throws {
+        try await pairingAction("/api/pairing/approve", pairID: pairID)
+    }
+
+    func rejectPairing(pairID: String) async throws {
+        try await pairingAction("/api/pairing/reject", pairID: pairID)
+    }
+
+    func cancelPairing(pairID: String) async throws {
+        try await pairingAction("/api/pairing/cancel", pairID: pairID)
+    }
+
     func reset(linkID: String) async throws {
         let body = try JSONEncoder().encode(["confirmation": linkID])
         let reply: ResetReply = try await request("/api/reset", method: "POST", body: body)
@@ -273,6 +378,12 @@ struct CompanionAPI {
         if let page = reply.page { return "Resolve page: \(page)" }
         if let muted = reply.muted { return muted ? "Mac audio muted" : "Mac audio unmuted" }
         throw CompanionFailure.invalidResponse
+    }
+
+    private func pairingAction(_ path: String, pairID: String) async throws {
+        let body = try JSONEncoder().encode(["pairId": pairID])
+        let reply: PairingActionReply = try await request(path, method: "POST", body: body)
+        guard reply.succeeded else { throw CompanionFailure.invalidResponse }
     }
 
     private func request<Response: Decodable>(
@@ -577,6 +688,8 @@ final class CompanionModel: ObservableObject {
     @Published private(set) var pollError: String?
     @Published private(set) var isMutating = false
     @Published private(set) var feedback = ""
+    @Published private(set) var pairingInvite: PairingInvite?
+    @Published private(set) var pairingQRCode: NSImage?
     @Published var enrollmentRequest = ""
     @Published private(set) var enrollmentResponse = ""
     @Published var errorMessage: String?
@@ -587,6 +700,7 @@ final class CompanionModel: ObservableObject {
     private var connection: CompanionConnection?
     private var api: CompanionAPI?
     private var pollTask: Task<Void, Never>?
+    private var attemptedAutomaticPairing = false
 
     private init() {
         host.onChange = { [weak self] snapshot in
@@ -616,6 +730,7 @@ final class CompanionModel: ObservableObject {
         started = false
         pollTask?.cancel()
         pollTask = nil
+        clearPairingInvite()
         host.stop()
     }
 
@@ -644,6 +759,62 @@ final class CompanionModel: ObservableObject {
             guard let self else { return }
             self.enrollmentResponse = try reply.formattedJSON()
             self.feedback = reply.warning ?? "Link created. Import the response on iPhone or iPad."
+        }
+    }
+
+    func startPairing() {
+        mutate { [weak self] api in
+            let reply = try await api.startPairing()
+            guard let self,
+                  let image = try Self.pairingImage(
+                    for: reply,
+                    responseConnection: api.connection,
+                    currentConnection: self.connection
+                  )
+            else { return }
+            pairingInvite = reply.invite
+            pairingQRCode = image
+            feedback = "Scan this code with Remote DaVinci on iPhone or iPad."
+        }
+    }
+
+    static func pairingImage(
+        for reply: PairingStartReply,
+        responseConnection: CompanionConnection,
+        currentConnection: CompanionConnection?
+    ) throws -> NSImage? {
+        guard currentConnection == responseConnection else { return nil }
+        let payload = try reply.invite.qrPayload()
+        guard let image = QRCodeRenderer.image(for: payload) else {
+            throw CompanionFailure.invalidResponse
+        }
+        return image
+    }
+
+    func approvePairing() {
+        guard let pairID = state?.pairing?.pairID else { return }
+        mutate { [weak self] api in
+            try await api.approvePairing(pairID: pairID)
+            self?.clearPairingInvite()
+            self?.feedback = "Finishing secure pairing…"
+        }
+    }
+
+    func rejectPairing() {
+        guard let pairID = state?.pairing?.pairID else { return }
+        mutate { [weak self] api in
+            try await api.rejectPairing(pairID: pairID)
+            self?.clearPairingInvite()
+            self?.feedback = "Pairing request rejected."
+        }
+    }
+
+    func cancelPairing() {
+        guard let pairID = state?.pairing?.pairID ?? pairingInvite?.pairID else { return }
+        mutate { [weak self] api in
+            try await api.cancelPairing(pairID: pairID)
+            self?.clearPairingInvite()
+            self?.feedback = "Pairing cancelled."
         }
     }
 
@@ -685,6 +856,12 @@ final class CompanionModel: ObservableObject {
         enrollmentRequest = ""
         enrollmentResponse = ""
         feedback = message
+        clearPairingInvite()
+    }
+
+    private func clearPairingInvite() {
+        pairingInvite = nil
+        pairingQRCode = nil
     }
 
     private func mutate(_ operation: @MainActor @escaping (CompanionAPI) async throws -> Void) {
@@ -718,6 +895,7 @@ final class CompanionModel: ObservableObject {
         pollError = nil
         guard let connection else {
             api = nil
+            clearPairingInvite()
             return
         }
         let api = CompanionAPI(connection: connection)
@@ -739,7 +917,14 @@ final class CompanionModel: ObservableObject {
             let state = try await api.state()
             guard connection == api.connection else { return }
             self.state = state
+            if state.configured || state.pairing.map({ !$0.isShowingInvite }) == true {
+                clearPairingInvite()
+            }
             pollError = nil
+            if !state.configured, state.pairing == nil, !attemptedAutomaticPairing {
+                attemptedAutomaticPairing = true
+                startPairing()
+            }
         } catch {
             guard connection == api.connection else { return }
             state = nil

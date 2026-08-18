@@ -6,20 +6,26 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strconv"
 )
 
 const (
-	ProtocolName                 = "remote-davinci.rendezvous"
-	ProtocolVersion        int64 = 1
-	ControlProtocolName          = "remote-davinci.control"
-	ControlProtocolVersion       = 1
-	PairingProtocolName          = "remote-davinci.pairing"
-	PairingProtocolVersion       = 1
-	PairingAuthorization         = "Pairing rd1"
-	PairingAppID                 = "remote-davinci/pair/v1"
-	SessionNoiseProtocol         = "Noise_IK_25519_ChaChaPoly_SHA256"
-	SessionNoisePrefix           = "remote-davinci/session/v1"
+	ProtocolName                       = "remote-davinci.rendezvous"
+	ProtocolVersion              int64 = 1
+	ControlProtocolName                = "remote-davinci.control"
+	ControlProtocolVersion             = 1
+	PairingProtocolName                = "remote-davinci.pairing"
+	PairingProtocolVersion             = 1
+	PairingInviteProtocolName          = "remote-davinci.pairing-invite"
+	PairingInviteProtocolVersion       = 1
+	PairingAuthorization               = "Pairing rd1"
+	PairingAppID                       = "remote-davinci/pair/v1"
+	PairingNoiseProtocol               = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
+	PairingNoisePrefix                 = "remote-davinci/pair-qr/v1"
+	SessionNoiseProtocol               = "Noise_IK_25519_ChaChaPoly_SHA256"
+	SessionNoisePrefix                 = "remote-davinci/session/v1"
 
 	MaxWebSocketFrameBytes   = 32 * 1024
 	MaxRelayPayloadBytes     = 16 * 1024
@@ -27,7 +33,9 @@ const (
 	MaxRelayReorderBytes     = MaxRelayPayloadBytes * MaxRelayReorderFrames
 	MaxControlPlaintextBytes = MaxRelayPayloadBytes - 16
 	MaxPairingPlaintextBytes = (MaxRelayPayloadBytes-23)/2 - 40
+	MaxPairingInviteBytes    = 2 * 1024
 	PairingTTLSeconds        = 5 * 60
+	PairingClockSkewSeconds  = 60
 	LocatorDigits            = 6
 	PairingWords             = 4
 )
@@ -98,8 +106,25 @@ type SystemPingBody struct {
 	SentAt int64 `json:"sentAt"`
 }
 
+type PairCreateBody struct {
+	JoinTokenHash string `json:"joinTokenHash,omitempty"`
+}
+
 type PairJoinBody struct {
-	Locator string `json:"locator"`
+	Locator   string `json:"locator,omitempty"`
+	JoinToken string `json:"joinToken,omitempty"`
+}
+
+type PairingInvite struct {
+	Protocol      string `json:"protocol"`
+	V             int64  `json:"v"`
+	RelayURL      string `json:"relayUrl"`
+	PairID        string `json:"pairId"`
+	CreatorSideID string `json:"creatorSideId"`
+	LinkID        string `json:"linkId"`
+	JoinToken     string `json:"joinToken"`
+	PSK           string `json:"psk"`
+	ExpiresAt     int64  `json:"expiresAt"`
 }
 
 type PairCancelBody struct {
@@ -233,6 +258,35 @@ func SessionNoisePrologue(linkID, sessionID string) ([]byte, error) {
 	return []byte(SessionNoisePrefix + "\n" + linkID + "\n" + sessionID), nil
 }
 
+func PairingNoisePrologue(relayURL, pairID, creatorSideID, joinerSideID, linkID string, expiresAt int64) ([]byte, error) {
+	if !validRelayURL(relayURL) ||
+		!uuidPattern.MatchString(pairID) || !uuidPattern.MatchString(creatorSideID) ||
+		!uuidPattern.MatchString(joinerSideID) || !uuidPattern.MatchString(linkID) ||
+		expiresAt < 0 || expiresAt > 253402300799 {
+		return nil, validationError(InvalidMessage, "Pairing Noise prologue fields are invalid")
+	}
+	return []byte(PairingNoisePrefix + "\n" + relayURL + "\n" + pairID + "\n" + creatorSideID + "\n" + joinerSideID + "\n" + linkID + "\n" + strconv.FormatInt(expiresAt, 10)), nil
+}
+
+func JoinTokenHash(joinToken string) (string, error) {
+	token, ok := canonicalBase64URL(joinToken)
+	if !ok || len(token) != 32 {
+		return "", validationError(InvalidMessage, "Join token must be 32 canonical base64url bytes")
+	}
+	digest := sha256.Sum256(token)
+	return base64.RawURLEncoding.EncodeToString(digest[:]), nil
+}
+
+func ValidatePairingInviteAt(invite PairingInvite, now int64) error {
+	if _, err := ParsePairingInvite(invite); err != nil {
+		return err
+	}
+	if now < 0 || invite.ExpiresAt <= now || invite.ExpiresAt-now > PairingTTLSeconds+PairingClockSkewSeconds {
+		return validationError(PairExpired, "Pairing invite is expired or outside its lifetime")
+	}
+	return nil
+}
+
 func NoiseKeyFingerprint(noiseKey string) (string, error) {
 	key, ok := canonicalBase64URL(noiseKey)
 	if !ok || len(key) != 32 {
@@ -266,6 +320,11 @@ func canonicalBase64URL(value string) ([]byte, bool) {
 		return nil, false
 	}
 	return decoded, true
+}
+
+func validRelayURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Scheme == "wss" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.String() == value
 }
 
 func validationError(code ErrorCode, message string, issues ...string) *ValidationError {
