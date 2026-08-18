@@ -31,12 +31,12 @@ type fakeStore struct {
 	commitPair     func(context.Context, string, PairCommit, int64) (CommitPairResult, error)
 	cancelPair     func(context.Context, string, string, int64) (*Pair, error)
 	link           func(context.Context, string) (*Link, error)
-	revokeLink     func(context.Context, string, string, int64) (RevokeLinkResult, error)
-	rotateEndpoint func(context.Context, string, string, int64) error
-	revokeEndpoint func(context.Context, string, int64) (RevokeEndpointResult, error)
+	revokeLink     func(context.Context, string, string, string, int64) (RevokeLinkResult, error)
+	rotateEndpoint func(context.Context, string, string, string, int64) error
+	revokeEndpoint func(context.Context, string, string, int64) (RevokeEndpointResult, error)
 	openSession    func(context.Context, string, string, string, string, int64) (Session, error)
 	session        func(context.Context, string, int64) (Session, error)
-	closeSession   func(context.Context, string, string, int64) (*CloseSessionResult, error)
+	closeSession   func(context.Context, string, string, string, int64) (*CloseSessionResult, error)
 }
 
 func (f *fakeStore) GetEndpoint(ctx context.Context, id string) (*Endpoint, error) {
@@ -116,25 +116,25 @@ func (f *fakeStore) Link(ctx context.Context, id string) (*Link, error) {
 	return f.link(ctx, id)
 }
 
-func (f *fakeStore) RevokeLink(ctx context.Context, linkID, endpointID string, now int64) (RevokeLinkResult, error) {
+func (f *fakeStore) RevokeLink(ctx context.Context, linkID, endpointID, connectionID string, now int64) (RevokeLinkResult, error) {
 	if f.revokeLink == nil {
 		return RevokeLinkResult{}, unexpected
 	}
-	return f.revokeLink(ctx, linkID, endpointID, now)
+	return f.revokeLink(ctx, linkID, endpointID, connectionID, now)
 }
 
-func (f *fakeStore) RotateEndpoint(ctx context.Context, endpointID, hash string, now int64) error {
+func (f *fakeStore) RotateEndpoint(ctx context.Context, endpointID, connectionID, hash string, now int64) error {
 	if f.rotateEndpoint == nil {
 		return unexpected
 	}
-	return f.rotateEndpoint(ctx, endpointID, hash, now)
+	return f.rotateEndpoint(ctx, endpointID, connectionID, hash, now)
 }
 
-func (f *fakeStore) RevokeEndpoint(ctx context.Context, endpointID string, now int64) (RevokeEndpointResult, error) {
+func (f *fakeStore) RevokeEndpoint(ctx context.Context, endpointID, connectionID string, now int64) (RevokeEndpointResult, error) {
 	if f.revokeEndpoint == nil {
 		return RevokeEndpointResult{}, unexpected
 	}
-	return f.revokeEndpoint(ctx, endpointID, now)
+	return f.revokeEndpoint(ctx, endpointID, connectionID, now)
 }
 
 func (f *fakeStore) OpenSession(ctx context.Context, linkID, endpointID, connectionID, sessionID string, now int64) (Session, error) {
@@ -151,11 +151,11 @@ func (f *fakeStore) Session(ctx context.Context, id string, now int64) (Session,
 	return f.session(ctx, id, now)
 }
 
-func (f *fakeStore) CloseSession(ctx context.Context, sessionID, endpointID string, now int64) (*CloseSessionResult, error) {
+func (f *fakeStore) CloseSession(ctx context.Context, sessionID, endpointID, connectionID string, now int64) (*CloseSessionResult, error) {
 	if f.closeSession == nil {
 		return nil, unexpected
 	}
-	return f.closeSession(ctx, sessionID, endpointID, now)
+	return f.closeSession(ctx, sessionID, endpointID, connectionID, now)
 }
 
 type apiError string
@@ -185,13 +185,21 @@ func socketEvent(connectionID, route, body string) WebSocketEvent {
 }
 
 func testHandler(store Store, post Post) *Handler {
-	return testHandlerWithLogger(store, post, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	return testHandlerWithOptions(store, post, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 }
 
 func testHandlerWithLogger(store Store, post Post, logger *slog.Logger) *Handler {
+	return testHandlerWithOptions(store, post, nil, logger)
+}
+
+func testHandlerWithDrop(store Store, post Post, drop func(context.Context, string, WebSocketEvent) error) *Handler {
+	return testHandlerWithOptions(store, post, drop, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+}
+
+func testHandlerWithOptions(store Store, post Post, drop func(context.Context, string, WebSocketEvent) error, logger *slog.Logger) *Handler {
 	value := 10
 	return NewHandler(HandlerDependencies{
-		Store: store, Post: post, Now: func() int64 { return 100 },
+		Store: store, Post: post, Drop: drop, Now: func() int64 { return 100 },
 		ID: func() string {
 			result := uuid(value)
 			value++
@@ -300,6 +308,60 @@ func TestConnectReplacementNotifiesOnlyOldPeer(t *testing.T) {
 	}
 }
 
+func TestSourceKeyNormalizesIPv6PrefixAndMappedIPv4(t *testing.T) {
+	if SourceKey("2001:db8:1:2::1") != SourceKey("2001:db8:1:2:ffff::2") {
+		t.Fatal("IPv6 hosts in one /64 received different source keys")
+	}
+	if SourceKey("2001:db8:1:2::1") == SourceKey("2001:db8:1:3::1") {
+		t.Fatal("distinct IPv6 /64 prefixes received one source key")
+	}
+	if SourceKey("203.0.113.42") != SourceKey("::ffff:203.0.113.42") {
+		t.Fatal("IPv4-mapped address did not normalize to IPv4")
+	}
+	if SourceKey("203.0.113.42") == SourceKey("203.0.113.43") {
+		t.Fatal("distinct IPv4 addresses received one source key")
+	}
+}
+
+func TestPairingConnectRateLimitsNormalizedSourceBeforePersisting(t *testing.T) {
+	limited := false
+	connectCalls := 0
+	store := &fakeStore{
+		rateLimit: func(_ context.Context, source, action string, limit, _ int64) error {
+			if connectCalls != 0 || source != SourceKey("2001:db8:1:2::99") || action != "pairing.connect" || limit != pairingConnectsPerMinute {
+				t.Fatalf("rate limit before connect = %d/%s/%s/%d", connectCalls, source, action, limit)
+			}
+			if limited {
+				return retryableError(protocol.RateLimited)
+			}
+			return nil
+		},
+		connect: func(_ context.Context, connection Connection, hash string) (*CloseSessionResult, error) {
+			connectCalls++
+			if connection.SourceKey != SourceKey("2001:db8:1:2::99") || connection.AuthMode != "pairing" || hash != "" {
+				t.Fatalf("connection = %#v, hash = %q", connection, hash)
+			}
+			return nil, nil
+		},
+	}
+	handler := testHandler(store, func(context.Context, string, Message, WebSocketEvent) error { return nil })
+	event := socketEvent("pairing-one", "$connect", "")
+	event.RequestContext.Identity.SourceIP = "2001:db8:1:2:abcd::1"
+	response, err := handler.Handle(context.Background(), event)
+	if err != nil || response.StatusCode != 200 || connectCalls != 1 {
+		t.Fatalf("response = %#v, calls = %d, error = %v", response, connectCalls, err)
+	}
+
+	limited = true
+	connectCalls = 0
+	event.RequestContext.ConnectionID = "pairing-two"
+	event.RequestContext.Identity.SourceIP = "2001:db8:1:2:ffff::2"
+	response, err = handler.Handle(context.Background(), event)
+	if err != nil || response.StatusCode != 503 || connectCalls != 0 {
+		t.Fatalf("limited response = %#v, calls = %d, error = %v", response, connectCalls, err)
+	}
+}
+
 func TestPairFrameForwardsOpaquePayloadWithoutSuccessReply(t *testing.T) {
 	pairID := uuid(2)
 	sideB := PairSide{ConnectionID: "b", SideID: uuid(4)}
@@ -340,23 +402,70 @@ func TestPairFrameForwardsOpaquePayloadWithoutSuccessReply(t *testing.T) {
 	}
 }
 
-func TestSessionFrameUsesOnlySessionAuthority(t *testing.T) {
+func TestRateLimitedPairFrameDropsBeforePairRead(t *testing.T) {
+	pairCalls, drops := 0, 0
+	var sent Message
+	handler := testHandlerWithDrop(&fakeStore{
+		rateLimit: func(context.Context, string, string, int64, int64) error {
+			return retryableError(protocol.RateLimited)
+		},
+		pairByID: func(context.Context, string, int64) (Pair, error) {
+			pairCalls++
+			return Pair{}, nil
+		},
+		disconnect: func(context.Context, string, int64) (*DisconnectResult, error) { return nil, nil },
+	}, func(_ context.Context, _ string, message Message, _ WebSocketEvent) error {
+		sent = message
+		return nil
+	}, func(context.Context, string, WebSocketEvent) error {
+		drops++
+		return nil
+	})
+	_, err := handler.Handle(context.Background(), socketEvent("pairing", "pair.frame", envelope("pair.frame", map[string]any{
+		"pairId": uuid(2), "seq": 1, "payload": "AQID",
+	})))
+	if err != nil || pairCalls != 0 || drops != 1 || decodedMessageBody(t, sent)["code"] != string(protocol.RateLimited) {
+		t.Fatalf("pair calls = %d, drops = %d, message = %#v, error = %v", pairCalls, drops, sent, err)
+	}
+}
+
+func TestSessionFrameChecksCurrentConnectionAndEndpointQuotaBeforeSession(t *testing.T) {
 	session := Session{
 		SessionID: uuid(7), LinkID: uuid(8), ControllerID: uuid(5), CompanionID: uuid(6),
 		ControllerConnectionID: "controller", CompanionConnectionID: "companion", Status: "ACTIVE", ExpiresAt: 1000,
 	}
-	reads := 0
+	connectionReads, rates, sessionReads := 0, 0, 0
 	var sent []struct {
 		target  string
 		message Message
 	}
-	handler := testHandler(&fakeStore{session: func(_ context.Context, id string, _ int64) (Session, error) {
-		reads++
-		if id != session.SessionID {
-			t.Fatalf("session id = %s", id)
-		}
-		return session, nil
-	}}, func(_ context.Context, connectionID string, message Message, _ WebSocketEvent) error {
+	handler := testHandler(&fakeStore{
+		connection: func(_ context.Context, id string, _ int64) (Connection, error) {
+			connectionReads++
+			endpointID := session.ControllerID
+			if id == "companion" {
+				endpointID = session.CompanionID
+			}
+			return Connection{ConnectionID: id, AuthMode: "endpoint", EndpointID: endpointID, ExpiresAt: 1_000}, nil
+		},
+		rateLimit: func(_ context.Context, source, action string, limit, _ int64) error {
+			rates++
+			if action != "session.frame" || limit != sessionFramesPerMinute || source != session.ControllerID && source != session.CompanionID {
+				t.Fatalf("rate limit = %s/%s/%d", source, action, limit)
+			}
+			if sessionReads != rates-1 {
+				t.Fatal("session read occurred before rate limit")
+			}
+			return nil
+		},
+		session: func(_ context.Context, id string, _ int64) (Session, error) {
+			sessionReads++
+			if id != session.SessionID {
+				t.Fatalf("session id = %s", id)
+			}
+			return session, nil
+		},
+	}, func(_ context.Context, connectionID string, message Message, _ WebSocketEvent) error {
 		if message.Type != "session.frame" {
 			t.Fatalf("message = %#v", message)
 		}
@@ -383,8 +492,97 @@ func TestSessionFrameUsesOnlySessionAuthority(t *testing.T) {
 			t.Fatalf("body = %#v", body)
 		}
 	}
-	if reads != 2 {
-		t.Fatalf("session reads = %d", reads)
+	if connectionReads != 2 || rates != 2 || sessionReads != 2 {
+		t.Fatalf("connection/rate/session calls = %d/%d/%d", connectionReads, rates, sessionReads)
+	}
+}
+
+func TestUnauthorizedSessionFrameDropsBeforeSessionRead(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		connection func(context.Context, string, int64) (Connection, error)
+		code       protocol.ErrorCode
+	}{
+		{"pairing", func(context.Context, string, int64) (Connection, error) {
+			return Connection{ConnectionID: "violator", AuthMode: "pairing", SourceKey: "source", ExpiresAt: 1_000}, nil
+		}, protocol.Forbidden},
+		{"unauthenticated", func(context.Context, string, int64) (Connection, error) {
+			return Connection{}, serviceError(protocol.Unauthenticated)
+		}, protocol.Unauthenticated},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sessionCalls := 0
+			var sent Message
+			var events []string
+			handler := testHandlerWithDrop(&fakeStore{
+				connection: test.connection,
+				rateLimit: func(context.Context, string, string, int64, int64) error {
+					t.Fatal("unauthorized session frame reached quota")
+					return nil
+				},
+				session: func(context.Context, string, int64) (Session, error) {
+					sessionCalls++
+					return Session{}, nil
+				},
+				disconnect: func(context.Context, string, int64) (*DisconnectResult, error) {
+					events = append(events, "cleanup")
+					return nil, nil
+				},
+			}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
+				if target != "violator" {
+					t.Fatalf("target = %s", target)
+				}
+				events = append(events, "error")
+				sent = message
+				return nil
+			}, func(_ context.Context, target string, _ WebSocketEvent) error {
+				if target != "violator" {
+					t.Fatalf("drop target = %s", target)
+				}
+				events = append(events, "drop")
+				return nil
+			})
+			_, err := handler.Handle(context.Background(), socketEvent("violator", "session.frame", envelope("session.frame", map[string]any{
+				"sessionId": uuid(7), "seq": 1, "payload": "AQID",
+			})))
+			if err != nil || sessionCalls != 0 || fmt.Sprint(events) != "[error drop cleanup]" || sent.Type != "error" || decodedMessageBody(t, sent)["code"] != string(test.code) {
+				t.Fatalf("session calls = %d, events = %v, message = %#v, error = %v", sessionCalls, events, sent, err)
+			}
+		})
+	}
+}
+
+func TestSessionFrameQuotaRejectsBeforeSessionRead(t *testing.T) {
+	sessionCalls := 0
+	var sent Message
+	dropped := 0
+	handler := testHandlerWithDrop(&fakeStore{
+		connection: func(context.Context, string, int64) (Connection, error) {
+			return Connection{ConnectionID: "controller", AuthMode: "endpoint", EndpointID: uuid(5), ExpiresAt: 1_000}, nil
+		},
+		rateLimit: func(_ context.Context, source, action string, limit, _ int64) error {
+			if source != uuid(5) || action != "session.frame" || limit != sessionFramesPerMinute {
+				t.Fatalf("quota = %s/%s/%d", source, action, limit)
+			}
+			return retryableError(protocol.RateLimited)
+		},
+		session: func(context.Context, string, int64) (Session, error) {
+			sessionCalls++
+			return Session{}, nil
+		},
+		disconnect: func(context.Context, string, int64) (*DisconnectResult, error) { return nil, nil },
+	}, func(_ context.Context, _ string, message Message, _ WebSocketEvent) error {
+		sent = message
+		return nil
+	}, func(context.Context, string, WebSocketEvent) error {
+		dropped++
+		return nil
+	})
+	_, err := handler.Handle(context.Background(), socketEvent("controller", "session.frame", envelope("session.frame", map[string]any{
+		"sessionId": uuid(999), "seq": 1, "payload": "AQID",
+	})))
+	if err != nil || dropped != 1 || sessionCalls != 0 || sent.Type != "error" || decodedMessageBody(t, sent)["code"] != string(protocol.RateLimited) {
+		t.Fatalf("drops = %d, session calls = %d, message = %#v, error = %v", dropped, sessionCalls, sent, err)
 	}
 }
 
@@ -395,28 +593,33 @@ func TestSessionOpenCallbackFailureClosesCommittedSession(t *testing.T) {
 		ControllerConnectionID: "controller", CompanionConnectionID: "companion", Status: "ACTIVE", ExpiresAt: 1000,
 	}
 	closeCalls := 0
+	var opened []string
 	handler := testHandler(&fakeStore{
 		connection: func(context.Context, string, int64) (Connection, error) {
 			return Connection{ConnectionID: "controller", AuthMode: "endpoint", EndpointID: controllerID, ExpiresAt: 1000}, nil
 		},
+		rateLimit: func(context.Context, string, string, int64, int64) error { return nil },
 		openSession: func(context.Context, string, string, string, string, int64) (Session, error) {
 			return session, nil
 		},
-		closeSession: func(context.Context, string, string, int64) (*CloseSessionResult, error) {
+		closeSession: func(context.Context, string, string, string, int64) (*CloseSessionResult, error) {
 			closeCalls++
 			closed := session
 			closed.Status = "CLOSED"
 			return &CloseSessionResult{Session: closed, ClosedNow: true}, nil
 		},
 	}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
-		if target == "controller" && message.Type == "session.opened" {
-			return errors.New("callback failed")
+		if message.Type == "session.opened" {
+			opened = append(opened, target)
+			if target == "controller" {
+				return errors.New("callback failed")
+			}
 		}
 		return nil
 	})
 	response, err := handler.Handle(context.Background(), socketEvent("controller", "$default", envelope("session.open", map[string]any{"linkId": session.LinkID})))
-	if err != nil || closeCalls != 1 {
-		t.Fatalf("close calls = %d, response = %#v, error = %v", closeCalls, response, err)
+	if err != nil || closeCalls != 1 || fmt.Sprint(opened) != "[companion controller]" {
+		t.Fatalf("opened = %v, close calls = %d, response = %#v, error = %v", opened, closeCalls, response, err)
 	}
 	if message := parseResponse(t, response); message.Type != "error" {
 		t.Fatalf("message = %#v", message)
@@ -426,40 +629,61 @@ func TestSessionOpenCallbackFailureClosesCommittedSession(t *testing.T) {
 func TestForeignSessionFrameGetsOneCorrelatedError(t *testing.T) {
 	session := Session{SessionID: uuid(7), ControllerConnectionID: "controller", CompanionConnectionID: "companion", Status: "ACTIVE", ExpiresAt: 1000}
 	var sent []Message
-	handler := testHandler(&fakeStore{session: func(context.Context, string, int64) (Session, error) {
-		return session, nil
-	}}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
+	drops := 0
+	handler := testHandlerWithDrop(&fakeStore{
+		connection: func(context.Context, string, int64) (Connection, error) {
+			return Connection{ConnectionID: "attacker", AuthMode: "endpoint", EndpointID: uuid(99), ExpiresAt: 1_000}, nil
+		},
+		rateLimit: func(context.Context, string, string, int64, int64) error { return nil },
+		session:   func(context.Context, string, int64) (Session, error) { return session, nil },
+		disconnect: func(context.Context, string, int64) (*DisconnectResult, error) {
+			return nil, nil
+		},
+	}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
 		if target != "attacker" {
 			t.Fatalf("target = %s", target)
 		}
 		sent = append(sent, message)
 		return nil
+	}, func(context.Context, string, WebSocketEvent) error {
+		drops++
+		return nil
 	})
 	_, err := handler.Handle(context.Background(), socketEvent("attacker", "session.frame", envelope("session.frame", map[string]any{
 		"sessionId": session.SessionID, "seq": 1, "payload": "AQID",
 	})))
-	if err != nil || len(sent) != 1 || sent[0].Type != "error" || sent[0].ReplyTo != uuid(1) {
-		t.Fatalf("sent = %#v, error = %v", sent, err)
+	if err != nil || drops != 1 || len(sent) != 1 || sent[0].Type != "error" || sent[0].ReplyTo != uuid(1) {
+		t.Fatalf("drops = %d, sent = %#v, error = %v", drops, sent, err)
 	}
 	if decodedMessageBody(t, sent[0])["code"] != string(protocol.Forbidden) {
 		t.Fatalf("body = %#v", sent[0].Body)
 	}
 }
 
-func TestInvalidFrameRetainsValidRequestCorrelation(t *testing.T) {
+func TestInvalidFrameRetainsCorrelationThenDropsBeforeCleanup(t *testing.T) {
 	var sent Message
-	handler := testHandler(&fakeStore{}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
+	var events []string
+	handler := testHandlerWithDrop(&fakeStore{
+		disconnect: func(context.Context, string, int64) (*DisconnectResult, error) {
+			events = append(events, "cleanup")
+			return nil, nil
+		},
+	}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
 		if target != "sender" {
 			t.Fatalf("target = %s", target)
 		}
+		events = append(events, "error")
 		sent = message
+		return nil
+	}, func(context.Context, string, WebSocketEvent) error {
+		events = append(events, "drop")
 		return nil
 	})
 	_, err := handler.Handle(context.Background(), socketEvent("sender", "session.frame", envelope("session.frame", map[string]any{
 		"sessionId": uuid(40), "seq": 1, "payload": "AQ==",
 	})))
-	if err != nil || sent.Type != "error" || sent.ReplyTo != uuid(1) {
-		t.Fatalf("message = %#v, error = %v", sent, err)
+	if err != nil || fmt.Sprint(events) != "[error drop cleanup]" || sent.Type != "error" || sent.ReplyTo != uuid(1) {
+		t.Fatalf("events = %v, message = %#v, error = %v", events, sent, err)
 	}
 }
 
@@ -491,18 +715,91 @@ func TestDefaultCommandReturnsNativeRouteResponse(t *testing.T) {
 	}
 }
 
-func TestDefaultFailureAlsoUsesRouteResponse(t *testing.T) {
-	posts := 0
-	handler := testHandler(&fakeStore{}, func(context.Context, string, Message, WebSocketEvent) error {
-		posts++
+func TestPairingMessageRateLimitPostsOneErrorThenDrops(t *testing.T) {
+	var sent Message
+	var events []string
+	handler := testHandlerWithDrop(&fakeStore{
+		connection: func(context.Context, string, int64) (Connection, error) {
+			return Connection{ConnectionID: "pairing", AuthMode: "pairing", SourceKey: "source", ExpiresAt: 1_000}, nil
+		},
+		rateLimit: func(_ context.Context, _ string, action string, limit, _ int64) error {
+			if action != "pairing.message" || limit != 120 {
+				t.Fatalf("rate limit = %s/%d", action, limit)
+			}
+			return retryableError(protocol.RateLimited)
+		},
+		disconnect: func(context.Context, string, int64) (*DisconnectResult, error) {
+			events = append(events, "cleanup")
+			return nil, nil
+		},
+	}, func(_ context.Context, _ string, message Message, _ WebSocketEvent) error {
+		events = append(events, "error")
+		sent = message
+		return nil
+	}, func(context.Context, string, WebSocketEvent) error {
+		events = append(events, "drop")
+		return nil
+	})
+	response, err := handler.Handle(context.Background(), socketEvent("pairing", "$default", envelope("system.hello", map[string]any{})))
+	if err != nil || response.StatusCode != 200 || response.Body != "" || fmt.Sprint(events) != "[error drop cleanup]" ||
+		sent.Type != "error" || sent.ReplyTo != uuid(1) || decodedMessageBody(t, sent)["code"] != string(protocol.RateLimited) {
+		t.Fatalf("events = %v, response = %#v, message = %#v, error = %v", events, response, sent, err)
+	}
+}
+
+func TestEndpointMessageRateLimitPostsOneErrorThenDrops(t *testing.T) {
+	endpointID := uuid(69)
+	var sent Message
+	var events []string
+	handler := testHandlerWithDrop(&fakeStore{
+		connection: func(context.Context, string, int64) (Connection, error) {
+			return Connection{ConnectionID: "endpoint", AuthMode: "endpoint", EndpointID: endpointID, ExpiresAt: 1_000}, nil
+		},
+		rateLimit: func(_ context.Context, source, action string, limit, _ int64) error {
+			if source != endpointID || action != "endpoint.message" || limit != endpointMessagesPerMinute {
+				t.Fatalf("rate limit = %s/%s/%d", source, action, limit)
+			}
+			return retryableError(protocol.RateLimited)
+		},
+		disconnect: func(context.Context, string, int64) (*DisconnectResult, error) {
+			events = append(events, "cleanup")
+			return nil, nil
+		},
+	}, func(_ context.Context, _ string, message Message, _ WebSocketEvent) error {
+		events = append(events, "error")
+		sent = message
+		return nil
+	}, func(context.Context, string, WebSocketEvent) error {
+		events = append(events, "drop")
+		return nil
+	})
+	response, err := handler.Handle(context.Background(), socketEvent("endpoint", "$default", envelope("system.hello", map[string]any{})))
+	if err != nil || response.StatusCode != 200 || response.Body != "" || fmt.Sprint(events) != "[error drop cleanup]" ||
+		sent.Type != "error" || sent.ReplyTo != uuid(1) || decodedMessageBody(t, sent)["code"] != string(protocol.RateLimited) {
+		t.Fatalf("events = %v, response = %#v, message = %#v, error = %v", events, response, sent, err)
+	}
+}
+
+func TestMalformedDefaultMessagePostsOneErrorThenDrops(t *testing.T) {
+	var sent Message
+	var events []string
+	handler := testHandlerWithDrop(&fakeStore{
+		disconnect: func(context.Context, string, int64) (*DisconnectResult, error) {
+			events = append(events, "cleanup")
+			return nil, nil
+		},
+	}, func(_ context.Context, _ string, message Message, _ WebSocketEvent) error {
+		events = append(events, "error")
+		sent = message
+		return nil
+	}, func(context.Context, string, WebSocketEvent) error {
+		events = append(events, "drop")
 		return nil
 	})
 	response, err := handler.Handle(context.Background(), socketEvent("one", "$default", `{not-json`))
-	if err != nil || posts != 0 {
-		t.Fatalf("posts = %d, response = %#v, error = %v", posts, response, err)
-	}
-	if message := parseResponse(t, response); message.Type != "error" {
-		t.Fatalf("message = %#v", message)
+	if err != nil || response.StatusCode != 200 || response.Body != "" || fmt.Sprint(events) != "[error drop cleanup]" ||
+		sent.Type != "error" || decodedMessageBody(t, sent)["code"] != string(protocol.InvalidMessage) {
+		t.Fatalf("events = %v, response = %#v, message = %#v, error = %v", events, response, sent, err)
 	}
 }
 
@@ -517,7 +814,11 @@ func TestEndpointRevokeCutsOnlyActiveSessionAndReturnsNoCount(t *testing.T) {
 		connection: func(context.Context, string, int64) (Connection, error) {
 			return Connection{ConnectionID: "controller", AuthMode: "endpoint", EndpointID: controllerID, ExpiresAt: 1000}, nil
 		},
-		revokeEndpoint: func(context.Context, string, int64) (RevokeEndpointResult, error) {
+		rateLimit: func(context.Context, string, string, int64, int64) error { return nil },
+		revokeEndpoint: func(_ context.Context, endpointID, connectionID string, _ int64) (RevokeEndpointResult, error) {
+			if endpointID != controllerID || connectionID != "controller" {
+				t.Fatalf("authority = %s/%s", endpointID, connectionID)
+			}
 			return RevokeEndpointResult{Endpoint: Endpoint{EndpointID: controllerID}, Session: &CloseSessionResult{Session: session, ClosedNow: true}}, nil
 		},
 	}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
@@ -541,12 +842,70 @@ func TestEndpointRevokeCutsOnlyActiveSessionAndReturnsNoCount(t *testing.T) {
 	}
 }
 
+func TestLifecycleMutatorsReceiveCurrentConnectionFence(t *testing.T) {
+	endpointID, peerID := uuid(74), uuid(75)
+	linkID, sessionID := uuid(76), uuid(77)
+	calls := 0
+	assertAuthority := func(gotEndpointID, gotConnectionID string) {
+		t.Helper()
+		calls++
+		if gotEndpointID != endpointID || gotConnectionID != "controller" {
+			t.Fatalf("authority = %s/%s", gotEndpointID, gotConnectionID)
+		}
+	}
+	store := &fakeStore{
+		getEndpoint: func(context.Context, string) (*Endpoint, error) { return nil, nil },
+		revokeLink: func(_ context.Context, gotLinkID, gotEndpointID, gotConnectionID string, _ int64) (RevokeLinkResult, error) {
+			assertAuthority(gotEndpointID, gotConnectionID)
+			return RevokeLinkResult{Link: Link{LinkID: gotLinkID, ControllerID: endpointID, CompanionID: peerID}}, nil
+		},
+		rotateEndpoint: func(_ context.Context, gotEndpointID, gotConnectionID, _ string, _ int64) error {
+			assertAuthority(gotEndpointID, gotConnectionID)
+			return nil
+		},
+		revokeEndpoint: func(_ context.Context, gotEndpointID, gotConnectionID string, _ int64) (RevokeEndpointResult, error) {
+			assertAuthority(gotEndpointID, gotConnectionID)
+			return RevokeEndpointResult{Endpoint: Endpoint{EndpointID: endpointID}}, nil
+		},
+		closeSession: func(_ context.Context, gotSessionID, gotEndpointID, gotConnectionID string, _ int64) (*CloseSessionResult, error) {
+			assertAuthority(gotEndpointID, gotConnectionID)
+			if gotSessionID != sessionID {
+				t.Fatalf("session = %s", gotSessionID)
+			}
+			return nil, nil
+		},
+	}
+	handler := testHandler(store, func(context.Context, string, Message, WebSocketEvent) error { return nil })
+	connection := Connection{ConnectionID: "controller", AuthMode: "endpoint", EndpointID: endpointID, ExpiresAt: 1_000}
+	for _, test := range []struct {
+		messageType string
+		body        map[string]any
+	}{
+		{"link.revoke", map[string]any{"linkId": linkID}},
+		{"endpoint.rotate", map[string]any{"credentialHash": base64.RawURLEncoding.EncodeToString(bytesOf(32, 1))}},
+		{"endpoint.revoke", map[string]any{}},
+		{"session.close", map[string]any{"sessionId": sessionID}},
+	} {
+		message, err := protocol.ParseClient(envelope(test.messageType, test.body))
+		if err != nil {
+			t.Fatalf("%s: %v", test.messageType, err)
+		}
+		if _, err := handler.dispatch(context.Background(), message, connection, socketEvent("controller", "$default", "")); err != nil {
+			t.Fatalf("%s: %v", test.messageType, err)
+		}
+	}
+	if calls != 4 {
+		t.Fatalf("calls = %d", calls)
+	}
+}
+
 func TestLinkGetDerivesEffectiveRevocationFromPeerEndpoint(t *testing.T) {
 	controllerID, companionID, linkID := uuid(80), uuid(81), uuid(82)
 	handler := testHandler(&fakeStore{
 		connection: func(context.Context, string, int64) (Connection, error) {
 			return Connection{ConnectionID: "controller", AuthMode: "endpoint", EndpointID: controllerID, ExpiresAt: 1000}, nil
 		},
+		rateLimit: func(context.Context, string, string, int64, int64) error { return nil },
 		link: func(context.Context, string) (*Link, error) {
 			return &Link{LinkID: linkID, ControllerID: controllerID, CompanionID: companionID, Status: "ACTIVE"}, nil
 		},
@@ -576,7 +935,11 @@ func TestGonePeerClosesSessionBeforeReturningFrameError(t *testing.T) {
 	closedSession.Status = "CLOSED"
 	var sent []Message
 	handler := testHandler(&fakeStore{
-		session: func(context.Context, string, int64) (Session, error) { return session, nil },
+		connection: func(context.Context, string, int64) (Connection, error) {
+			return Connection{ConnectionID: "controller", AuthMode: "endpoint", EndpointID: session.ControllerID, ExpiresAt: 1_000}, nil
+		},
+		rateLimit: func(context.Context, string, string, int64, int64) error { return nil },
+		session:   func(context.Context, string, int64) (Session, error) { return session, nil },
 		disconnect: func(_ context.Context, id string, _ int64) (*DisconnectResult, error) {
 			if id != "companion" {
 				t.Fatalf("disconnect = %s", id)

@@ -37,14 +37,15 @@ flowchart LR
     WIRING["5 Lambda integrations<br/>5 invoke permissions"]
     RELAY["RelayHandler Lambda<br/>Go · ARM64 · provided.al2023<br/>256 MiB · 10-second timeout"]
     STATE[("DynamoDB State table<br/>on-demand · AWS-managed encryption<br/>pk + sk · expiresAt TTL")]
-    IAM["Lambda execution role/policy<br/>DynamoDB item operations<br/>execute-api:ManageConnections"]
+    IAM["Lambda execution role/policy<br/>DynamoDB item operations<br/>RelayLogs writes<br/>execute-api:ManageConnections"]
 
     RELAY_LOGS["CloudWatch RelayLogs"]
-    ACCESS_LOGS["CloudWatch AccessLogs<br/>optional; enabled for dev by default"]
+    ACCESS_LOGS["CloudWatch AccessLogs<br/>enabled by default<br/>metadata only"]
 
-    LAMBDA_ALARMS["RelayErrors<br/>RelayThrottles"]
+    LAMBDA_ALARMS["RelayErrors<br/>RelayThrottles<br/>RelayRejections"]
     API_ALARM["ApiExecutionErrors"]
     TABLE_ALARM["TableThrottles"]
+    ALERT_TOPIC["Existing SNS alarm topic<br/>confirmed operator subscription"]
   end
 
   IOS <-->|"WSS JSON"| STAGE
@@ -62,6 +63,9 @@ flowchart LR
   RELAY -. "metrics" .-> LAMBDA_ALARMS
   STAGE -. "metrics" .-> API_ALARM
   STATE -. "metrics" .-> TABLE_ALARM
+  LAMBDA_ALARMS --> ALERT_TOPIC
+  API_ALARM --> ALERT_TOPIC
+  TABLE_ALARM --> ALERT_TOPIC
 ```
 
 ## Local validation
@@ -75,6 +79,26 @@ Synthesize the development stack with `npm --prefix infra/cdk run synth`. It
 targets `us-east-1` by default; pass CDK context `region` to the infrastructure
 workspace to select another region. Deployment requires an AWS account
 bootstrapped for CDK and is intentionally not performed by the test suite.
+
+Production synthesis and deployment require an explicit account/region
+allowlist plus an existing SNS topic in that same account and region:
+
+```sh
+npm --prefix infra/cdk run synth -- \
+  -c environment=prod \
+  -c productionAccount=123456789012 \
+  -c productionRegion=us-east-1 \
+  -c alarmTopicArn=arn:aws:sns:us-east-1:123456789012:remote-davinci-alerts
+```
+
+The CDK app refuses production when the allowlist differs from the account and
+region resolved by the CDK toolkit. Before deployment, confirm the SNS topic
+has at least one subscribed operator and test delivery. API Gateway access logs
+are enabled by default with metadata-only fields and seven-day production
+retention; configure the account-level API Gateway CloudWatch Logs role first.
+Use `-c accessLogs=false` only as an explicit exception. The normal production
+profile reserves 200 Lambda concurrency; `docs/capacity.md` lists the account
+quota required before deployment.
 
 ## Run the vertical slice
 
@@ -110,11 +134,22 @@ the last supported tab selected and are not changed automatically.
 `host.volume.toggle-mute` remains the separate fixed macOS control. Remote raw
 keys, shell commands, and user-authored scripts are not accepted.
 
-Enrollment is a trusted, manual, one-operator ceremony for this slice. The iOS
-app uses the device-only Keychain and the native Mac helper uses the login
-Keychain. The standalone Go CLI remains a development fallback and uses a
-mode-0600 configuration file. Add PAKE/QR enrollment before onboarding anyone
-outside that boundary.
+Enrollment is a trusted, manual, one-operator ceremony for this slice. Transfer
+both JSON documents directly between the unlocked controller and Mac without
+an intermediary; that operator-controlled path is the authenticated channel.
+The shipped apps do not run PAKE or negotiate operation grants. The originating
+controller validates and persists its selected relay before emitting the
+unchanged V1 identity request, then rejects a companion response for any other
+relay. Accepting a response grants that one controller all five fixed V1
+operations listed above.
+
+The iOS app uses the device-only Keychain and the native Mac helper uses the
+login Keychain. The standalone Go CLI is an explicitly insecure development
+fallback: it requires `-allow-insecure-file-config` and a private, regular,
+non-symlink mode-0600 configuration file. Its printed browser URL contains a
+single-use bootstrap value rather than the API credential. Implement and review
+the documented PAKE/QR ceremony and persisted per-operation grants before
+onboarding anyone outside the one-trusted-operator boundary.
 Both apps offer separately confirmed local-only recovery when remote revocation
 cannot complete; it warns that the old relay identity may remain.
 

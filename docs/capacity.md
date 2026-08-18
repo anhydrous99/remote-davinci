@@ -13,26 +13,31 @@ capacity.
 - Unexpected steady-state errors below 0.1% and no service throttles.
 
 One control round trip is two one-way session frames. A one-way frame performs
-one strong DynamoDB Session read, one Lambda invocation, one inbound API Gateway
-request, and one callback to the peer. The relay stores no ciphertext.
+strong DynamoDB Connection and Session reads, one rate-limit update, one Lambda
+invocation, one inbound API Gateway request, and one callback to the peer. The
+relay stores no ciphertext. The figures below assume the authority items remain
+at most 4 KiB and each rate-limit item remains at most 1 KiB.
 
-| Load | Frames/s | API requests/s | Lambda invokes/s | Strong reads/s |
-|---|---:|---:|---:|---:|
-| Sustained | 2,000 | 4,000 | 2,000 | 2,000 |
-| Peak | 20,000 | 40,000 | 20,000 | 20,000 |
+| Load | Frames/s | API requests/s | Lambda invokes/s | Strong reads/s | Writes/s |
+|---|---:|---:|---:|---:|---:|
+| Sustained | 2,000 | 4,000 | 2,000 | 4,000 | 2,000 |
+| Peak | 20,000 | 40,000 | 20,000 | 40,000 | 20,000 |
 
 The default production profile caps the on-demand table at 30,000 reads and
-5,000 writes per second, leaves Lambda concurrency unreserved, and throttles
+8,000 writes per second, reserves 200 Lambda concurrency, and throttles
 `session.frame` at 4,000 messages per second with a 5,000-message burst. This
-profile fits the current default API Gateway throttle envelope.
-The live account's initial Lambda concurrency of 10 is enough to deploy but not
-to run the sustained acceptance target; obtain at least 200 before that test.
+profile leaves write headroom for connection, pairing, default, and disconnect
+routes alongside the frame limiter. Obtain at least 300 regional Lambda
+concurrency before deployment so the reservation can leave the service-required
+100 concurrency unreserved.
 
 The opt-in peak profile reserves 4,500 Lambda concurrency, pre-warms the table
-for 25,000 reads and 5,000 writes per second, and raises `session.frame` to
-25,000 messages per second with a 50,000-message burst. Enable it with CDK
-context `peakCapacity=true` only after AWS has approved at least 60,000 regional
-API Gateway requests per second and 6,000 regional Lambda concurrency, before
+for 60,000 reads and 30,000 writes per second, and raises `session.frame` to
+25,000 messages per second with a 50,000-message burst. The 20% headroom covers
+the route's two strong reads and one rate-limit write per frame. Enable it with
+CDK context `peakCapacity=true` only after AWS has approved at least 60,000
+regional API Gateway requests per second, 6,000 regional Lambda concurrency,
+60,000 DynamoDB reads per second, and 30,000 DynamoDB writes per second, before
 deployment. API Gateway counts inbound WebSocket requests and management
 callbacks against its regional throttle; current quotas are documented in the
 [API Gateway quota guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html).
@@ -54,7 +59,7 @@ Always refresh prices from the official [API Gateway](https://aws.amazon.com/api
 and [CloudWatch](https://aws.amazon.com/cloudwatch/pricing/) pages before making
 a purchasing decision. The reference profile below excludes free tiers, taxes,
 Internet transfer, lifecycle writes, DynamoDB storage and point-in-time
-recovery, CloudWatch alarms and log ingestion, investigation-only access logs,
+recovery, CloudWatch alarms and log ingestion (including default access logs),
 and the peak profile's one-time DynamoDB pre-warm charge.
 
 For `F` one-way frames and `C` connection-minutes:
@@ -64,6 +69,8 @@ WebSocket messages = 2F
 Lambda requests     = F
 Lambda GB-seconds   = F * configured_GB * measured_average_seconds
 DynamoDB read units = F                 (Session items must remain <= 4 KiB)
+                      + F               (Connection items must remain <= 4 KiB)
+DynamoDB write units = F                (Rate-limit items must remain <= 1 KiB)
 Connection minutes  = C
 ```
 
@@ -71,11 +78,11 @@ The reference workload is 1,000 pairs connected eight hours per day and 500
 control round trips per pair per day, over a 30-day month. At 256 MiB and a
 measured 30 ms average Lambda duration, that is 30 million one-way frames,
 60 million WebSocket messages, 30 million Lambda requests, 225,000 GB-seconds,
-30 million strong read units, and 28.8 million connection-minutes. At August
-2026 us-east-1 list prices, the components are approximately $60.00 for
-messages, $7.20 for connection-minutes, $6.00 for Lambda requests, $3.00 for
-Lambda compute, and $3.75 for DynamoDB reads: $79.95/month before the exclusions
-above.
+60 million strong read units, 30 million write units, and 28.8 million
+connection-minutes. At August 2026 us-east-1 list prices, the components are
+approximately $60.00 for messages, $7.20 for connection-minutes, $6.00 for
+Lambda requests, $3.00 for Lambda compute, $7.50 for DynamoDB reads, and $18.75
+for DynamoDB writes: $102.45/month before the exclusions above.
 
 The pre-redesign implementation used three WebSocket messages and six strong
 reads per frame, plus metered application-level keepalives, for an estimated
@@ -83,14 +90,19 @@ $146/month at the same workload. Recalculate either estimate from actual
 CloudWatch usage and Cost Explorer tags after every load test.
 
 Use native WebSocket ping/pong for keepalive; API Gateway documents control
-frames as unmetered. Production suppresses successful per-frame logs, detailed
-route metrics, and always-on access logs.
+frames as unmetered. Production suppresses successful per-frame logs and
+detailed route metrics. Metadata-only API Gateway access logs are enabled by
+default with seven-day retention; include their ingestion in the deployment
+budget.
 
-Each live session deliberately has one strongly read authority item so
-revocation is immediate. Clients cap themselves at 60 frames per second; the
-table throttle alarm catches an abusive single-session hot key. Add an edge
-per-session limiter only if authenticated abuse is observed, because a
-DynamoDB write limiter on every frame would cost more and scale worse.
+Each session frame strongly reads its current connection and session authority,
+then updates an endpoint-scoped one-minute rate bucket. The bucket enforces the
+documented 60-frame-per-second client cap, and a violating socket is physically
+disconnected. A frame whose authority read starts after replacement or
+revocation is rejected; an already-read callback may still arrive later and is
+discarded by the receiver's local revocation gate. Relay rejection,
+Lambda/DynamoDB throttle, Lambda error, and API execution alarms all notify the
+required production SNS topic.
 
 ## Scaling decision
 

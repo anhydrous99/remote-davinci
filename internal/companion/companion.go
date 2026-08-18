@@ -29,8 +29,11 @@ import (
 )
 
 const (
-	DefaultRelayURL = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
-	maxFrameBytes   = 32 * 1024
+	DefaultRelayURL          = "wss://t25ft375dj.execute-api.us-east-1.amazonaws.com/v1"
+	maxFrameBytes            = protocol.MaxWebSocketFrameBytes
+	maxPendingRelayResponses = 32
+	maxPendingRelayWireBytes = protocol.MaxWebSocketFrameBytes * protocol.MaxRelayReorderFrames
+	relayRequestTimeout      = 15 * time.Second
 )
 
 var Version = "0.1.0"
@@ -193,8 +196,9 @@ type wireEnvelope struct {
 }
 
 type relayPeer struct {
-	connection *websocket.Conn
-	pending    []json.RawMessage
+	connection   *websocket.Conn
+	pending      []json.RawMessage
+	pendingBytes int
 }
 
 type relayUpgradeError struct{ status int }
@@ -233,6 +237,9 @@ func (peer *relayPeer) close() {
 }
 
 func (peer *relayPeer) request(ctx context.Context, messageType string, body any, result any) error {
+	ctx, cancel := context.WithTimeout(ctx, relayRequestTimeout)
+	defer cancel()
+
 	id, err := randomUUID()
 	if err != nil {
 		return err
@@ -251,7 +258,9 @@ func (peer *relayPeer) request(ctx context.Context, messageType string, body any
 			return errors.New("relay returned an invalid response")
 		}
 		if envelope.ReplyTo != id {
-			peer.pending = append(peer.pending, append(json.RawMessage(nil), raw...))
+			if err := peer.queuePending(raw); err != nil {
+				return err
+			}
 			continue
 		}
 		if envelope.Type == "error" {
@@ -276,6 +285,17 @@ func (peer *relayPeer) request(ctx context.Context, messageType string, body any
 		}
 		return json.Unmarshal(success.Result, result)
 	}
+}
+
+func (peer *relayPeer) queuePending(raw json.RawMessage) error {
+	// pendingBytes counts complete on-wire JSON WebSocket message bytes. Keep it
+	// separate from the decoded payload-byte limit used by session reordering.
+	if len(peer.pending) >= maxPendingRelayResponses || peer.pendingBytes+len(raw) > maxPendingRelayWireBytes {
+		return errors.New("relay returned too many unmatched responses")
+	}
+	peer.pending = append(peer.pending, append(json.RawMessage(nil), raw...))
+	peer.pendingBytes += len(raw)
+	return nil
 }
 
 // RevokeEnrollment checkpoints the irreversible link revocation before making
@@ -490,7 +510,7 @@ if current != requested:
     current = resolve.GetCurrentPage()
 print(current or "")
 `
-		readback, err := output(commandContext, "/usr/bin/python3", "-c", script, page)
+		readback, err := output(commandContext, "/usr/bin/python3", "-I", "-c", script, page)
 		if err != nil || strings.TrimSpace(string(readback)) != page {
 			return nil, &operationError{code: "resolve.unavailable"}
 		}
@@ -596,7 +616,7 @@ func resolvePageMonitorRetryDelay(previous time.Duration, observed bool) time.Du
 }
 
 func runResolvePageMonitor(ctx context.Context, emit func(resolvePageObservation) error) error {
-	command := exec.CommandContext(ctx, "/usr/bin/python3", "-u", "-c", resolvePageMonitorScript)
+	command := exec.CommandContext(ctx, "/usr/bin/python3", "-I", "-u", "-c", resolvePageMonitorScript)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return err

@@ -87,6 +87,44 @@ func TestFileConfigStoreRoundTripUsesPrivatePermissions(t *testing.T) {
 	}
 }
 
+func TestFileConfigStoreRejectsUnsafeFiles(t *testing.T) {
+	config := validTestConfig(t)
+
+	t.Run("weak permissions", func(t *testing.T) {
+		store := FileConfigStore{Path: filepath.Join(t.TempDir(), "companion.json")}
+		if err := store.Save(config); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(store.Path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Load(); err == nil {
+			t.Fatal("loaded a configuration readable by other users")
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		directory := t.TempDir()
+		target := FileConfigStore{Path: filepath.Join(directory, "target.json")}
+		if err := target.Save(config); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(directory, "companion.json")
+		if err := os.Symlink(target.Path, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := (FileConfigStore{Path: link}).Load(); err == nil {
+			t.Fatal("loaded a configuration through a symlink")
+		}
+	})
+
+	t.Run("non-regular", func(t *testing.T) {
+		if _, err := (FileConfigStore{Path: t.TempDir()}).Load(); err == nil {
+			t.Fatal("loaded a configuration from a non-regular file")
+		}
+	})
+}
+
 func TestConfigStoresRejectOversizedConfiguration(t *testing.T) {
 	config := validTestConfig(t)
 	config.ControllerLabel = strings.Repeat("x", maxStoredConfigBytes)

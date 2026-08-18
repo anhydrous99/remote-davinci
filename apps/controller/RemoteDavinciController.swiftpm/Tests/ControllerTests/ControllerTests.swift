@@ -43,6 +43,64 @@ final class ControllerTests: XCTestCase {
         )
     }
 
+    func testEnrollmentRequestUsesExactFiveFieldV1WireAndPinsDeploymentRelay() throws {
+        let customRelay = "wss://relay.example/v1"
+        let (request, stored) = try Enrollment.create(
+            deviceLabel: "Test iPad",
+            relayURL: customRelay
+        )
+        XCTAssertEqual(stored.expectedRelayUrl, customRelay)
+        XCTAssertEqual(try Enrollment.request(for: stored), request)
+
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(request)
+        ) as? [String: Any])
+        XCTAssertEqual(
+            object.keys.sorted(),
+            [
+                "controllerCredentialHash",
+                "controllerEndpointId",
+                "controllerNoiseKey",
+                "deviceLabel",
+                "v",
+            ]
+        )
+    }
+
+    func testDeploymentRelayValidationAndReplacementPreserveOverride() throws {
+        let customRelay = "wss://relay.example/custom"
+        XCTAssertEqual(try Enrollment.deploymentRelayURL(nil), Enrollment.defaultRelayURL)
+        XCTAssertEqual(try Enrollment.deploymentRelayURL(customRelay), customRelay)
+        for invalid in [
+            "https://relay.example/v1",
+            "wss://user@relay.example/v1",
+            "wss://relay.example/v1?token=secret",
+            "wss://relay.example/v1#fragment",
+            "wss:///v1",
+        ] {
+            XCTAssertThrowsError(try Enrollment.deploymentRelayURL(invalid)) { error in
+                XCTAssertEqual(error as? EnrollmentError, .invalidRelay)
+            }
+            XCTAssertThrowsError(try Enrollment.create(deviceLabel: "Test iPad", relayURL: invalid))
+        }
+
+        let (request, stored) = try ControllerModel.replacementEnrollment(
+            deviceLabel: "Replacement iPad",
+            relayURL: customRelay
+        )
+        XCTAssertEqual(stored.expectedRelayUrl, customRelay)
+        XCTAssertEqual(try Enrollment.request(for: stored), request)
+    }
+
+    @MainActor
+    func testInvalidDeploymentOverrideFailsClosedWithoutClaimingLocalEnrollment() {
+        let model = ControllerModel(relayURL: "https://relay.example/v1")
+        XCTAssertFalse(model.hasLocalEnrollment)
+        XCTAssertFalse(model.isEnrolled)
+        XCTAssertTrue(model.enrollmentRequestJSON.isEmpty)
+        XCTAssertEqual(model.enrollmentStatus, EnrollmentError.invalidRelay.localizedDescription)
+    }
+
     func testEnrollmentResponseValidation() throws {
         let controllerID = "11111111-1111-4111-8111-111111111111"
         let controllerPrivate = Data(0..<32)
@@ -55,6 +113,7 @@ final class ControllerTests: XCTestCase {
             controllerSecret: Base64URL.encode(Data(repeating: 7, count: 32)),
             controllerNoisePrivateKey: Base64URL.encode(controllerPrivate),
             deviceLabel: "Test iPad",
+            expectedRelayUrl: "wss://example.execute-api.us-east-1.amazonaws.com/v1",
             response: nil
         )
         let response = EnrollmentResponse(
@@ -72,6 +131,43 @@ final class ControllerTests: XCTestCase {
 
         XCTAssertEqual(try Enrollment.importResponse(responseJSON, into: pending).response, response)
 
+        var legacy = pending
+        legacy.expectedRelayUrl = nil
+        legacy.response = response
+        let migrated = try Enrollment.migrateLegacy(
+            legacy,
+            deploymentRelayURL: Enrollment.defaultRelayURL
+        )
+        XCTAssertEqual(migrated.expectedRelayUrl, response.relayUrl)
+        XCTAssertEqual(try Enrollment.active(from: migrated).relayURL.absoluteString, response.relayUrl)
+        let effectiveRelay = try Enrollment.replacementRelayURL(
+            stored: migrated,
+            deploymentRelayURL: Enrollment.defaultRelayURL
+        )
+        XCTAssertEqual(effectiveRelay, response.relayUrl)
+        XCTAssertEqual(
+            try ControllerModel.replacementEnrollment(
+                deviceLabel: "Replacement iPad",
+                relayURL: effectiveRelay
+            ).1.expectedRelayUrl,
+            response.relayUrl
+        )
+
+        XCTAssertEqual(
+            try Enrollment.migrateLegacy(
+                pending,
+                deploymentRelayURL: "wss://ignored.example/v1"
+            ),
+            pending
+        )
+        XCTAssertEqual(
+            try Enrollment.replacementRelayURL(
+                stored: pending,
+                deploymentRelayURL: Enrollment.defaultRelayURL
+            ),
+            pending.expectedRelayUrl
+        )
+
         let wrongController = EnrollmentResponse(
             v: response.v,
             relayUrl: response.relayUrl,
@@ -86,6 +182,20 @@ final class ControllerTests: XCTestCase {
         )
         XCTAssertThrowsError(try Enrollment.importResponse(wrongJSON, into: pending)) { error in
             XCTAssertEqual(error as? EnrollmentError, .mismatchedController)
+        }
+        let wrongRelay = EnrollmentResponse(
+            v: response.v,
+            relayUrl: "wss://different.example/v1",
+            linkId: response.linkId,
+            controllerEndpointId: response.controllerEndpointId,
+            companionEndpointId: response.companionEndpointId,
+            companionNoiseKey: response.companionNoiseKey
+        )
+        XCTAssertThrowsError(try Enrollment.importResponse(
+            String(decoding: try JSONEncoder().encode(wrongRelay), as: UTF8.self),
+            into: pending
+        )) { error in
+            XCTAssertEqual(error as? EnrollmentError, .mismatchedRelay)
         }
         let insecureResponse = EnrollmentResponse(
             v: response.v,
@@ -290,6 +400,13 @@ final class ControllerTests: XCTestCase {
             from: Data(json.utf8)
         )
         XCTAssertNil(stored.linkRevocationConfirmed)
+        XCTAssertNil(stored.expectedRelayUrl)
+        stored = try Enrollment.migrateLegacy(
+            stored,
+            deploymentRelayURL: "wss://self-hosted.example/v1"
+        )
+        XCTAssertEqual(stored.expectedRelayUrl, "wss://self-hosted.example/v1")
+        XCTAssertNoThrow(try Enrollment.request(for: stored))
         stored.linkRevocationConfirmed = true
         XCTAssertEqual(
             try JSONDecoder().decode(
@@ -298,6 +415,34 @@ final class ControllerTests: XCTestCase {
             ).linkRevocationConfirmed,
             true
         )
+    }
+
+    func testInvalidActiveLegacyMigrationDoesNotProduceMutatedRecord() throws {
+        let (_, pending) = try Enrollment.create(
+            deviceLabel: "Legacy iPad",
+            relayURL: "wss://old.example/v1"
+        )
+        let companionPrivate = Curve25519.KeyAgreement.PrivateKey()
+        let invalidResponse = EnrollmentResponse(
+            v: 1,
+            relayUrl: "https://attacker.example/v1",
+            linkId: "22222222-2222-4222-8222-222222222222",
+            controllerEndpointId: pending.controllerEndpointId,
+            companionEndpointId: "33333333-3333-4333-8333-333333333333",
+            companionNoiseKey: Base64URL.encode(companionPrivate.publicKey.rawRepresentation)
+        )
+        var legacy = pending
+        legacy.expectedRelayUrl = nil
+        legacy.response = invalidResponse
+        let original = legacy
+
+        XCTAssertThrowsError(try Enrollment.migrateLegacy(
+            legacy,
+            deploymentRelayURL: Enrollment.defaultRelayURL
+        )) { error in
+            XCTAssertEqual(error as? EnrollmentError, .invalidResponse)
+        }
+        XCTAssertEqual(legacy, original)
     }
 
     func testRelayFramesBufferBoundedReorderingAndRejectDuplicates() throws {

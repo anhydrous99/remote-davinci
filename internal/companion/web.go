@@ -23,16 +23,18 @@ var uiHTML []byte
 const uiTokenHeader = "X-Remote-Davinci-Token"
 
 type App struct {
-	ctx      context.Context
-	store    ConfigStore
-	relayURL string
-	enrollMu sync.Mutex
-	mu       sync.RWMutex
-	config   *Config
-	status   RelayStatus
-	cancel   context.CancelFunc
-	uiToken  string
-	revoke   func(context.Context, Config, func(Config) error) error
+	ctx            context.Context
+	store          ConfigStore
+	relayURL       string
+	enrollMu       sync.Mutex
+	bootstrapMu    sync.Mutex
+	mu             sync.RWMutex
+	config         *Config
+	status         RelayStatus
+	cancel         context.CancelFunc
+	uiToken        string
+	bootstrapToken string
+	revoke         func(context.Context, Config, func(Config) error) error
 }
 
 type State struct {
@@ -72,10 +74,16 @@ func NewAppWithStore(ctx context.Context, store ConfigStore, relay string) (*App
 	if err != nil {
 		return nil, err
 	}
+	bootstrap, err := random32()
+	if err != nil {
+		return nil, err
+	}
 	app := &App{
 		ctx: ctx, store: store, relayURL: relay,
-		status:  RelayStatus{Message: "Not enrolled"},
-		uiToken: base64.RawURLEncoding.EncodeToString(token), revoke: RevokeEnrollment,
+		status:         RelayStatus{Message: "Not enrolled"},
+		uiToken:       base64.RawURLEncoding.EncodeToString(token),
+		bootstrapToken: base64.RawURLEncoding.EncodeToString(bootstrap),
+		revoke:         RevokeEnrollment,
 	}
 	config, err := store.Load()
 	if err == nil {
@@ -95,7 +103,9 @@ func NewAppWithStore(ctx context.Context, store ConfigStore, relay string) (*App
 	return app, nil
 }
 
-func (app *App) LaunchURL(base string) string { return base + "?token=" + app.uiToken }
+func (app *App) NativeLaunchURL(base string) string { return base + "?token=" + app.uiToken }
+
+func (app *App) BrowserLaunchURL(base string) string { return base + "/?bootstrap=" + app.bootstrapToken }
 
 func (app *App) Close() {
 	app.mu.Lock()
@@ -170,9 +180,7 @@ func (app *App) Handler() http.Handler {
 			return
 		}
 		if len(request.URL.Path) >= 5 && request.URL.Path[:5] == "/api/" {
-			expected := sha256.Sum256([]byte(app.uiToken))
-			provided := sha256.Sum256([]byte(request.Header.Get(uiTokenHeader)))
-			if app.uiToken == "" || subtle.ConstantTimeCompare(expected[:], provided[:]) != 1 {
+			if !app.validUIToken(request.Header.Get(uiTokenHeader)) {
 				http.Error(response, "forbidden", http.StatusForbidden)
 				return
 			}
@@ -193,7 +201,40 @@ func (app *App) Handler() http.Handler {
 	})
 }
 
-func (app *App) handleIndex(response http.ResponseWriter, _ *http.Request) {
+func (app *App) validUIToken(token string) bool {
+	expected := sha256.Sum256([]byte(app.uiToken))
+	provided := sha256.Sum256([]byte(token))
+	return app.uiToken != "" && subtle.ConstantTimeCompare(expected[:], provided[:]) == 1
+}
+
+func (app *App) consumeBootstrap(token string) bool {
+	app.bootstrapMu.Lock()
+	defer app.bootstrapMu.Unlock()
+	if app.bootstrapToken == "" {
+		return false
+	}
+	expected := sha256.Sum256([]byte(app.bootstrapToken))
+	provided := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(expected[:], provided[:]) != 1 {
+		return false
+	}
+	app.bootstrapToken = ""
+	return true
+}
+
+func (app *App) handleIndex(response http.ResponseWriter, request *http.Request) {
+	if request.URL.RawQuery != "" {
+		query := request.URL.Query()
+		bootstrap := query["bootstrap"]
+		if len(query) != 1 || len(bootstrap) != 1 || !app.consumeBootstrap(bootstrap[0]) {
+			http.Error(response, "forbidden", http.StatusForbidden)
+			return
+		}
+		token, _ := json.Marshal(app.uiToken)
+		response.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = response.Write([]byte(`<!doctype html><meta charset="utf-8"><script>sessionStorage.setItem('remote-davinci-token', ` + string(token) + `); location.replace('/');</script>`))
+		return
+	}
 	response.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = response.Write(uiHTML)
 }

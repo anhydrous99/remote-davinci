@@ -18,9 +18,8 @@ is not release readiness.
 - Never copy enrollment JSON, bearer headers, Noise keys, ciphertext, or the
   companion launch token into test evidence or shared logs. The native app
   captures the helper's launch record privately. The development CLI
-  necessarily prints its launch-scoped tokenized URL to the local console;
-  capture it privately and record only stable operation/error codes and
-  pass/fail results.
+  prints a single-use browser-bootstrap URL to the local console; capture it
+  privately and record only stable operation/error codes and pass/fail results.
 - Give every test a timeout. Do not replay commands into a replacement session.
 - Use a uniquely named disposable Resolve project. Delete only that exact
   project after closing it.
@@ -76,15 +75,18 @@ Coverage required:
 
 - Rendezvous/control schema validation and frame byte limits.
 - Official Noise IK interoperability vector and peer-static-key validation.
-- Enrollment response validation and device-only Keychain coding.
+- Enrollment response validation, exact request/response relay binding, relay
+  mismatch rejection, and device-only Keychain coding.
 - Eight-frame/128 KiB bounded reordering, contiguous drain, and rejection of
   duplicates, stale sequences, oversized gaps, and oversized payloads.
 - One-command-in-flight, expiration, deduplication, and late-response handling.
 - Four fixed Resolve page mappings, initial/change-only page observation,
   unsupported-page handling, and no request echo from an inbound page event.
 - Full-jitter reconnect ceiling, randomized connection rotation, and no replay.
-- Config atomic write, mode `0600`, localhost token, Host/Origin/media-type
-  checks, reset checkpoints, and stale callback protection.
+- Config atomic write, mode `0600`, rejection of symlink/non-regular/weak-mode
+  files, standalone insecure-storage opt-in, one-time browser bootstrap,
+  localhost token, Host/Origin/media-type checks, reset checkpoints, and stale
+  callback protection.
 - Native readiness validation, terminal startup errors, parent-death shutdown,
   bounded helper restart, and verified file-to-Keychain migration.
 - CDK synthesis assertions for routes, permissions, retention, TTL, alarms,
@@ -116,9 +118,9 @@ log, accidental enabled control, or unconfirmed destructive action.
 ## Phase 3: disposable relay deployment
 
 Deploy the exact CDK synthesis under test as `RemoteDavinci-dev`. If WebSocket
-access logging is enabled, first configure the account-level API Gateway
-CloudWatch Logs role; otherwise explicitly set `accessLogs=false` for the
-disposable test stack.
+access logging is enabled (the default), first configure the account-level API
+Gateway CloudWatch Logs role. Set `accessLogs=false` only as an explicit
+exception for the disposable test stack.
 
 Verify:
 
@@ -167,8 +169,18 @@ Lambda, API, or terminal output.
 
 Build a signed native app with the same identity intended for release and cold
 launch it. Separately start the development CLI with a temporary config path
-when direct HTTP boundary probing is required, and capture its launch URL
-privately.
+when direct HTTP boundary probing is required:
+
+```sh
+go run ./cmd/companion -config /absolute/private/temp/companion.json -allow-insecure-file-config
+```
+
+For a confirmed disposable or self-hosted relay, set the same canonical
+`REMOTE_DAVINCI_RELAY_URL` in the controller and companion Xcode launch
+environments before creating either side's enrollment. Omit it when testing the
+default production relay.
+
+Capture its single-use bootstrap URL privately.
 
 Verify:
 
@@ -191,8 +203,10 @@ Verify:
   reset. A failed reset retains credentials and restores the relay connection.
 - Once link revocation is durably checkpointed, endpoint revocation is
   best-effort and a lost endpoint acknowledgment cannot strand local cleanup.
-- Beyond the one local startup URL, the launch token does not enter application
-  logs or error bodies; config secrets and enrollment material never do.
+- The CLI bootstrap succeeds once, replay fails, and the API token delivered to
+  port-scoped session storage does not enter the process arguments, startup
+  URL, application logs, or error bodies; config secrets and enrollment
+  material never do.
 - A corrupt temporary config fails closed before the GUI or native API binds.
   Recovery is an explicit move-aside of that exact file and a fresh enrollment;
   record that the old remote identity may remain.
@@ -203,10 +217,14 @@ mutate the host, and every supported runtime failure leaves a recoverable state.
 ## Phase 6: physical-device live matrix
 
 Repeat the manual enrollment ceremony separately on an iPhone and iPad using
-fresh endpoints. For each device:
+fresh endpoints. This test operator, with both devices unlocked and under direct
+control, is the authenticated channel: the shipped apps do not run PAKE or
+negotiate granular grants. For each device:
 
-1. Confirm controller request details on the trusted Mac and import the returned
-   response only on the originating device.
+1. Confirm the controller's locally selected relay matches the trusted Mac's
+   configured relay and import the returned response only on the originating
+   device. Tamper the response relay once and require rejection before importing
+   the untampered response.
 2. Connect and verify both sides report a secure session and matching peer.
 3. Tap each page tab and use the host mute control once. Require remote actions
    to remain unavailable while disconnected or handshaking, and page commands

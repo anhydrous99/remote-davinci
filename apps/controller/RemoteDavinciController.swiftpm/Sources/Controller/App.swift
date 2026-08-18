@@ -1,10 +1,13 @@
 import ControllerCore
+import Foundation
 import SwiftUI
 
 @main
 struct RemoteDavinciControllerApp: App {
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var model = ControllerModel()
+    @StateObject private var model = ControllerModel(
+        relayURL: ProcessInfo.processInfo.environment["REMOTE_DAVINCI_RELAY_URL"]
+    )
 
     var body: some Scene {
         WindowGroup {

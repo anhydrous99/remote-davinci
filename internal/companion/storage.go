@@ -63,11 +63,25 @@ func SaveConfig(path string, config Config) error {
 }
 
 func (store FileConfigStore) Load() (Config, error) {
+	pathInfo, err := os.Lstat(store.Path)
+	if err != nil {
+		return Config{}, err
+	}
+	if !pathInfo.Mode().IsRegular() || pathInfo.Mode().Perm()&0o077 != 0 {
+		return Config{}, errors.New("refusing insecure companion configuration file")
+	}
 	file, err := os.Open(store.Path)
 	if err != nil {
 		return Config{}, err
 	}
 	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return Config{}, err
+	}
+	if !openedInfo.Mode().IsRegular() || openedInfo.Mode().Perm()&0o077 != 0 || !os.SameFile(pathInfo, openedInfo) {
+		return Config{}, errors.New("refusing insecure companion configuration file")
+	}
 	data, err := io.ReadAll(io.LimitReader(file, maxStoredConfigBytes+1))
 	if err != nil {
 		return Config{}, err

@@ -14,6 +14,7 @@ import (
 type storageDynamo struct {
 	items        map[string]map[string]types.AttributeValue
 	reads        int
+	updates      []*dynamodb.UpdateItemInput
 	transactions []*dynamodb.TransactWriteItemsInput
 	getItem      func(*dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error)
 	updateItem   func(*dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error)
@@ -29,6 +30,7 @@ func (d *storageDynamo) GetItem(_ context.Context, input *dynamodb.GetItemInput,
 }
 
 func (d *storageDynamo) UpdateItem(_ context.Context, input *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	d.updates = append(d.updates, input)
 	if d.updateItem != nil {
 		return d.updateItem(input)
 	}
@@ -58,6 +60,22 @@ func storageItem(t *testing.T, kind, id string, value any) map[string]types.Attr
 
 func storageUUID(value string) string { return "00000000-0000-4000-8000-" + value }
 
+func storageReason(code string) types.CancellationReason {
+	return types.CancellationReason{Code: &code}
+}
+
+func storageCancellationReasons(size int, overrides map[int]string) []types.CancellationReason {
+	reasons := make([]types.CancellationReason, size)
+	for index := range reasons {
+		code := "None"
+		if override, ok := overrides[index]; ok {
+			code = override
+		}
+		reasons[index] = storageReason(code)
+	}
+	return reasons
+}
+
 func TestConditionalFailureInspectsTransactionCancellationReasons(t *testing.T) {
 	reason := func(code string) types.CancellationReason { return types.CancellationReason{Code: &code} }
 	for _, test := range []struct {
@@ -74,6 +92,29 @@ func TestConditionalFailureInspectsTransactionCancellationReasons(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			if got := conditionalFailure(test.err); got != test.matched {
 				t.Fatalf("conditionalFailure() = %t, want %t", got, test.matched)
+			}
+		})
+	}
+}
+
+func TestTransactionConditionalFailureAtInspectsRequestedMember(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		err     error
+		index   int
+		matched bool
+	}{
+		{"requested member", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{4: "ConditionalCheckFailed"})}, 4, true},
+		{"requested and other conditions", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{0: "ConditionalCheckFailed", 4: "ConditionalCheckFailed"})}, 4, true},
+		{"different member", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{0: "ConditionalCheckFailed"})}, 4, false},
+		{"condition and throttle", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{1: "ThrottlingError", 4: "ConditionalCheckFailed"})}, 4, false},
+		{"missing reasons", &types.TransactionCanceledException{}, 4, false},
+		{"direct condition", &types.ConditionalCheckFailedException{}, 0, false},
+		{"out of range", &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(1, map[int]string{0: "ConditionalCheckFailed"})}, 1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := transactionConditionalFailureAt(test.err, test.index); got != test.matched {
+				t.Fatalf("transactionConditionalFailureAt() = %t, want %t", got, test.matched)
 			}
 		})
 	}
@@ -127,6 +168,20 @@ func TestPairAndSessionHotPathsEachUseOneStrongRead(t *testing.T) {
 	}
 }
 
+func TestConnectionAuthorityUsesOneStrongRecordRead(t *testing.T) {
+	connection := Connection{
+		ConnectionID: "controller", AuthMode: "endpoint", EndpointID: storageUUID("000000000006"),
+		SourceKey: "source", ConnectedAt: 1, ExpiresAt: 1_000,
+	}
+	db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
+		"CONNECTION#controller": storageItem(t, "connection", "controller", connection),
+	}}
+	got, err := NewDynamoStore("table", db).Connection(context.Background(), "controller", 100)
+	if err != nil || got.EndpointID != connection.EndpointID || db.reads != 1 {
+		t.Fatalf("connection = %#v, reads = %d, error = %v", got, db.reads, err)
+	}
+}
+
 func TestEndpointWriteIsConditionalUpsert(t *testing.T) {
 	endpoint := Endpoint{
 		EndpointID: storageUUID("000000000005"), CredentialHash: "hash", Role: protocol.Controller,
@@ -150,6 +205,21 @@ func TestEndpointWriteIsConditionalUpsert(t *testing.T) {
 		if !strings.Contains(condition, clause) {
 			t.Fatalf("condition does not contain %q: %s", clause, condition)
 		}
+	}
+}
+
+func TestRotateEndpointFencesExpectedConnection(t *testing.T) {
+	db := &storageDynamo{updateItem: func(input *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+		if !strings.Contains(*input.ConditionExpression, "connectionId = :connectionId") ||
+			input.ExpressionAttributeValues[":connectionId"].(*types.AttributeValueMemberS).Value != "old" {
+			t.Fatalf("rotate condition = %#v", input)
+		}
+		return nil, &types.ConditionalCheckFailedException{}
+	}}
+	err := NewDynamoStore("table", db).RotateEndpoint(context.Background(), storageUUID("000000000007"), "old", strings.Repeat("a", 43), 100)
+	var service *ServiceError
+	if !errors.As(err, &service) || service.Code != protocol.Unauthenticated {
+		t.Fatalf("error = %#v", err)
 	}
 }
 
@@ -202,8 +272,8 @@ func TestCloseSessionAtomicallyClearsRoutePointers(t *testing.T) {
 		Status: "ACTIVE", CreatedAt: 1, ExpiresAt: 1000,
 	}
 	link := Link{LinkID: linkID, ControllerID: controllerID, CompanionID: companionID, Status: "ACTIVE", ActiveSessionID: sessionID, CreatedAt: 1}
-	controller := Endpoint{EndpointID: controllerID, ActiveSessionID: sessionID, CreatedAt: 1, UpdatedAt: 1}
-	companion := Endpoint{EndpointID: companionID, ActiveSessionID: sessionID, CreatedAt: 1, UpdatedAt: 1}
+	controller := Endpoint{EndpointID: controllerID, ConnectionID: "controller", ActiveSessionID: sessionID, CreatedAt: 1, UpdatedAt: 1}
+	companion := Endpoint{EndpointID: companionID, ConnectionID: "companion", ActiveSessionID: sessionID, CreatedAt: 1, UpdatedAt: 1}
 	db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
 		"SESSION#" + sessionID:     storageItem(t, "session", sessionID, session),
 		"LINK#" + linkID:           storageItem(t, "link", linkID, link),
@@ -211,7 +281,7 @@ func TestCloseSessionAtomicallyClearsRoutePointers(t *testing.T) {
 		"ENDPOINT#" + companionID:  storageItem(t, "endpoint", companionID, companion),
 	}}
 	store := NewDynamoStore("table", db)
-	result, err := store.CloseSession(context.Background(), sessionID, controllerID, 100)
+	result, err := store.CloseSession(context.Background(), sessionID, controllerID, "controller", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,6 +290,12 @@ func TestCloseSessionAtomicallyClearsRoutePointers(t *testing.T) {
 	}
 	if got := len(db.transactions[0].TransactItems); got != 4 {
 		t.Fatalf("transaction actions = %d", got)
+	}
+	for _, operation := range db.transactions[0].TransactItems {
+		if operation.Update != nil && storagePK(operation.Update.Key) == "ENDPOINT#"+controllerID &&
+			!strings.Contains(*operation.Update.ConditionExpression, "connectionId = :connectionId") {
+			t.Fatalf("close authority condition = %s", *operation.Update.ConditionExpression)
+		}
 	}
 }
 
@@ -410,7 +486,7 @@ func TestPairingDisconnectAtomicallyCancelsOwnedPair(t *testing.T) {
 	}
 }
 
-func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
+func pairActivationFixture() (string, Pair, PairCommit) {
 	pairID := storageUUID("000000000036")
 	linkID := storageUUID("000000000037")
 	aID, bID := storageUUID("000000000038"), storageUUID("000000000039")
@@ -428,8 +504,13 @@ func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
 		PairID: pairID, Locator: "123456", Status: "HALF_COMMITTED",
 		SideA:   PairSide{ConnectionID: "a", SideID: a.SideID},
 		SideB:   &PairSide{ConnectionID: "b", SideID: b.SideID},
-		CommitA: &a, ExpiresAt: 1_000,
+		CommitA: &a, ExpiresAt: 200_000,
 	}
+	return pairID, pair, b
+}
+
+func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
+	pairID, pair, b := pairActivationFixture()
 	db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
 		"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
 	}}
@@ -437,7 +518,7 @@ func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
 	if err != nil || result.Link == nil || result.Pair.Status != "ACTIVE" {
 		t.Fatalf("result = %#v, error = %v", result, err)
 	}
-	if len(db.transactions) != 1 || len(db.transactions[0].TransactItems) != 4 {
+	if len(db.transactions) != 1 || len(db.transactions[0].TransactItems) != 5 {
 		t.Fatalf("transactions = %#v", db.transactions)
 	}
 	update := db.transactions[0].TransactItems[0].Update
@@ -449,6 +530,113 @@ func TestOppositeCommitActivatesWithoutVersionField(t *testing.T) {
 			t.Fatalf("activation condition missing %q: %s", clause, *update.ConditionExpression)
 		}
 	}
+}
+
+func TestPairActivationUsesGlobalDailyCircuitBreaker(t *testing.T) {
+	pairID, pair, b := pairActivationFixture()
+	db := &storageDynamo{
+		items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
+		},
+		transact: func(input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			if len(input.TransactItems) != 5 {
+				t.Fatalf("transaction = %#v", input.TransactItems)
+			}
+			rate := input.TransactItems[4].Update
+			if rate == nil || storagePK(rate.Key) != "RATE#global#pair.activate#1" ||
+				rate.ExpressionAttributeValues[":limit"].(*types.AttributeValueMemberN).Value != "10000" ||
+				rate.ExpressionAttributeValues[":expiresAt"].(*types.AttributeValueMemberN).Value != "259200" ||
+				*rate.UpdateExpression != "SET expiresAt = :expiresAt ADD #count :one" ||
+				*rate.ConditionExpression != "attribute_not_exists(#count) OR #count < :limit" {
+				t.Fatalf("daily rate update = %#v", rate)
+			}
+			return nil, &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(5, map[int]string{4: "ConditionalCheckFailed"})}
+		},
+	}
+	_, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 90_000)
+	var service *ServiceError
+	if !errors.As(err, &service) || service.Code != protocol.RateLimited || service.RetryAfterMS == nil || *service.RetryAfterMS != 3_600_000 {
+		t.Fatalf("error = %#v", err)
+	}
+	if len(db.updates) != 0 || len(db.transactions) != 1 {
+		t.Fatalf("updates = %d, transactions = %d", len(db.updates), len(db.transactions))
+	}
+}
+
+func TestPairActivationMapsNonQuotaConditionToConflict(t *testing.T) {
+	pairID, pair, b := pairActivationFixture()
+	db := &storageDynamo{
+		items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
+		},
+		transact: func(input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			return nil, &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(len(input.TransactItems), map[int]string{0: "ConditionalCheckFailed"})}
+		},
+	}
+	_, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+	var service *ServiceError
+	if !errors.As(err, &service) || service.Code != protocol.Conflict || !service.Retryable {
+		t.Fatalf("error = %#v", err)
+	}
+	if len(db.updates) != 0 || len(db.transactions) != 1 {
+		t.Fatalf("updates = %d, transactions = %d", len(db.updates), len(db.transactions))
+	}
+}
+
+func TestPairActivationPreservesMixedOperationalCancellation(t *testing.T) {
+	pairID, pair, b := pairActivationFixture()
+	db := &storageDynamo{
+		items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
+		},
+		transact: func(input *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			return nil, &types.TransactionCanceledException{CancellationReasons: storageCancellationReasons(len(input.TransactItems), map[int]string{
+				1: "ThrottlingError", len(input.TransactItems) - 1: "ConditionalCheckFailed",
+			})}
+		},
+	}
+	_, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+	var service *ServiceError
+	if errors.As(err, &service) {
+		t.Fatalf("mixed cancellation mapped to service error = %#v", service)
+	}
+	var cancelled *types.TransactionCanceledException
+	if !errors.As(err, &cancelled) {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestPairActivationQuotaSkipsNonActivationCommits(t *testing.T) {
+	t.Run("first commit", func(t *testing.T) {
+		pairID, pair, b := pairActivationFixture()
+		pair.Status, pair.CommitA = "READY", nil
+		db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID: storageItem(t, "pair", pairID, pair),
+		}}
+		result, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+		if err != nil || result.Link != nil || result.Pair.Status != "HALF_COMMITTED" {
+			t.Fatalf("result = %#v, error = %v", result, err)
+		}
+		if len(db.updates) != 1 || storagePK(db.updates[0].Key) != "PAIR#"+pairID || len(db.transactions) != 0 {
+			t.Fatalf("updates = %#v, transactions = %#v", db.updates, db.transactions)
+		}
+	})
+
+	t.Run("active retry", func(t *testing.T) {
+		pairID, pair, b := pairActivationFixture()
+		pair.Status, pair.CommitB = "ACTIVE", &b
+		db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
+			"PAIR#" + pairID:   storageItem(t, "pair", pairID, pair),
+			"LINK#" + b.LinkID: storageItem(t, "link", b.LinkID, Link{LinkID: b.LinkID, Status: "ACTIVE"}),
+		}}
+		result, err := NewDynamoStore("table", db).CommitPair(context.Background(), pairID, b, 100)
+		if err != nil || result.Link == nil || result.Link.LinkID != b.LinkID {
+			t.Fatalf("result = %#v, error = %v", result, err)
+		}
+		if len(db.updates) != 0 || len(db.transactions) != 0 {
+			t.Fatalf("updates = %#v, transactions = %#v", db.updates, db.transactions)
+		}
+	})
 }
 
 func TestPairCancellationLosesToConcurrentActivation(t *testing.T) {
@@ -495,13 +683,13 @@ func TestLinkRevokeAtomicallyClosesActiveSession(t *testing.T) {
 		}),
 		"SESSION#" + sessionID: storageItem(t, "session", sessionID, session),
 		"ENDPOINT#" + controllerID: storageItem(t, "endpoint", controllerID, Endpoint{
-			EndpointID: controllerID, ActiveSessionID: sessionID,
+			EndpointID: controllerID, ConnectionID: "controller", ActiveSessionID: sessionID,
 		}),
 		"ENDPOINT#" + companionID: storageItem(t, "endpoint", companionID, Endpoint{
-			EndpointID: companionID, ActiveSessionID: sessionID,
+			EndpointID: companionID, ConnectionID: "companion", ActiveSessionID: sessionID,
 		}),
 	}}
-	result, err := NewDynamoStore("table", db).RevokeLink(context.Background(), linkID, controllerID, 100)
+	result, err := NewDynamoStore("table", db).RevokeLink(context.Background(), linkID, controllerID, "controller", 100)
 	if err != nil || result.Link.Status != "REVOKED" || result.Session == nil || !result.Session.ClosedNow {
 		t.Fatalf("result = %#v, error = %v", result, err)
 	}
@@ -516,10 +704,36 @@ func TestLinkRevokeAtomicallyClosesActiveSession(t *testing.T) {
 		if operation.Update == nil || !want[storagePK(operation.Update.Key)] {
 			t.Fatalf("unexpected operation %#v", operation)
 		}
+		if storagePK(operation.Update.Key) == "ENDPOINT#"+controllerID &&
+			!strings.Contains(*operation.Update.ConditionExpression, "connectionId = :connectionId") {
+			t.Fatalf("revoke authority condition = %s", *operation.Update.ConditionExpression)
+		}
 		delete(want, storagePK(operation.Update.Key))
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing targets = %v", want)
+	}
+}
+
+func TestLinkRevokeWithoutSessionStillFencesConnection(t *testing.T) {
+	controllerID, companionID := storageUUID("000000000067"), storageUUID("000000000068")
+	linkID := storageUUID("000000000069")
+	db := &storageDynamo{items: map[string]map[string]types.AttributeValue{
+		"ENDPOINT#" + controllerID: storageItem(t, "endpoint", controllerID, Endpoint{
+			EndpointID: controllerID, ConnectionID: "controller",
+		}),
+		"LINK#" + linkID: storageItem(t, "link", linkID, Link{
+			LinkID: linkID, ControllerID: controllerID, CompanionID: companionID, Status: "ACTIVE",
+		}),
+	}}
+	if _, err := NewDynamoStore("table", db).RevokeLink(context.Background(), linkID, controllerID, "controller", 100); err != nil {
+		t.Fatal(err)
+	}
+	transaction := db.transactions[0].TransactItems
+	if len(transaction) != 2 || transaction[1].ConditionCheck == nil ||
+		storagePK(transaction[1].ConditionCheck.Key) != "ENDPOINT#"+controllerID ||
+		!strings.Contains(*transaction[1].ConditionCheck.ConditionExpression, "connectionId = :connectionId") {
+		t.Fatalf("transaction = %#v", transaction)
 	}
 }
 
@@ -541,14 +755,44 @@ func TestEndpointRevokeClosesOneActiveRouteInConstantWork(t *testing.T) {
 		"ENDPOINT#" + companionID:  storageItem(t, "endpoint", companionID, companion),
 	}}
 	store := NewDynamoStore("table", db)
-	result, err := store.RevokeEndpoint(context.Background(), controllerID, 100)
+	result, err := store.RevokeEndpoint(context.Background(), controllerID, "controller", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Session == nil || !result.Session.ClosedNow || result.Endpoint.RevokedAt != 100 {
 		t.Fatalf("result = %#v", result)
 	}
-	if got := len(db.transactions[0].TransactItems); got != 4 {
+	if got := len(db.transactions[0].TransactItems); got != 5 {
 		t.Fatalf("transaction actions = %d", got)
+	}
+	transaction := db.transactions[0].TransactItems
+	if !strings.Contains(*transaction[0].Update.ConditionExpression, "connectionId = :connectionId") ||
+		transaction[1].Delete == nil || storagePK(transaction[1].Delete.Key) != "CONNECTION#controller" {
+		t.Fatalf("endpoint revoke fence = %#v", transaction[:2])
+	}
+}
+
+func TestEndpointRevokeLosesToConnectionReplacement(t *testing.T) {
+	endpointID := storageUUID("000000000066")
+	replaced := false
+	db := &storageDynamo{
+		getItem: func(input *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
+			connectionID := "old"
+			if replaced {
+				connectionID = "new"
+			}
+			return &dynamodb.GetItemOutput{Item: storageItem(t, "endpoint", endpointID, Endpoint{
+				EndpointID: endpointID, ConnectionID: connectionID,
+			})}, nil
+		},
+		transact: func(*dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+			replaced = true
+			return nil, &types.ConditionalCheckFailedException{}
+		},
+	}
+	_, err := NewDynamoStore("table", db).RevokeEndpoint(context.Background(), endpointID, "old", 100)
+	var service *ServiceError
+	if !errors.As(err, &service) || service.Code != protocol.Unauthenticated || len(db.transactions) != 1 {
+		t.Fatalf("transactions = %d, error = %#v", len(db.transactions), err)
 	}
 }

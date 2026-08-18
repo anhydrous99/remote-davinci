@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -119,13 +120,13 @@ func TestResolvePageOperationsRequireAuthoritativeReadback(t *testing.T) {
 			called := false
 			result, err := executeOperation(t.Context(), "resolve.page."+page, func(_ context.Context, name string, args ...string) ([]byte, error) {
 				called = true
-				if name != "/usr/bin/python3" || len(args) != 3 || args[0] != "-c" || args[2] != page {
+				if name != "/usr/bin/python3" || len(args) != 4 || args[0] != "-I" || args[1] != "-c" || args[3] != page {
 					t.Fatalf("command = %s %#v", name, args)
 				}
-				get := strings.Index(args[1], "current = resolve.GetCurrentPage()")
-				guard := strings.Index(args[1], "if current != requested:")
-				open := strings.Index(args[1], "resolve.OpenPage(requested)")
-				readback := strings.LastIndex(args[1], "current = resolve.GetCurrentPage()")
+				get := strings.Index(args[2], "current = resolve.GetCurrentPage()")
+				guard := strings.Index(args[2], "if current != requested:")
+				open := strings.Index(args[2], "resolve.OpenPage(requested)")
+				readback := strings.LastIndex(args[2], "current = resolve.GetCurrentPage()")
 				if get < 0 || guard <= get || open <= guard || readback <= open {
 					t.Fatal("Resolve command does not short-circuit and read back the selected page")
 				}
@@ -544,6 +545,48 @@ func TestEnrollmentValidationRejectsNonCanonicalCredentials(t *testing.T) {
 	}
 }
 
+func TestEnrollmentRequestV1WireIsExactlyFiveFields(t *testing.T) {
+	secret := sha256.Sum256(bytes.Repeat([]byte{1}, 32))
+	key, err := noise.DH25519.GenerateKeypair(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := EnrollmentRequest{
+		V: 1, ControllerEndpointID: testControllerID,
+		ControllerCredentialHash: base64.RawURLEncoding.EncodeToString(secret[:]),
+		ControllerNoiseKey:       base64.RawURLEncoding.EncodeToString(key.Public),
+		DeviceLabel:              "Staggered controller",
+	}
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"controllerCredentialHash", "controllerEndpointId", "controllerNoiseKey", "deviceLabel", "v"}
+	got := make([]string, 0, len(wire))
+	for key := range wire {
+		got = append(got, key)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("enrollment request fields = %v, want %v", got, want)
+	}
+	if _, err := ParseEnrollmentRequest(raw); err != nil {
+		t.Fatalf("five-field V1 request rejected: %v", err)
+	}
+	wire["relayUrl"] = json.RawMessage(`"wss://relay.example/v1"`)
+	sixField, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseEnrollmentRequest(sixField); err == nil {
+		t.Fatal("accepted a non-V1 sixth enrollment field")
+	}
+}
+
 func TestProvisionCompletesRelayPairing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -742,7 +785,7 @@ func TestProvisionCompletesRelayPairing(t *testing.T) {
 	if err := config.validate(); err != nil {
 		t.Fatal(err)
 	}
-	if config.RelayURL != relay || config.LinkID != enrollment.LinkID || config.EndpointID != enrollment.CompanionEndpointID ||
+	if config.RelayURL != relay || enrollment.RelayURL != relay || config.LinkID != enrollment.LinkID || config.EndpointID != enrollment.CompanionEndpointID ||
 		config.ControllerEndpointID != testControllerID || enrollment.ControllerEndpointID != testControllerID ||
 		config.ControllerNoiseKey != request.ControllerNoiseKey || config.ControllerLabel != request.DeviceLabel {
 		t.Fatalf("inconsistent provision result: config = %#v, enrollment = %#v", config, enrollment)
@@ -785,7 +828,7 @@ func TestGUIRejectsDNSRebinding(t *testing.T) {
 	}
 }
 
-func TestGUIRequiresLaunchScopedTokenForAPIs(t *testing.T) {
+func TestGUIUsesOneTimeBrowserBootstrapAndLaunchScopedToken(t *testing.T) {
 	first, err := NewApp(t.Context(), filepath.Join(t.TempDir(), "first.json"), DefaultRelayURL)
 	if err != nil {
 		t.Fatal(err)
@@ -800,12 +843,34 @@ func TestGUIRequiresLaunchScopedTokenForAPIs(t *testing.T) {
 	if err != nil || len(decoded) != 32 || first.uiToken == second.uiToken {
 		t.Fatalf("launch tokens are not independent 32-byte values")
 	}
-	if launchURL := first.LaunchURL("http://127.0.0.1:7314"); !strings.Contains(launchURL, "?token="+first.uiToken) {
-		t.Fatalf("launch URL does not carry the UI token: %s", launchURL)
+	bootstrap := first.bootstrapToken
+	decodedBootstrap, err := base64.RawURLEncoding.DecodeString(bootstrap)
+	if err != nil || len(decodedBootstrap) != 32 || bootstrap == first.uiToken {
+		t.Fatalf("browser bootstrap is not an independent 32-byte value")
+	}
+	baseURL := "http://127.0.0.1:7314"
+	if launchURL := first.NativeLaunchURL(baseURL); !strings.Contains(launchURL, "?token="+first.uiToken) {
+		t.Fatalf("native launch URL does not carry the private-pipe UI token: %s", launchURL)
+	}
+	browserURL := first.BrowserLaunchURL(baseURL)
+	if strings.Contains(browserURL, first.uiToken) || !strings.Contains(browserURL, "?bootstrap="+bootstrap) {
+		t.Fatalf("browser launch URL exposes the UI token or omits the bootstrap: %s", browserURL)
+	}
+	request := httptest.NewRequest(http.MethodGet, browserURL, nil)
+	response := httptest.NewRecorder()
+	first.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), first.uiToken) {
+		t.Fatalf("bootstrap status = %d, body = %s", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, browserURL, nil)
+	response = httptest.NewRecorder()
+	first.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("replayed bootstrap status = %d, want %d", response.Code, http.StatusForbidden)
 	}
 
-	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7314/api/state", nil)
-	response := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7314/api/state", nil)
+	response = httptest.NewRecorder()
 	first.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("tokenless API status = %d, want %d", response.Code, http.StatusForbidden)
@@ -817,6 +882,61 @@ func TestGUIRequiresLaunchScopedTokenForAPIs(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("authorized API status = %d, body = %s", response.Code, response.Body.String())
 	}
+}
+
+func TestRelayPendingResponsesAreBounded(t *testing.T) {
+	peer := &relayPeer{}
+	small := validPendingServerFrame(t, 1, 1)
+	for range maxPendingRelayResponses {
+		if err := peer.queuePending(small); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.queuePending(small); err == nil {
+		t.Fatal("accepted too many unmatched relay responses")
+	}
+
+	peer = &relayPeer{}
+	maximal := validPendingServerFrame(t, 1, protocol.MaxRelayPayloadBytes)
+	for sequence := 1; sequence <= protocol.MaxRelayReorderFrames; sequence++ {
+		frame := validPendingServerFrame(t, int64(sequence), protocol.MaxRelayPayloadBytes)
+		if err := peer.queuePending(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if peer.pendingBytes <= protocol.MaxRelayReorderBytes {
+		t.Fatalf("eight maximum payload frames used %d wire bytes; test did not cross decoded-byte limit %d", peer.pendingBytes, protocol.MaxRelayReorderBytes)
+	}
+	for peer.pendingBytes+len(maximal) <= maxPendingRelayWireBytes {
+		if err := peer.queuePending(maximal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.queuePending(maximal); err == nil {
+		t.Fatal("accepted unmatched relay responses beyond the byte limit")
+	}
+}
+
+func validPendingServerFrame(t *testing.T, sequence int64, payloadBytes int) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(wireEnvelope{
+		Protocol: protocol.ProtocolName,
+		V:        protocol.ProtocolVersion,
+		Type:     "session.frame",
+		ID:       fmt.Sprintf("90000000-0000-4000-8000-%012d", sequence),
+		Body: map[string]any{
+			"sessionId": testSessionID,
+			"seq":       sequence,
+			"payload":   base64.RawURLEncoding.EncodeToString(make([]byte, payloadBytes)),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.ParseServer(raw); err != nil {
+		t.Fatalf("test server frame invalid: %v", err)
+	}
+	return raw
 }
 
 func TestRevokeEnrollmentCheckpointsBeforeBestEffortEndpointRevocation(t *testing.T) {

@@ -11,15 +11,18 @@ import {
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import type { Construct } from 'constructs';
 
 export interface RendezvousRelayStackProps extends StackProps {
   readonly environment: 'dev' | 'prod';
   readonly accessLogs?: boolean;
+  readonly alarmTopicArn?: string;
   readonly peakCapacity?: boolean;
 }
 
@@ -28,14 +31,29 @@ export class RendezvousRelayStack extends Stack {
     super(scope, id, props);
 
     const production = props.environment === 'prod';
-    const accessLogging = props.accessLogs ?? !production;
+    const accessLogging = props.accessLogs ?? true;
     const peakCapacity = production && (props.peakCapacity ?? false);
+    const relayRejectionsNamespace = `RemoteDavinci/${props.environment}`;
     const removalPolicy = production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
+    const alarmTopicArn = props.alarmTopicArn;
+    if (production && alarmTopicArn === undefined) {
+      throw new Error('Production requires an existing SNS alarm topic ARN');
+    }
+    if (alarmTopicArn !== undefined) {
+      const match = /^arn:[^:]+:sns:([^:]+):(\d{12}):[^:]+$/.exec(alarmTopicArn);
+      if (match === null) {
+        throw new Error('alarmTopicArn must be an SNS topic ARN');
+      }
+      if (production && (match[1] !== this.region || match[2] !== this.account)) {
+        throw new Error('Production alarmTopicArn must match the deployment account and region');
+      }
+    }
     Tags.of(this).add('Project', 'remote-davinci');
     Tags.of(this).add('Environment', props.environment);
     const repositoryRoot = path.join(__dirname, '../../../..');
     const goCode = (name: string, command: string): lambda.Code => {
       const output = path.join(repositoryRoot, '.build', name);
+      fs.rmSync(output, { force: true, recursive: true });
       fs.mkdirSync(output, { recursive: true });
       return lambda.Code.fromCustomCommand(
         output,
@@ -70,15 +88,15 @@ export class RendezvousRelayStack extends Stack {
       encryption: dynamodb.TableEncryption.AWS_MANAGED,
       ...(production
         ? {
-            maxReadRequestUnits: 30_000,
-            maxWriteRequestUnits: 5_000,
+            maxReadRequestUnits: peakCapacity ? 60_000 : 30_000,
+            maxWriteRequestUnits: peakCapacity ? 30_000 : 8_000,
           }
         : {}),
       ...(peakCapacity
         ? {
             warmThroughput: {
-              readUnitsPerSecond: 25_000,
-              writeUnitsPerSecond: 5_000,
+              readUnitsPerSecond: 60_000,
+              writeUnitsPerSecond: 30_000,
             },
           }
         : {}),
@@ -99,10 +117,10 @@ export class RendezvousRelayStack extends Stack {
       ...(production
         ? {
             applicationLogLevelV2: lambda.ApplicationLogLevel.WARN,
+            reservedConcurrentExecutions: peakCapacity ? 4_500 : 200,
             systemLogLevelV2: lambda.SystemLogLevel.WARN,
           }
         : {}),
-      ...(peakCapacity ? { reservedConcurrentExecutions: 4_500 } : {}),
       runtime: lambda.Runtime.PROVIDED_AL2023,
       timeout: Duration.seconds(10),
     } as const;
@@ -113,11 +131,30 @@ export class RendezvousRelayStack extends Stack {
         : logs.RetentionDays.THREE_DAYS,
     } as const;
 
+    const relayLogs = new logs.LogGroup(this, 'RelayLogs', lambdaLogProps);
+    const relayRole = new iam.Role(this, 'RelayRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+    });
+    relayLogs.grantWrite(relayRole);
     const relayHandler = new lambda.Function(this, 'RelayHandler', {
       ...lambdaDefaults,
       code: goCode('relay', './services/rendezvous-relay/cmd/relay'),
       handler: 'bootstrap',
-      logGroup: new logs.LogGroup(this, 'RelayLogs', lambdaLogProps),
+      logGroup: relayLogs,
+      role: relayRole,
+    });
+
+    new logs.MetricFilter(this, 'RelayRejectionsMetric', {
+      defaultValue: 0,
+      filterPattern: logs.FilterPattern.anyTerm(
+        'connect-rejected',
+        'message-rejected',
+        'RATE_LIMITED',
+      ),
+      logGroup: relayLogs,
+      metricName: 'RelayRejections',
+      metricNamespace: relayRejectionsNamespace,
+      metricValue: '1',
     });
 
     table.grant(
@@ -223,48 +260,69 @@ export class RendezvousRelayStack extends Stack {
       }),
     );
 
-    new cloudwatch.Alarm(this, 'RelayErrors', {
-      alarmDescription: 'Relay Lambda reported an error',
-      evaluationPeriods: 1,
-      metric: relayHandler.metricErrors({ period: Duration.minutes(5) }),
-      threshold: 1,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-    new cloudwatch.Alarm(this, 'RelayThrottles', {
-      alarmDescription: 'Relay Lambda was throttled',
-      evaluationPeriods: 1,
-      metric: relayHandler.metricThrottles({ period: Duration.minutes(5) }),
-      threshold: 1,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-
-    new cloudwatch.Alarm(this, 'ApiExecutionErrors', {
-      alarmDescription: 'WebSocket API failed to execute an integration',
-      evaluationPeriods: 1,
-      metric: new cloudwatch.Metric({
-        dimensionsMap: { ApiId: api.apiId, Stage: stage.stageName },
-        metricName: 'ExecutionError',
-        namespace: 'AWS/ApiGateway',
-        period: Duration.minutes(5),
-        statistic: 'Sum',
+    const alarms = [
+      new cloudwatch.Alarm(this, 'RelayErrors', {
+        alarmDescription: 'Relay Lambda reported an error',
+        evaluationPeriods: 1,
+        metric: relayHandler.metricErrors({ period: Duration.minutes(5) }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
       }),
-      threshold: 1,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-    new cloudwatch.Alarm(this, 'TableThrottles', {
-      alarmDescription: 'DynamoDB throttled a rendezvous operation',
-      evaluationPeriods: 1,
-      metric: table.metricThrottledRequestsForOperations({
-        operations: [
-          dynamodb.Operation.GET_ITEM,
-          dynamodb.Operation.TRANSACT_WRITE_ITEMS,
-          dynamodb.Operation.UPDATE_ITEM,
-        ],
-        period: Duration.minutes(5),
+      new cloudwatch.Alarm(this, 'RelayThrottles', {
+        alarmDescription: 'Relay Lambda was throttled',
+        evaluationPeriods: 1,
+        metric: relayHandler.metricThrottles({ period: Duration.minutes(5) }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
       }),
-      threshold: 1,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
+      new cloudwatch.Alarm(this, 'RelayRejections', {
+        alarmDescription: 'Relay rejected or rate-limited connections or messages',
+        evaluationPeriods: 1,
+        metric: new cloudwatch.Metric({
+          metricName: 'RelayRejections',
+          namespace: relayRejectionsNamespace,
+          period: Duration.minutes(5),
+          statistic: 'Sum',
+        }),
+        threshold: 20,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'ApiExecutionErrors', {
+        alarmDescription: 'WebSocket API failed to execute an integration',
+        evaluationPeriods: 1,
+        metric: new cloudwatch.Metric({
+          dimensionsMap: { ApiId: api.apiId, Stage: stage.stageName },
+          metricName: 'ExecutionError',
+          namespace: 'AWS/ApiGateway',
+          period: Duration.minutes(5),
+          statistic: 'Sum',
+        }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'TableThrottles', {
+        alarmDescription: 'DynamoDB throttled a rendezvous operation',
+        evaluationPeriods: 1,
+        metric: table.metricThrottledRequestsForOperations({
+          operations: [
+            dynamodb.Operation.GET_ITEM,
+            dynamodb.Operation.TRANSACT_WRITE_ITEMS,
+            dynamodb.Operation.UPDATE_ITEM,
+          ],
+          period: Duration.minutes(5),
+        }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ];
+    if (alarmTopicArn !== undefined) {
+      const action = new cloudwatchActions.SnsAction(
+        sns.Topic.fromTopicArn(this, 'AlarmTopic', alarmTopicArn),
+      );
+      for (const alarm of alarms) {
+        alarm.addAlarmAction(action);
+      }
+    }
 
     new CfnOutput(this, 'WebSocketUrl', { value: stage.url });
   }

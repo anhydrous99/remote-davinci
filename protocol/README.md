@@ -44,7 +44,7 @@ Authorization: Bearer rd1.<endpointId>.<secret>
 
 `secret` is 32 cryptographically random bytes encoded as 43 unpadded base64url characters. `credentialHash` is unpadded base64url of `SHA-256(raw secret bytes)`, not a hash of the encoded string. Clients store the secret in platform secure storage. AWS stores only the hash.
 
-A pairing connection may call `system.*`, pairing lifecycle messages, and `pair.frame` for its assigned pair. A bearer connection may call `system.*`, `link.*`, `endpoint.*`, session lifecycle messages, and `session.frame` for its assigned session. Lifecycle operations recheck the current endpoint and link records. Session forwarding strongly reads the authoritative session route; revocation and connection replacement close that route transactionally before they return.
+A pairing connection may call `system.*`, pairing lifecycle messages, and `pair.frame` for its assigned pair. A bearer connection may call `system.*`, `link.*`, `endpoint.*`, session lifecycle messages, and `session.frame` for its assigned session. Lifecycle operations atomically fence the connection that authorized them. Session forwarding strongly reads the current connection and authoritative session route before posting. Frames whose authority read begins after revocation or replacement are rejected; a callback already past that read may still arrive afterward because concurrent Lambda callbacks are not ordered. A revoking receiver therefore stops accepting controls before requesting revocation.
 
 ## Outer messages
 
@@ -80,11 +80,35 @@ Server events are:
 
 The stable outer errors are exported as `ErrorCodes`. Successful frame forwarding has no correlated `ok` response. A correlated `error` reports that AWS rejected or could not forward the frame; it says nothing about whether a peer decrypted or applied ciphertext already posted successfully.
 
-## One-time pairing profile
+## Shipped enrollment boundary
+
+The current controller and companion do **not** implement the PAKE profile
+below. Enrollment is a manual bootstrap for one operator controlling both
+unlocked devices: the controller validates and persists its intended relay
+locally before creating the unchanged V1 identity request, the companion uses
+its own configured relay and administratively submits both relay commits, and
+the controller accepts only a response with the original controller ID and its
+locally pinned relay. The two JSON documents must be transferred over an
+authenticated operator-controlled path; the software does not cryptographically
+authenticate that manual transfer.
+
+Enrollment is all-or-nothing authorization for the current five fixed
+operations (`resolve.page.cut`, `resolve.page.edit`, `resolve.page.fusion`,
+`resolve.page.color`, and `host.volume.toggle-mute`). Capability `hello`
+messages support feature negotiation only. The apps neither negotiate nor
+persist per-operation grants.
+
+## Deferred authenticated pairing profile
+
+This section is an expansion gate, not a shipped-runtime claim. Before
+multi-user, delegated, unattended, or untrusted-channel enrollment, implement
+this profile interoperably in both clients, test identity/relay binding and
+failure cases across Go and Swift, and persist an approved permission
+intersection used by the companion's central authorization check.
 
 ### Human code
 
-`pair.create` allocates a random six-digit routing locator for five minutes. The creator locally generates four random bytes and maps them to four words from the PGP Word List: word `0` uses the odd column, word `1` uses the even column, and the remaining words continue alternating. Both clients canonicalize the words to lowercase ASCII.
+In this deferred profile, `pair.create` allocates a random six-digit routing locator for five minutes. Before shipping this path, add a high-entropy QR routing token and normalized source-prefix admission limits; the six-digit locator alone remains an enumerable, lower-assurance manual fallback. The creator locally generates four random bytes and maps them to four words from the PGP Word List: word `0` uses the odd column, word `1` uses the even column, and the remaining words continue alternating. Both clients canonicalize the words to lowercase ASCII.
 
 The displayed and QR-transferred code is exactly:
 
@@ -105,13 +129,13 @@ Use a reviewed implementation compatible with Magic Wormhole's `python-spake2==0
 5. Encrypt `version` and numeric phases with NaCl SecretBox (XSalsa20-Poly1305), using a fresh random 24-byte nonce prepended to the authenticated ciphertext, then lowercase-hex encode the result into `body`.
 6. The `version` plaintext is UTF-8 JSON containing `{ "app_versions": { "remote-davinci": { "v": 1 } } }`. Successfully decrypting any peer encrypted phase proves key possession; failure immediately closes the pairing. The optional 32-byte verifier is HKDF-SHA256(`K`, no salt, info `wormhole:verifier`).
 7. After key confirmation, each side sends one numeric phase `0` whose decrypted plaintext matches `pairing-v1.schema.json`. The creator generates `linkId`; the joiner echoes it. `noiseFingerprint` is exactly `"sha256:" + base64url(SHA-256(raw 32-byte noiseKey))`; receivers recompute it and reject a mismatch. The Noise implementation also rejects invalid or low-order X25519 public keys. Noise keys, fingerprints, labels, permissions, and capabilities stay inside this encrypted document and local storage.
-8. The controller's permissions are its request. The companion's permissions are its grant; both persist only the intersection after local user approval. Each then sends the minimal outer `pair.commit`.
+8. The controller's permissions are its request. The companion's permissions are its grant; a future implementation must persist only the intersection after local user approval and enforce it centrally. Each then sends the minimal outer `pair.commit`.
 
 The compact phase-`0` wrapper plus SecretBox and hex overhead limits the decrypted pairing identity document to `MAX_PAIRING_PLAINTEXT_BYTES` (8,140 bytes). Pairing state is `OPEN -> READY -> HALF_COMMITTED -> ACTIVE`; any non-active state can become `CLOSED`.
 
 ## Durable link and session profile
 
-Private service credentials and the local Noise static private key belong in Keychain or the platform credential store. Normal local app storage holds the peer endpoint ID, peer Noise static public key and fingerprint, local display name, negotiated permissions/capabilities, protocol version, and revocation state. Credential loss or an unexpected peer key requires pairing again; a changed peer key is never silently accepted.
+Private service credentials and the local Noise static private key belong in Keychain or the platform credential store. The current apps store the requested relay, peer endpoint ID, peer Noise static public key, local display name, and revocation state in Keychain; they do not store a negotiated grant. A future PAKE/grant implementation also stores the verified fingerprint, approved permission intersection, negotiated capabilities, and protocol version. Credential loss or an unexpected peer key requires pairing again; a changed peer key is never silently accepted.
 
 An authenticated controller opens a live session by link ID. The service permits one active session per endpoint and link and emits `session.opened` to both sides. Each direction starts outer `seq` at `1`. API Gateway may deliver concurrent relay invocations out of order, so a receiver buffers at most the next 8 frames (128 KiB decoded total) and drains only contiguous sequences into Noise. An old or duplicate sequence, or a gap beyond that bound, closes the session.
 
@@ -170,7 +194,7 @@ Resolve pages outside Cut, Edit, Fusion, and Color produce no event, leave the
 last supported app tab selected, and are never changed by the controller merely
 to force synchronization.
 
-Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The companion checks each operation against the authenticated peer and locally stored grant. Within a session, duplicate request IDs return the cached response without executing twice.
+Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The current companion accepts requests only after the enrolled controller completes Noise IK, then authorizes against the fixed five-operation allowlist above. This is the full grant conferred by current enrollment; it is not a negotiated or persisted per-operation grant. A future granular-grant implementation must add one central stored-grant check before dispatch. Within a session, duplicate request IDs return the cached response without executing twice.
 
 ## Delivery and lifecycle semantics
 
