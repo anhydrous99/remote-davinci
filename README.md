@@ -3,7 +3,154 @@
 Accountless rendezvous and live encrypted relay for an iPhone/iPad controller
 and a macOS DaVinci Resolve companion.
 
-## What is here
+## Run the Mac companion and iPhone app
+
+For normal use, start only the **Remote DaVinci Companion** app on the Mac. It
+automatically launches and supervises its embedded Go server helper; do not run
+the standalone Go CLI at the same time.
+
+Both apps connect outbound to the same preconfigured hosted WSS relay. The
+iPhone never connects directly to the helper's loopback port, so the devices do
+not need to share Wi-Fi and there is no Mac IP address, inbound firewall rule,
+port forwarding, Node install, AWS account, or relay deployment to configure.
+
+### Prerequisites
+
+- An Apple Silicon Mac running macOS 14 or later.
+- Full Xcode with Swift 6 and an iOS 17 or later runtime.
+- Go 1.26.6, as declared by `go.mod`, available to Xcode.
+- An iPhone or iPad running iOS 17 or later. A physical device needs a passcode,
+  an Xcode development team, device trust, and Developer Mode. An iOS simulator
+  is enough for an initial local trial.
+- Internet access from both devices.
+- DaVinci Resolve Studio only for Resolve page controls. Mac mute control works
+  without Resolve.
+
+Run shell commands below from the repository root.
+
+### 1. Build and start the Mac companion
+
+```sh
+make companion-app
+open '.derivedData/companion/Build/Products/Debug/Remote DaVinci Companion.app'
+```
+
+The first command builds a locally signed development app and embeds the helper.
+On a fresh enrollment, wait for a status beginning **Server running** and for
+the connection status **Not enrolled**.
+Leave the companion running while using the controller. Closing its window
+leaves the menu-bar app running; use **Quit Remote DaVinci Companion** to stop
+the helper.
+
+### 2. Prepare Resolve page control
+
+Skip this step if you only want to test Mac mute.
+
+1. Open DaVinci Resolve Studio and a project.
+2. Choose **DaVinci Resolve > Preferences > System > General**.
+3. Set **External scripting using** to **Local**, save, and keep Resolve running.
+
+The companion uses Resolve's local scripting module. It does not require
+Network scripting, port 9060, raw keyboard access, or Accessibility permission.
+
+### 3. Run the iPhone or iPad controller
+
+```sh
+open -a Xcode apps/controller/RemoteDavinciController.swiftpm
+```
+
+In Xcode, select the **RemoteDavinciController** scheme, then choose a run
+destination:
+
+- For a simulator, choose an iPhone or iPad simulator and press Run.
+- For a physical device, select a development team under Signing, connect and
+  unlock the device, trust the Mac, enable Developer Mode if prompted, choose
+  the device, and press Run.
+
+If Xcode reports that `dev.remote-davinci.controller` is unavailable, change the
+application's bundle identifier in `Package.swift` to a unique reverse-DNS
+value. The app opens its **Settings** sheet automatically when it is not
+enrolled.
+
+### 4. Enroll the controller
+
+> Enrollment is currently a manual ceremony for one trusted operator who
+> controls both unlocked devices. Transfer both JSON documents directly, such
+> as with AirDrop or Universal Clipboard. The shipped apps do not yet implement
+> PAKE/QR authentication or granular operation grants.
+
+1. On iOS, keep or edit **Device label**, then tap **Create Enrollment
+   Request**.
+2. Tap **Share Enrollment Request** and transfer or copy the JSON to the Mac.
+3. In the Mac app's **Enroll iPhone or iPad** section, paste the complete JSON
+   and click **Create Link**.
+4. When the response appears, click **Copy Response** and transfer it back to
+   the same iOS device.
+5. Paste it below **Paste the response from the trusted Mac companion**, then
+   tap **Import Enrollment Response**. The enrollment status becomes
+   **Enrolled**.
+6. Tap **Connect**. The iOS status progresses through **Connecting**, **Waiting
+   for companion**, and secure-session setup. Success is **Connected** with
+   **Ready** on iOS and **Secure controller session** on the Mac.
+
+### 5. Control the Mac
+
+Tap **Done**, then select the Cut, Edit, Fusion, or Color tab. The tab body is
+intentionally blank: selecting the tab itself asks Resolve to open that page.
+Changing to one of those pages inside Resolve updates the selected iOS tab.
+Media, Fairlight, and Deliver are outside this V1 controller and leave the last
+supported tab selected.
+
+Mac mute remains under **Settings > Host control**. Controls stay disabled until
+the secure session is ready. Backgrounding the iOS app intentionally
+disconnects it; tap **Connect** again after returning.
+
+### Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| The Mac build says Go is required | Confirm `go version` works in Terminal, then rebuild the companion. |
+| Mac shows **Server stopped** or a startup error | Unlock the login Keychain and click **Retry Server**. If it reports a missing helper, rebuild the companion. |
+| Physical-device build will not sign | Select your team, enable automatic signing, and use a unique bundle identifier. |
+| **Connect** is disabled | Finish importing the enrollment response so the status is **Enrolled**. |
+| iOS stays at **Waiting for companion** | Keep the Mac companion running and confirm both apps were enrolled against the same relay. |
+| Page control reports `resolve.unavailable` | Run Resolve Studio from its standard installation, open a project, and set external scripting to **Local**. |
+| Page or mute controls are disabled | Wait for iOS **Connected / Ready** and Mac **Secure controller session**. |
+| Mute reports `host.mute-unsupported` | The current output device does not expose a macOS mute property. |
+| **Create Link** is disabled for a new device | The Mac supports one enrolled controller. Revoke and reset the old enrollment first. |
+
+Use **Revoke and Reset** on the Mac or **Revoke and Re-enroll** on iOS while the
+relay is reachable. The separately confirmed local-forget actions are emergency
+recovery only: they can leave the old relay identity active.
+
+### Use a custom relay
+
+The default quick start does not need this. Before creating either side of an
+enrollment, open the companion project as well:
+
+```sh
+open -a Xcode apps/companion/RemoteDavinciCompanion.xcodeproj
+```
+
+In the Run action for each scheme, add the identical canonical
+`REMOTE_DAVINCI_RELAY_URL` value under **Product > Scheme > Edit Scheme > Run >
+Arguments > Environment Variables**. The value must be a credential-free
+`wss://` URL.
+
+Run both apps from Xcode for that enrollment. The controller pins the relay in
+Keychain; changing it later requires revocation and re-enrollment.
+
+## Documentation
+
+- [`protocol/README.md`](protocol/README.md): canonical wire protocol, trust
+  boundary, shipped manual enrollment, and deferred authenticated pairing.
+- [`docs/e2e-test-plan.md`](docs/e2e-test-plan.md): release-validation matrix for
+  simulators, physical devices, AWS, Resolve, and host effects.
+- [`docs/capacity.md`](docs/capacity.md): relay quotas, load targets, and cost
+  model.
+- [`SECURITY.md`](SECURITY.md): private vulnerability-reporting process.
+
+## Project layout
 
 - `protocol`: the versioned, language-neutral wire contract and Go validators.
 - `services/rendezvous-relay`: WebSocket authorization, pairing, routing, and
@@ -11,15 +158,63 @@ and a macOS DaVinci Resolve companion.
 - `apps/controller/RemoteDavinciController.swiftpm`: the native iOS 17+
   SwiftUI controller for iPhone and iPad.
 - `apps/companion`: the native macOS 14+ SwiftUI app and menu-bar companion.
-- `cmd/companion` and `internal/companion`: its embedded Go server helper and
-  loopback API; the browser GUI remains available for command-line development.
+- `cmd/companion` and `internal/companion`: the embedded Go helper and loopback
+  API. The browser GUI is a separate command-line development fallback.
 - `infra/cdk`: the TypeScript CDK stack for API Gateway, Lambda, DynamoDB, and
   operational alarms.
-- `docs/capacity.md`: the capacity envelope, quota prerequisites, and cost
-  model.
 
 The relay sees routing metadata and opaque ciphertext. It does not queue
 commands, terminate the peer-to-peer secure channel, or connect to Resolve.
+
+## Development validation
+
+Go, relay, protocol, and infrastructure checks use the Go version from `go.mod`
+and Node 24:
+
+```sh
+make bootstrap
+make check
+```
+
+The native companion tests and fast Mac Catalyst controller tests require
+Xcode:
+
+```sh
+make companion-app-check
+make controller-check
+```
+
+`controller-check` is not an iOS simulator or physical-device test. The complete
+deployment, device, failure-path, host-effect, and cleanup matrix is in
+[`docs/e2e-test-plan.md`](docs/e2e-test-plan.md).
+
+## AWS infrastructure development
+
+These commands are optional and are not part of the app quick start. Synthesize
+the development stack with `npm --prefix infra/cdk run synth`. It targets
+`us-east-1` by default; pass CDK context `region` to select another region.
+Deployment requires a CDK-bootstrapped AWS account and is intentionally not
+performed by the test suite.
+
+Production synthesis and deployment require an explicit account/region
+allowlist plus an existing SNS topic in that same account and region:
+
+```sh
+npm --prefix infra/cdk run synth -- \
+  -c environment=prod \
+  -c productionAccount=123456789012 \
+  -c productionRegion=us-east-1 \
+  -c alarmTopicArn=arn:aws:sns:us-east-1:123456789012:remote-davinci-alerts
+```
+
+The CDK app refuses production when the allowlist differs from the account and
+region resolved by the CDK toolkit. Before deployment, confirm the SNS topic
+has at least one subscribed operator and test delivery. API Gateway access logs
+are enabled by default with metadata-only fields and seven-day production
+retention; configure the account-level API Gateway CloudWatch Logs role first.
+Use `-c accessLogs=false` only as an explicit exception. The normal production
+profile reserves 200 Lambda concurrency; [`docs/capacity.md`](docs/capacity.md)
+lists the quota prerequisites.
 
 ## AWS architecture
 
@@ -67,101 +262,6 @@ flowchart LR
   API_ALARM --> ALERT_TOPIC
   TABLE_ALARM --> ALERT_TOPIC
 ```
-
-## Local validation
-
-```sh
-make bootstrap
-make check
-```
-
-Synthesize the development stack with `npm --prefix infra/cdk run synth`. It
-targets `us-east-1` by default; pass CDK context `region` to the infrastructure
-workspace to select another region. Deployment requires an AWS account
-bootstrapped for CDK and is intentionally not performed by the test suite.
-
-Production synthesis and deployment require an explicit account/region
-allowlist plus an existing SNS topic in that same account and region:
-
-```sh
-npm --prefix infra/cdk run synth -- \
-  -c environment=prod \
-  -c productionAccount=123456789012 \
-  -c productionRegion=us-east-1 \
-  -c alarmTopicArn=arn:aws:sns:us-east-1:123456789012:remote-davinci-alerts
-```
-
-The CDK app refuses production when the allowlist differs from the account and
-region resolved by the CDK toolkit. Before deployment, confirm the SNS topic
-has at least one subscribed operator and test delivery. API Gateway access logs
-are enabled by default with metadata-only fields and seven-day production
-retention; configure the account-level API Gateway CloudWatch Logs role first.
-Use `-c accessLogs=false` only as an explicit exception. The normal production
-profile reserves 200 Lambda concurrency; `docs/capacity.md` lists the account
-quota required before deployment.
-
-## Run the vertical slice
-
-Build and start the native macOS companion:
-
-```sh
-make companion-app
-open '.derivedData/companion/Build/Products/Debug/Remote DaVinci Companion.app'
-```
-
-The app owns the window, menu bar, Launch at Login setting, and embedded helper
-lifecycle. The helper chooses an ephemeral loopback port and gives its
-launch-scoped API token only to the parent app. On first native launch, an
-existing valid CLI configuration is copied to the login Keychain, verified,
-and only then removed from disk. For Resolve control, launch DaVinci Resolve
-Studio and allow command-line scripting in Resolve Preferences. The host-volume
-control does not require Resolve.
-
-Open `apps/controller/RemoteDavinciController.swiftpm` in Xcode, select a
-development team and an iPhone or iPad running iOS 17 or later, and Run. Then:
-
-1. Create an enrollment request on iOS.
-2. Paste it into the companion app and create the link.
-3. Paste the returned response into iOS and import it.
-4. Keep the companion running, tap Connect, then use a page tab or the host
-   mute control.
-
-The app has blank Cut, Edit, Fusion, and Color tabs. Tapping one requests the
-matching fixed operation (`resolve.page.cut`, `resolve.page.edit`,
-`resolve.page.fusion`, or `resolve.page.color`); switching to one of those pages
-inside Resolve updates the selected app tab. Unsupported Resolve pages leave
-the last supported tab selected and are not changed automatically.
-`host.volume.toggle-mute` remains the separate fixed macOS control. Remote raw
-keys, shell commands, and user-authored scripts are not accepted.
-
-Enrollment is a trusted, manual, one-operator ceremony for this slice. Transfer
-both JSON documents directly between the unlocked controller and Mac without
-an intermediary; that operator-controlled path is the authenticated channel.
-The shipped apps do not run PAKE or negotiate operation grants. The originating
-controller validates and persists its selected relay before emitting the
-unchanged V1 identity request, then rejects a companion response for any other
-relay. Accepting a response grants that one controller all five fixed V1
-operations listed above.
-
-The iOS app uses the device-only Keychain and the native Mac helper uses the
-login Keychain. The standalone Go CLI is an explicitly insecure development
-fallback: it requires `-allow-insecure-file-config` and a private, regular,
-non-symlink mode-0600 configuration file. Its printed browser URL contains a
-single-use bootstrap value rather than the API credential. Implement and review
-the documented PAKE/QR ceremony and persisted per-operation grants before
-onboarding anyone outside the one-trusted-operator boundary.
-Both apps offer separately confirmed local-only recovery when remote revocation
-cannot complete; it warns that the old relay identity may remain.
-
-On macOS with Xcode installed, run both native app test targets with:
-
-```sh
-make companion-app-check
-make controller-check
-```
-
-The complete deployment, device, failure-path, host-effect, and cleanup matrix
-is in [`docs/e2e-test-plan.md`](docs/e2e-test-plan.md).
 
 ## V1 boundary
 

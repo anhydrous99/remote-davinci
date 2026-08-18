@@ -1,5 +1,10 @@
 # Relay capacity and cost
 
+This is an operator document. For normal app setup, use the
+[README quick start](../README.md#run-the-mac-companion-and-iphone-app); the
+preconfigured hosted relay does not require users to size or deploy AWS
+infrastructure.
+
 This is the operating envelope for the single-region managed relay. It is a
 quota and load-test target, not a claim that local unit tests prove AWS service
 capacity.
@@ -46,8 +51,9 @@ confirmation for the 50,000-message burst as part of that approval. If AWS
 approves less, change the configured peak profile to that approved value and
 retain the required 60-second client/load-test ramp.
 
-API Gateway permits a 500-new-connections-per-second default and closes a
-connection after two hours. Clients therefore reconnect after a randomized
+The [API Gateway WebSocket quota table](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-execution-service-websocket-limits-table.html)
+lists a 500-new-connections-per-second default, a two-hour connection duration,
+and a ten-minute idle timeout. Clients therefore reconnect after a randomized
 90–110 minutes. After an outage, exponential full-jitter retry is capped at 15
 minutes; 200,000 clients uniformly spread over that interval average about 222
 new connections per second.
@@ -74,12 +80,13 @@ DynamoDB write units = F                (Rate-limit items must remain <= 1 KiB)
 Connection minutes  = C
 ```
 
-The reference workload is 1,000 pairs connected eight hours per day and 500
+The following August 2026 example is a dated price snapshot, not a quote. Its
+reference workload is 1,000 pairs connected eight hours per day and 500
 control round trips per pair per day, over a 30-day month. At 256 MiB and a
 measured 30 ms average Lambda duration, that is 30 million one-way frames,
 60 million WebSocket messages, 30 million Lambda requests, 225,000 GB-seconds,
 60 million strong read units, 30 million write units, and 28.8 million
-connection-minutes. At August 2026 us-east-1 list prices, the components are
+connection-minutes. At that month's us-east-1 list prices, the components are
 approximately $60.00 for messages, $7.20 for connection-minutes, $6.00 for
 Lambda requests, $3.00 for Lambda compute, $7.50 for DynamoDB reads, and $18.75
 for DynamoDB writes: $102.45/month before the exclusions above.

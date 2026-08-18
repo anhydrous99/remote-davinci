@@ -1,5 +1,8 @@
 # `protocol`
 
+This is the implementer-facing protocol reference. For app installation and the
+manual enrollment flow, use the [README quick start](../README.md#run-the-mac-companion-and-iphone-app).
+
 Language-neutral v1 contracts and Go trust-boundary validators for the Remote DaVinci rendezvous, pairing, relay, and control protocols.
 
 The JSON Schemas in `schemas` are the wire-format source of truth. The public Go package exports the corresponding message types, constants, and parsers. Unknown fields on a known message are ignored for forward compatibility, except for the deliberately closed `pair.commit` identity objects. Unknown message types, missing fields, invalid field values, and unsupported protocol versions fail closed.

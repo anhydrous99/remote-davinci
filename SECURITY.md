@@ -1,5 +1,9 @@
 # Security policy
 
+This file covers supported versions and private vulnerability reporting. For
+the protocol threat model, shipped enrollment boundary, and deferred pairing
+design, see [`protocol/README.md`](protocol/README.md#scope-and-trust-boundary).
+
 ## Supported versions
 
 Security fixes are applied to the `main` branch. This project does not yet
