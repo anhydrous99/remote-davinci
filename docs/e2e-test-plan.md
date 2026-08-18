@@ -1,5 +1,9 @@
 # End-to-end test plan
 
+This is the release-validation matrix, not the basic setup guide. To build,
+enroll, and run the two apps, start with [Run the Mac companion and iPhone
+app](../README.md#run-the-mac-companion-and-iphone-app).
+
 This plan validates the complete live path:
 
 ```text
@@ -32,11 +36,11 @@ is not release readiness.
 
 | Environment | Purpose | Required state |
 | --- | --- | --- |
-| Local Go/Node | contracts, relay, companion, CDK | supported Go and Node versions; clean test caches are optional |
+| Local Go/Node | contracts, relay, companion, CDK | Go version from `go.mod`; Node 24; npm; clean test caches are optional |
 | Mac Catalyst | fast Swift/Noise regression | current Xcode |
-| Native macOS app | SwiftUI host, helper lifecycle, Keychain migration | macOS 14+; current Xcode; stable signing identity for release checks |
-| iPhone simulator | phone build, launch, layout | installed iOS runtime |
-| iPad simulator | tablet build, launch, layout | installed iOS runtime |
+| Native macOS app | SwiftUI host, helper lifecycle, Keychain migration | Apple Silicon; macOS 14+; full Xcode; Go version from `go.mod`; stable signing identity for release checks |
+| iPhone simulator | phone build, launch, layout | full Xcode; installed iOS 17+ runtime |
+| iPad simulator | tablet build, launch, layout | full Xcode; installed iOS 17+ runtime |
 | Disposable AWS stack | real API Gateway/Lambda/DynamoDB ordering and lifecycle | account credentials; stack tagged `Project=remote-davinci`, `Environment=dev` |
 | Physical iPhone and iPad | Keychain, suspension, Wi-Fi/cellular roaming, signing | trusted devices, development provisioning, passcodes enabled |
 | Host Mac | real control effects | companion running; Resolve scripting enabled; mute-capable output for mute test |
@@ -59,10 +63,9 @@ has no active alarm, and cleanup targets are unambiguous.
 Run:
 
 ```sh
+make bootstrap
 make check
-go test -count=1 ./...
 go test -race -count=1 ./...
-go vet ./...
 make companion-app-check
 make controller-check
 ```
@@ -175,12 +178,15 @@ when direct HTTP boundary probing is required:
 go run ./cmd/companion -config /absolute/private/temp/companion.json -allow-insecure-file-config
 ```
 
-For a confirmed disposable or self-hosted relay, set the same canonical
-`REMOTE_DAVINCI_RELAY_URL` in the controller and companion Xcode launch
-environments before creating either side's enrollment. Omit it when testing the
-default production relay.
+For a confirmed disposable or self-hosted relay, add the same canonical
+`REMOTE_DAVINCI_RELAY_URL` to both apps under **Product > Scheme > Edit Scheme >
+Run > Arguments > Environment Variables** before creating either side's
+enrollment, then run both apps from Xcode. Omit it when testing the default
+production relay.
 
-Capture its single-use bootstrap URL privately.
+For the development CLI run only, capture its single-use bootstrap URL
+privately. The native app receives a separate launch record internally and does
+not display it.
 
 Verify:
 
