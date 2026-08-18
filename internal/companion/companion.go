@@ -86,6 +86,23 @@ type Config struct {
 	LinkRevoked           bool   `json:"linkRevoked,omitempty"`
 }
 
+func manualEnrollmentResponse(config Config) (EnrollmentResponse, error) {
+	privateKey, err := decode32(config.NoisePrivateKey)
+	if err != nil {
+		return EnrollmentResponse{}, err
+	}
+	keypair, err := noise.DH25519.GenerateKeypair(bytes.NewReader(privateKey))
+	if err != nil {
+		return EnrollmentResponse{}, err
+	}
+	return EnrollmentResponse{
+		V: config.V, RelayURL: config.RelayURL, LinkID: config.LinkID,
+		ControllerEndpointID: config.ControllerEndpointID,
+		CompanionEndpointID:  config.EndpointID,
+		CompanionNoiseKey:    base64.RawURLEncoding.EncodeToString(keypair.Public),
+	}, nil
+}
+
 func (config Config) validate() error {
 	if config.V != 1 || !uuidPattern.MatchString(config.LinkID) || !uuidPattern.MatchString(config.EndpointID) ||
 		!uuidPattern.MatchString(config.ControllerEndpointID) {
@@ -458,11 +475,9 @@ func Provision(ctx context.Context, relay string, request EnrollmentRequest, per
 		ControllerNoiseKey:   request.ControllerNoiseKey,
 		ControllerLabel:      request.DeviceLabel,
 	}
-	response := EnrollmentResponse{
-		V: 1, RelayURL: relay, LinkID: linkID,
-		ControllerEndpointID: request.ControllerEndpointID,
-		CompanionEndpointID:  companionEndpointID,
-		CompanionNoiseKey:    base64.RawURLEncoding.EncodeToString(keypair.Public),
+	response, err := manualEnrollmentResponse(config)
+	if err != nil {
+		return Config{}, EnrollmentResponse{}, err
 	}
 	var pending struct {
 		Pending bool `json:"pending"`

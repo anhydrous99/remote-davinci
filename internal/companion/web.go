@@ -41,15 +41,16 @@ type App struct {
 }
 
 type State struct {
-	Configured      bool          `json:"configured"`
-	RelayURL        string        `json:"relayUrl"`
-	EndpointID      string        `json:"endpointId,omitempty"`
-	LinkID          string        `json:"linkId,omitempty"`
-	ControllerLabel string        `json:"controllerLabel,omitempty"`
-	Connected       bool          `json:"connected"`
-	Secure          bool          `json:"secure"`
-	Status          string        `json:"status"`
-	Pairing         *PairingState `json:"pairing,omitempty"`
+	Configured         bool                `json:"configured"`
+	RelayURL           string              `json:"relayUrl"`
+	EndpointID         string              `json:"endpointId,omitempty"`
+	LinkID             string              `json:"linkId,omitempty"`
+	ControllerLabel    string              `json:"controllerLabel,omitempty"`
+	Connected          bool                `json:"connected"`
+	Secure             bool                `json:"secure"`
+	Status             string              `json:"status"`
+	Pairing            *PairingState       `json:"pairing,omitempty"`
+	EnrollmentResponse *EnrollmentResponse `json:"enrollmentResponse,omitempty"`
 }
 
 func NewApp(ctx context.Context, configPath, relay string) (*App, error) {
@@ -165,6 +166,12 @@ func (app *App) state() State {
 		state.EndpointID = app.config.EndpointID
 		state.LinkID = app.config.LinkID
 		state.ControllerLabel = app.config.ControllerLabel
+		if app.config.ControllerFingerprint == "" && !state.Secure {
+			response, err := manualEnrollmentResponse(*app.config)
+			if err == nil {
+				state.EnrollmentResponse = &response
+			}
+		}
 	}
 	if app.pairing != nil {
 		pairing := app.pairing.snapshot()

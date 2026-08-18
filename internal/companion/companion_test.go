@@ -1090,6 +1090,21 @@ func TestResetRetainsCredentialsUntilRevocationSucceeds(t *testing.T) {
 	}
 }
 
+func TestStateReconstructsManualEnrollmentResponseUntilSecure(t *testing.T) {
+	config := validTestConfig(t)
+	app := &App{relayURL: config.RelayURL, config: &config}
+	state := app.state()
+	if state.EnrollmentResponse == nil || state.EnrollmentResponse.LinkID != config.LinkID ||
+		state.EnrollmentResponse.ControllerEndpointID != config.ControllerEndpointID ||
+		state.EnrollmentResponse.CompanionEndpointID != config.EndpointID {
+		t.Fatalf("manual enrollment response = %#v", state.EnrollmentResponse)
+	}
+	app.status.Secure = true
+	if response := app.state().EnrollmentResponse; response != nil {
+		t.Fatalf("secure state exposed manual enrollment response = %#v", response)
+	}
+}
+
 func TestResetRequestSecurity(t *testing.T) {
 	config := validTestConfig(t)
 	called := false

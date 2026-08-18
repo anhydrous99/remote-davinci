@@ -22,4 +22,4 @@ companion-app-check:
 	xcodebuild -quiet -project apps/companion/RemoteDavinciCompanion.xcodeproj -scheme RemoteDavinciCompanion -destination 'platform=macOS,arch=arm64' -derivedDataPath .derivedData/companion-tests CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
 
 controller-check:
-	cd apps/controller/RemoteDavinciController.swiftpm && xcodebuild -quiet -scheme RemoteDavinciController -destination 'platform=macOS,variant=Mac Catalyst' -derivedDataPath .derivedData CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
+	cd apps/controller/RemoteDavinciController.swiftpm && xcodebuild -quiet -scheme 'Remote DaVinci' -destination 'platform=macOS,variant=Mac Catalyst' -derivedDataPath .derivedData CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test

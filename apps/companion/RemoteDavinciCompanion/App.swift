@@ -89,6 +89,18 @@ struct CompanionView: View {
                 PairingSection(model: model)
             }
 
+            if !model.manualEnrollmentResponse.isEmpty {
+                Section("Finish manual enrollment") {
+                    Text("Import this response under Advanced Manual Enrollment on the iPhone or iPad.")
+                        .foregroundStyle(.secondary)
+                    Text(model.manualEnrollmentResponse)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .accessibilityLabel("Controller enrollment response")
+                    Button("Copy Response") { model.copyEnrollmentResponse() }
+                }
+            }
+
             if model.state?.configured == true {
                 Section("Reset Enrollment") {
                     Text("Revoke the controller link and remove this Mac’s local credentials.")
@@ -224,13 +236,6 @@ private struct PairingSection: View {
                             model.state?.pairing?.isTerminal == false ||
                             model.enrollmentRequest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     )
-                if !model.enrollmentResponse.isEmpty {
-                    Text(model.enrollmentResponse)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .accessibilityLabel("Controller enrollment response")
-                    Button("Copy Response") { model.copyEnrollmentResponse() }
-                }
             }
         }
     }

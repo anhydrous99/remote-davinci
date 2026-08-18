@@ -163,9 +163,10 @@ struct CompanionState: Decodable, Equatable, Sendable {
     let secure: Bool
     let status: String
     let pairing: PairingSnapshot?
+    let enrollmentResponse: EnrollmentReply?
 
     enum CodingKeys: String, CodingKey {
-        case configured, connected, secure, status, pairing
+        case configured, connected, secure, status, pairing, enrollmentResponse
         case relayURL = "relayUrl"
         case endpointID = "endpointId"
         case linkID = "linkId"
@@ -719,6 +720,12 @@ final class CompanionModel: ObservableObject {
         return canRetry ? "exclamationmark.triangle" : "hourglass"
     }
 
+    var manualEnrollmentResponse: String {
+        if !enrollmentResponse.isEmpty { return enrollmentResponse }
+        guard let response = state?.enrollmentResponse else { return "" }
+        return (try? response.formattedJSON()) ?? ""
+    }
+
     func start() {
         guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
         guard !started else { return }
@@ -819,10 +826,11 @@ final class CompanionModel: ObservableObject {
     }
 
     func copyEnrollmentResponse() {
-        guard !enrollmentResponse.isEmpty else { return }
+        let response = manualEnrollmentResponse
+        guard !response.isEmpty else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        if pasteboard.setString(enrollmentResponse, forType: .string) {
+        if pasteboard.setString(response, forType: .string) {
             feedback = "Enrollment response copied."
         } else {
             errorMessage = "The enrollment response could not be copied."
@@ -917,6 +925,10 @@ final class CompanionModel: ObservableObject {
             let state = try await api.state()
             guard connection == api.connection else { return }
             self.state = state
+            if state.secure {
+                enrollmentRequest = ""
+                enrollmentResponse = ""
+            }
             if state.configured || state.pairing.map({ !$0.isShowingInvite }) == true {
                 clearPairingInvite()
             }

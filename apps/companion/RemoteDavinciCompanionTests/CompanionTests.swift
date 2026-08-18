@@ -97,10 +97,6 @@ final class CompanionTests: XCTestCase {
     }
 
     func testStateAndEnrollmentModelsMatchHelperJSON() throws {
-        let state = try JSONDecoder().decode(CompanionState.self, from: Data(#"{"configured":true,"relayUrl":"wss://relay.example/v1","endpointId":"endpoint","linkId":"link","controllerLabel":"iPad","connected":true,"secure":true,"status":"Secure session","pairing":null}"#.utf8))
-        XCTAssertEqual(state.connectionSummary, "Secure controller session")
-        XCTAssertEqual(state.controllerLabel, "iPad")
-
         let reply = EnrollmentReply(
             v: 1,
             relayURL: "wss://relay.example/v1",
@@ -110,6 +106,11 @@ final class CompanionTests: XCTestCase {
             companionNoiseKey: token,
             warning: nil
         )
+        let state = try JSONDecoder().decode(CompanionState.self, from: Data(#"{"configured":true,"relayUrl":"wss://relay.example/v1","endpointId":"endpoint","linkId":"link","controllerLabel":"iPad","connected":true,"secure":false,"status":"Waiting for controller","pairing":null,"enrollmentResponse":{"v":1,"relayUrl":"wss://relay.example/v1","linkId":"link","controllerEndpointId":"controller","companionEndpointId":"companion","companionNoiseKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#.utf8))
+        XCTAssertEqual(state.connectionSummary, "Connected to relay")
+        XCTAssertEqual(state.controllerLabel, "iPad")
+        XCTAssertEqual(state.enrollmentResponse, reply)
+
         let roundTrip = try JSONDecoder().decode(
             EnrollmentReply.self,
             from: Data(try reply.formattedJSON().utf8)
