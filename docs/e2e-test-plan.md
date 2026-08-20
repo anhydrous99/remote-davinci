@@ -78,19 +78,24 @@ skips, or expected failures.
 Coverage required:
 
 - Rendezvous/control schema validation and frame byte limits.
+- Exact integer handling for `1`, `1.0`, and `1e0`; rejection of fractional,
+  out-of-range, and resource-exhausting numeric spellings before dispatch.
 - Official Noise IK and Noise NNpsk0 interoperability vectors, peer-static-key
   validation, and cross-language pairing-handshake coverage.
 - Strict QR invitation parsing, relay pinning, expiry, independent secret
   validation, pairing prologue binding, legacy enrollment response validation,
-  and device-only Keychain coding.
+  controller-fingerprint comparison on both devices, fail-closed approval
+  details, safe device labels, and device-only Keychain coding.
 - Token-only pair creation/join, hash-only admission storage, wrong/missing/
   reused token rejection, and no downgrade to the legacy locator profile.
 - Eight-frame/128 KiB bounded reordering, contiguous drain, and rejection of
   duplicates, stale sequences, oversized gaps, and oversized payloads.
 - One-command-in-flight, expiration, deduplication, and late-response handling.
-- Four fixed Resolve page mappings, initial/change-only page observation,
+- Seven fixed Resolve page mappings, initial/change-only page observation,
   unsupported-page handling, and no request echo from an inbound page event.
-- Full-jitter reconnect ceiling, randomized connection rotation, and no replay.
+- Session-local versus enrollment-terminal failure classification, bounded
+  establishment, full-jitter reconnect ceiling, randomized connection
+  rotation, and no replay.
 - Config atomic write, mode `0600`, rejection of symlink/non-regular/weak-mode
   files, standalone insecure-storage opt-in, one-time browser bootstrap,
   localhost token, Host/Origin/media-type checks, reset checkpoints, and stale
@@ -115,10 +120,12 @@ For both an iPhone and iPad simulator:
 4. Because the simulator camera cannot prove scanning, exercise the paste-invite
    fallback with valid, malformed, expired, and wrong-relay invitations. Verify
    no pending credential is promoted before reciprocal activation.
-5. Verify all four page bodies are blank, then inspect portrait phone plus
+5. Verify the controller fingerprint remains visible while approval is pending
+   and is cleared after approval, rejection, cancellation, or failure.
+6. Verify all seven page bodies are blank, then inspect portrait phone plus
    portrait and landscape tablet layouts, Dynamic Type, tab VoiceOver labels,
-   and destructive confirmation dialogs.
-6. Exercise explicit local-forget recovery with a deliberately invalid pending
+   locked tabs for unavailable grants, and destructive confirmation dialogs.
+7. Exercise explicit local-forget recovery with a deliberately invalid pending
    enrollment; verify it requires its own warning and confirmation.
 
 Pass: no crash, truncation that hides an action, Keychain error, secret-bearing
@@ -243,9 +250,10 @@ endpoints. For each device:
 2. Tamper the QR relay, pair ID, join token, PSK, expiry, and one unknown field
    separately. Require rejection or cryptographic failure with no saved link;
    also reject an expired screenshot and reuse of a successfully scanned QR.
-3. Scan a fresh QR, verify the Mac hides it, compare the displayed controller
-   label/fingerprint and eight requested controls, then approve. Reject a separate
-   fresh attempt once and verify neither device persists it.
+3. Scan a fresh QR, verify the Mac hides it, compare the exact fingerprint shown
+   on both devices plus the controller label and eight requested controls, then
+   approve. Reject a separate fresh attempt once and verify neither device
+   persists it.
 4. Verify both sides report a secure session and matching peer, and that the
    controller connects automatically only after activation.
 5. Tap each page tab and use the host mute control once. Require remote actions
@@ -259,12 +267,16 @@ endpoints. For each device:
 8. Disable/restore Wi-Fi, switch Wi-Fi to cellular and back, restart the
    companion, and replace the bearer socket. Confirm bounded backoff and fresh
    sessions without stale-session teardown.
-9. Inject a delayed response beyond command expiry. It may update an expired
-   result policy but must not close an otherwise healthy secure session.
-10. Revoke and re-enroll. Verify the old link stops immediately, both old bearer
+9. Suppress `session.opened`, Noise message 2, and the authenticated companion
+   hello in separate attempts. Each must leave setup and reconnect within the
+   establishment bound without deleting enrollment.
+10. Stall a command send and separately inject a delayed response beyond wire
+   expiry. The UI must clear at the absolute deadline, execute no replay, and
+   retain an otherwise healthy secure session.
+11. Revoke and re-enroll. Verify the old link stops immediately, both old bearer
     credentials fail, exact Keychain data is removed, and the new identity is
     different.
-11. Test the separately confirmed local-forget path with a deliberately stale
+12. Test the separately confirmed local-forget path with a deliberately stale
     credential; record any intentionally orphaned inert endpoint for stack
     teardown.
 

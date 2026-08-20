@@ -29,14 +29,17 @@ struct PairingInvite: Codable, Equatable, Sendable {
     ) throws -> PairingInvite {
         let data = Data(value.utf8)
         guard !data.isEmpty, data.count <= maximumBytes,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let object = ProtocolJSON.object(data),
               Set(object.keys) == Set(CodingKeys.allCases.map(\.rawValue)),
+              jsonInt64(object["v"]) == 1,
+              let expiresAt = jsonInt64(object["expiresAt"]),
               let invite = try? JSONDecoder().decode(Self.self, from: data),
               invite.protocolName == protocolName,
               invite.v == 1,
-              pairingCanonicalUUID(invite.pairId),
-              pairingCanonicalUUID(invite.creatorSideId),
-              pairingCanonicalUUID(invite.linkId),
+              invite.expiresAt == expiresAt,
+              isCanonicalUUID(invite.pairId),
+              isCanonicalUUID(invite.creatorSideId),
+              isCanonicalUUID(invite.linkId),
               Base64URL.decode32(invite.joinToken) != nil,
               Base64URL.decode32(invite.psk) != nil,
               invite.joinToken != invite.psk
@@ -68,11 +71,25 @@ struct PairingInvite: Codable, Equatable, Sendable {
 
 extension PairingInvite.CodingKeys: CaseIterable {}
 
-enum PairingProgress: String, Sendable {
-    case joining = "Joining Mac pairing session"
-    case securing = "Securing pairing session"
-    case waitingForApproval = "Waiting for approval on Mac"
-    case activating = "Activating enrollment"
+enum PairingProgress: Sendable, Equatable {
+    case joining
+    case securing
+    case waitingForApproval(fingerprint: String)
+    case activating
+
+    var status: String {
+        switch self {
+        case .joining: "Joining Mac pairing session"
+        case .securing: "Securing pairing session"
+        case .waitingForApproval: "Waiting for approval on Mac"
+        case .activating: "Activating enrollment"
+        }
+    }
+
+    var fingerprint: String? {
+        guard case let .waitingForApproval(fingerprint) = self else { return nil }
+        return fingerprint
+    }
 }
 
 enum PairingError: LocalizedError, Equatable {
@@ -151,38 +168,24 @@ private struct PairingRelayEnvelope {
     let body: [String: Any]
 
     static func parse(_ data: Data) throws -> PairingRelayEnvelope {
-        guard data.count <= 32 * 1_024,
-              let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              envelope["protocol"] as? String == "remote-davinci.rendezvous",
-              pairingJSONInt64(envelope["v"]) == 1,
-              let type = envelope["type"] as? String,
-              let id = envelope["id"] as? String,
-              pairingCanonicalUUID(id),
-              let body = envelope["body"] as? [String: Any]
+        guard let envelope = RendezvousEnvelope(
+            data,
+            allowedTypes: ["ok", "error", "pair.ready", "pair.completed", "pair.closed", "pair.frame"]
+        )
         else {
             throw PairingError.invalidMessage
         }
-        let replyTo: String?
-        if let rawReplyTo = envelope["replyTo"] {
-            guard let value = rawReplyTo as? String, pairingCanonicalUUID(value) else {
-                throw PairingError.invalidMessage
-            }
-            replyTo = value
-        } else {
-            replyTo = nil
-        }
-        return PairingRelayEnvelope(type: type, id: id, replyTo: replyTo, body: body)
+        return PairingRelayEnvelope(
+            type: envelope.type,
+            id: envelope.id,
+            replyTo: envelope.replyTo,
+            body: envelope.body
+        )
     }
 }
 
 @MainActor
 enum PairingClient {
-    private static let allowedErrorCodes = Set([
-        "INVALID_MESSAGE", "UNSUPPORTED_VERSION", "UNAUTHENTICATED", "FORBIDDEN",
-        "PAIR_UNAVAILABLE", "PAIR_FULL", "PAIR_EXPIRED", "PEER_OFFLINE", "PEER_BUSY",
-        "SESSION_NOT_FOUND", "PAYLOAD_TOO_LARGE", "RATE_LIMITED", "CONFLICT", "INTERNAL",
-    ])
-
     static func enroll(
         invite: PairingInvite,
         deviceLabel: String,
@@ -221,7 +224,7 @@ enum PairingClient {
 
         return try await withTaskCancellationHandler {
             var pendingSaved = false
-            var commitSent = false
+            var commitStarted = false
             do {
                 progress(.joining)
                 let joined = try await join(invite: invite, socket: socket)
@@ -254,6 +257,7 @@ enum PairingClient {
                 )
                 try noise.readMessage2(response)
 
+                let controllerFingerprint = try noiseFingerprint(request.controllerNoiseKey)
                 let controllerIdentity = PairingIdentityEnvelope(
                     protocol: "remote-davinci.pairing",
                     v: 1,
@@ -264,7 +268,7 @@ enum PairingClient {
                         endpointId: request.controllerEndpointId,
                         role: "controller",
                         noiseKey: request.controllerNoiseKey,
-                        noiseFingerprint: try noiseFingerprint(request.controllerNoiseKey),
+                        noiseFingerprint: controllerFingerprint,
                         deviceLabel: baseEnrollment.deviceLabel,
                         permissions: ControllerModel.operations,
                         capabilities: ControllerModel.operations
@@ -279,7 +283,7 @@ enum PairingClient {
                     socket: socket
                 )
 
-                progress(.waitingForApproval)
+                progress(.waitingForApproval(fingerprint: controllerFingerprint))
                 let companionCiphertext = try await receivePairFrame(
                     pairID: invite.pairId,
                     socket: socket,
@@ -304,8 +308,6 @@ enum PairingClient {
                 pending.response = responseEnrollment
                 pending.activationPending = true
                 pending.grantedPermissions = companion.permissions
-                pending.companionNoiseFingerprint = companion.noiseFingerprint
-                pending.pairingProtocol = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
                 pending.pairingExpiresAt = invite.expiresAt
                 do {
                     try KeychainStore.save(pending)
@@ -315,9 +317,10 @@ enum PairingClient {
                 }
 
                 progress(.activating)
+                try Task.checkCancellation()
                 let commitID = UUID().uuidString.lowercased()
                 // Once a commit send begins, activation may have happened even if the reply is lost.
-                commitSent = true
+                commitStarted = true
                 try await sendOuter(
                     type: "pair.commit",
                     id: commitID,
@@ -354,7 +357,7 @@ enum PairingClient {
                 return pending
             } catch {
                 if pendingSaved,
-                   pairingCheckpointDisposition(commitStarted: commitSent, error: error) == .delete
+                   pairingCheckpointDisposition(commitStarted: commitStarted, error: error) == .delete
                 {
                     do {
                         try KeychainStore.delete()
@@ -394,9 +397,9 @@ enum PairingClient {
                       let result = envelope.body["result"] as? [String: Any],
                       result["pairId"] as? String == invite.pairId,
                       let receivedSideID = result["sideId"] as? String,
-                      pairingCanonicalUUID(receivedSideID),
+                      isCanonicalUUID(receivedSideID),
                       receivedSideID != invite.creatorSideId,
-                      let receivedExpiry = pairingJSONInt64(result["expiresAt"]),
+                      let receivedExpiry = jsonInt64(result["expiresAt"]),
                       receivedExpiry == invite.expiresAt
                 else {
                     throw PairingError.invalidMessage
@@ -406,7 +409,7 @@ enum PairingClient {
                 guard envelope.replyTo == nil,
                       envelope.body["pairId"] as? String == invite.pairId,
                       envelope.body["peerSideId"] as? String == invite.creatorSideId,
-                      pairingJSONInt64(envelope.body["expiresAt"]) == invite.expiresAt
+                      jsonInt64(envelope.body["expiresAt"]) == invite.expiresAt
                 else {
                     throw PairingError.invalidMessage
                 }
@@ -438,7 +441,7 @@ enum PairingClient {
             case "pair.frame":
                 guard envelope.replyTo == nil,
                       envelope.body["pairId"] as? String == pairID,
-                      let sequence = pairingJSONInt64(envelope.body["seq"]),
+                      let sequence = jsonInt64(envelope.body["seq"]),
                       sequence >= 1,
                       let payload = envelope.body["payload"] as? String,
                       let frame = Base64URL.decode(payload),
@@ -474,12 +477,12 @@ enum PairingClient {
                 else {
                     throw PairingError.invalidMessage
                 }
-                if pairingJSONBool(result["active"]) == true,
+                if jsonBool(result["active"]) == true,
                    result["linkId"] as? String == invite.linkId
                 {
                     return
                 }
-                guard pairingJSONBool(result["pending"]) == true else {
+                guard jsonBool(result["pending"]) == true else {
                     throw PairingError.invalidMessage
                 }
             case "pair.completed":
@@ -511,8 +514,9 @@ enum PairingClient {
         controllerEndpointID: String
     ) throws -> PairingIdentityBody {
         guard data.count <= 8_140,
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let object = ProtocolJSON.object(data),
               Set(object.keys) == Set(["protocol", "v", "type", "id", "body"]),
+              jsonInt64(object["v"]) == 1,
               let rawBody = object["body"] as? [String: Any],
               Set(rawBody.keys) == Set([
                   "linkId", "endpointId", "role", "noiseKey", "noiseFingerprint",
@@ -522,15 +526,15 @@ enum PairingClient {
               identity.protocol == "remote-davinci.pairing",
               identity.v == 1,
               identity.type == "identity",
-              pairingCanonicalUUID(identity.id),
+              isCanonicalUUID(identity.id),
               identity.body.linkId == invite.linkId,
-              pairingCanonicalUUID(identity.body.endpointId),
+              isCanonicalUUID(identity.body.endpointId),
               identity.body.endpointId != controllerEndpointID,
               identity.body.role == "companion",
               let peerKey = Base64URL.decode32(identity.body.noiseKey),
               Enrollment.isContributoryX25519PublicKey(peerKey),
               identity.body.noiseFingerprint == (try? noiseFingerprint(identity.body.noiseKey)),
-              (1...80).contains(identity.body.deviceLabel.unicodeScalars.count),
+              validDeviceLabel(identity.body.deviceLabel),
               validNames(identity.body.permissions),
               validNames(identity.body.capabilities),
               !identity.body.permissions.isEmpty,
@@ -603,10 +607,17 @@ enum PairingClient {
 
     private static func relayError(_ envelope: PairingRelayEnvelope) throws -> PairingError {
         guard let code = envelope.body["code"] as? String,
-              allowedErrorCodes.contains(code),
-              let retryable = pairingJSONBool(envelope.body["retryable"])
+              RendezvousEnvelope.errorCodes.contains(code),
+              let retryable = jsonBool(envelope.body["retryable"])
         else {
             throw PairingError.invalidMessage
+        }
+        if envelope.body.keys.contains("retryAfterMs") {
+            guard let retryAfter = jsonInt64(envelope.body["retryAfterMs"]),
+                  (0...3_600_000).contains(retryAfter)
+            else {
+                throw PairingError.invalidMessage
+            }
         }
         return .relay(code: code, retryable: retryable)
     }
@@ -651,28 +662,4 @@ private func validNames(_ values: [String]) -> Bool {
             options: .regularExpression
         ) != nil
     }
-}
-
-private func pairingCanonicalUUID(_ value: String) -> Bool {
-    UUID(uuidString: value)?.uuidString.lowercased() == value
-}
-
-private func pairingJSONInt64(_ value: Any?) -> Int64? {
-    guard let number = value as? NSNumber,
-          CFGetTypeID(number) != CFBooleanGetTypeID(),
-          number.doubleValue.rounded(.towardZero) == number.doubleValue,
-          abs(number.doubleValue) <= 9_007_199_254_740_991
-    else {
-        return nil
-    }
-    return number.int64Value
-}
-
-private func pairingJSONBool(_ value: Any?) -> Bool? {
-    guard let number = value as? NSNumber,
-          CFGetTypeID(number) == CFBooleanGetTypeID()
-    else {
-        return nil
-    }
-    return number.boolValue
 }

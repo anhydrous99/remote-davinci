@@ -425,6 +425,104 @@ func TestQRPairCreateAndJoinUseOnlyTokenHashInStorage(t *testing.T) {
 	}
 }
 
+func TestGoneJoinerDuringPairReadyNotifiesCreatorClosedOnce(t *testing.T) {
+	joinToken := base64.RawURLEncoding.EncodeToString(bytesOf(32, 9))
+	pair := Pair{
+		PairID: uuid(20), JoinTokenHash: credentialDigest(joinToken), Status: "OPEN",
+		SideA: PairSide{ConnectionID: "creator", SideID: uuid(21)}, ExpiresAt: 1_000,
+	}
+	disconnects, cancellations := 0, 0
+	var posts []string
+	handler := testHandler(&fakeStore{
+		rateLimit: func(context.Context, string, string, int64, int64) error { return nil },
+		joinPair: func(_ context.Context, _ string, _ string, side PairSide, _ int64) (Pair, error) {
+			pair.SideB, pair.Status = &side, "READY"
+			return pair, nil
+		},
+		disconnect: func(_ context.Context, id string, _ int64) (*DisconnectResult, error) {
+			disconnects++
+			if id != "joiner" {
+				t.Fatalf("disconnect = %s", id)
+			}
+			return &DisconnectResult{Connection: Connection{ConnectionID: id, PairingID: pair.PairID}}, nil
+		},
+		cancelPair: func(_ context.Context, pairID, connectionID string, _ int64) (*Pair, error) {
+			cancellations++
+			if pairID != pair.PairID || connectionID != "joiner" {
+				t.Fatalf("cancel = %s/%s", pairID, connectionID)
+			}
+			closed := pair
+			closed.Status = "CLOSED"
+			return &closed, nil
+		},
+	}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
+		posts = append(posts, target+":"+message.Type)
+		if target == "joiner" && message.Type == "pair.ready" {
+			return apiError("GoneException")
+		}
+		if target == "creator" && message.Type == "pair.closed" {
+			body := decodedMessageBody(t, message)
+			if body["pairId"] != pair.PairID || body["reason"] != "peer-disconnected" {
+				t.Fatalf("closed body = %#v", body)
+			}
+		}
+		return nil
+	})
+	message, err := protocol.ParseClient(envelope("pair.join", map[string]any{"joinToken": joinToken}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := handler.dispatch(context.Background(), message, Connection{
+		ConnectionID: "joiner", AuthMode: "pairing", SourceKey: "source", ExpiresAt: 1_000,
+	}, socketEvent("joiner", "$default", ""))
+	if result != nil || serviceCode(err) != protocol.PeerOffline || disconnects != 1 || cancellations != 1 {
+		t.Fatalf("result = %#v, error = %v, disconnects = %d, cancellations = %d", result, err, disconnects, cancellations)
+	}
+	want := "[creator:pair.ready joiner:pair.ready creator:pair.closed]"
+	if fmt.Sprint(posts) != want {
+		t.Fatalf("posts = %v, want %s", posts, want)
+	}
+}
+
+func TestGonePeerDuringPairCancelDoesNotNotifyCancellerClosed(t *testing.T) {
+	pair := Pair{
+		PairID: uuid(22), Status: "CLOSED", SideA: PairSide{ConnectionID: "creator", SideID: uuid(23)},
+		SideB: &PairSide{ConnectionID: "joiner", SideID: uuid(24)}, ExpiresAt: 1_000,
+	}
+	disconnects, cancellations := 0, 0
+	var posts []string
+	handler := testHandler(&fakeStore{
+		disconnect: func(_ context.Context, id string, _ int64) (*DisconnectResult, error) {
+			disconnects++
+			return &DisconnectResult{Connection: Connection{ConnectionID: id, PairingID: pair.PairID}}, nil
+		},
+		cancelPair: func(_ context.Context, pairID, _ string, _ int64) (*Pair, error) {
+			cancellations++
+			if pairID != pair.PairID {
+				t.Fatalf("pair id = %s", pairID)
+			}
+			return &pair, nil
+		},
+	}, func(_ context.Context, target string, message Message, _ WebSocketEvent) error {
+		posts = append(posts, target+":"+message.Type)
+		if target == "joiner" {
+			return apiError("GoneException")
+		}
+		return nil
+	})
+	message, err := protocol.ParseClient(envelope("pair.cancel", map[string]any{"pairId": pair.PairID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := handler.dispatch(context.Background(), message, Connection{ConnectionID: "creator"}, socketEvent("creator", "$default", ""))
+	if err != nil || result["cancelled"] != true || disconnects != 1 || cancellations != 2 {
+		t.Fatalf("result = %#v, error = %v, disconnects = %d, cancellations = %d", result, err, disconnects, cancellations)
+	}
+	if want := "[joiner:pair.closed]"; fmt.Sprint(posts) != want {
+		t.Fatalf("posts = %v, want %s", posts, want)
+	}
+}
+
 func TestPairFrameForwardsOpaquePayloadWithoutSuccessReply(t *testing.T) {
 	pairID := uuid(2)
 	sideB := PairSide{ConnectionID: "b", SideID: uuid(4)}

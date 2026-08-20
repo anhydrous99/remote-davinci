@@ -136,23 +136,27 @@ func (app *App) startRelay(config Config) {
 	app.mu.Unlock()
 	go func() {
 		_ = RunRelay(ctx, config, func(status RelayStatus) {
-			if ctx.Err() != nil {
-				return
-			}
-			app.mu.Lock()
-			if app.config != nil && app.config.EndpointID == config.EndpointID {
-				if status.Connected && app.config.ActivationPending {
-					activated := *app.config
-					activated.ActivationPending = false
-					if app.store.Save(activated) == nil {
-						app.config = &activated
-					}
-				}
-				app.status = status
-			}
-			app.mu.Unlock()
+			app.applyRelayStatus(ctx, config, status)
 		})
 	}()
+}
+
+func (app *App) applyRelayStatus(ctx context.Context, config Config, status RelayStatus) {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	if app.config != nil && app.config.EndpointID == config.EndpointID {
+		if status.Connected && app.config.ActivationPending {
+			activated := *app.config
+			activated.ActivationPending = false
+			if app.store.Save(activated) == nil {
+				app.config = &activated
+			}
+		}
+		app.status = status
+	}
 }
 
 func (app *App) state() State {
@@ -165,7 +169,7 @@ func (app *App) state() State {
 	if app.config != nil {
 		state.EndpointID = app.config.EndpointID
 		state.LinkID = app.config.LinkID
-		state.ControllerLabel = app.config.ControllerLabel
+		state.ControllerLabel = displayDeviceLabel(app.config.ControllerLabel)
 		if app.config.ControllerFingerprint == "" && !state.Secure {
 			response, err := manualEnrollmentResponse(*app.config)
 			if err == nil {
@@ -310,6 +314,8 @@ func (app *App) handlePairingStart(response http.ResponseWriter, request *http.R
 
 func (app *App) finishPairing(attempt *pairingAttempt) {
 	config, staged, err := attempt.run()
+	app.enrollMu.Lock()
+	defer app.enrollMu.Unlock()
 	app.mu.Lock()
 	if app.pairing != attempt {
 		app.mu.Unlock()

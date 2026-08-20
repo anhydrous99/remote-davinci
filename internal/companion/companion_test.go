@@ -34,6 +34,40 @@ const (
 	testCompanionID  = "22222222-2222-4222-8222-222222222222"
 )
 
+func TestRelayURLRequiresCanonicalForm(t *testing.T) {
+	for _, value := range []string{DefaultRelayURL, "wss://relay.example/v1"} {
+		if _, err := relayURL(value); err != nil {
+			t.Fatalf("canonical relay URL %q rejected: %v", value, err)
+		}
+	}
+	for _, value := range []string{
+		"wss://relay.example/v1?",
+		"wss://relay.example/v1#",
+		"wss://relay.example/v1?token=secret",
+		"wss://relay.example/v1#fragment",
+	} {
+		if _, err := relayURL(value); err == nil {
+			t.Fatalf("noncanonical relay URL %q accepted", value)
+		}
+	}
+}
+
+func TestDeviceLabelsRejectInvisibleControls(t *testing.T) {
+	for _, value := range []string{"Alex's iPad", "Téléphone 猫 📱"} {
+		if !validDeviceLabel(value) {
+			t.Fatalf("safe device label %q rejected", value)
+		}
+	}
+	for _, value := range []string{"", " ", " padded", "line\nbreak", "spoof\u202e", "family\u200demoji"} {
+		if validDeviceLabel(value) {
+			t.Fatalf("unsafe device label %q accepted", value)
+		}
+		if got := displayDeviceLabel(value); got != "Unknown controller" {
+			t.Fatalf("unsafe device label rendered as %q", got)
+		}
+	}
+}
+
 func TestControlProcessorValidatesAndDeduplicates(t *testing.T) {
 	executions := 0
 	processor := newControlProcessor(func(_ context.Context, operation string) (map[string]any, error) {
@@ -408,6 +442,36 @@ func TestSecureChannelInteroperatesWithNoiseIKAndReordersFrames(t *testing.T) {
 	}
 }
 
+func TestSessionFrameFilteringIgnoresOnlyValidStaleFrames(t *testing.T) {
+	raw := validPendingServerFrame(t, 1, 1)
+	envelope, err := protocol.ParseServer(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame, err := currentSessionFrame(envelope, nil); err != nil || frame != nil {
+		t.Fatalf("outside-session frame = %#v, error = %v", frame, err)
+	}
+	if frame, err := currentSessionFrame(envelope, &secureChannel{sessionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"}); err != nil || frame != nil {
+		t.Fatalf("stale-session frame = %#v, error = %v", frame, err)
+	}
+
+	channel, err := newSecureChannel(validTestConfig(t), testSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := currentSessionFrame(envelope, channel)
+	if err != nil || frame == nil {
+		t.Fatalf("current-session frame = %#v, error = %v", frame, err)
+	}
+	if _, _, err := channel.receive(t.Context(), frame.Seq, frame.Payload); err == nil {
+		t.Fatal("accepted invalid Noise payload for the current session")
+	}
+	malformed := protocol.ServerEnvelope{Type: "session.frame", Body: json.RawMessage(`{"sessionId":`)}
+	if frame, err := currentSessionFrame(malformed, nil); err == nil || frame != nil {
+		t.Fatalf("malformed stale frame = %#v, error = %v", frame, err)
+	}
+}
+
 func TestRelayReconcilesWithoutDroppingQueuedRevocationEvents(t *testing.T) {
 	config := validTestConfig(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -533,6 +597,12 @@ func TestEnrollmentValidationRejectsNonCanonicalCredentials(t *testing.T) {
 	if _, err := ParseEnrollmentRequest(data); err != nil {
 		t.Fatal(err)
 	}
+	request.DeviceLabel = "spoof\u202e"
+	data, _ = json.Marshal(request)
+	if _, err := ParseEnrollmentRequest(data); err == nil {
+		t.Fatal("accepted a device label containing directional formatting")
+	}
+	request.DeviceLabel = "Test iPad"
 	request.ControllerCredentialHash += "="
 	data, _ = json.Marshal(request)
 	if _, err := ParseEnrollmentRequest(data); err == nil {
@@ -1110,6 +1180,32 @@ func TestStateReconstructsManualEnrollmentResponseUntilSecure(t *testing.T) {
 	app.status.Secure = true
 	if response := app.state().EnrollmentResponse; response != nil {
 		t.Fatalf("secure state exposed manual enrollment response = %#v", response)
+	}
+}
+
+func TestCancelledRelayCallbackCannotClearActivationCheckpoint(t *testing.T) {
+	config := validTestConfig(t)
+	config.ActivationPending = true
+	store := &fakeConfigStore{}
+	app := &App{store: store, config: &config, status: RelayStatus{Message: "Connecting"}}
+	ctx, cancel := context.WithCancel(t.Context())
+
+	app.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.applyRelayStatus(ctx, config, RelayStatus{Connected: true, Message: "Connected"})
+	}()
+	cancel()
+	app.mu.Unlock()
+	<-done
+	if len(store.saves) != 0 || !app.config.ActivationPending || app.status.Message != "Connecting" {
+		t.Fatalf("cancelled callback saved %d times; config/status = %#v/%#v", len(store.saves), app.config, app.status)
+	}
+
+	app.applyRelayStatus(t.Context(), config, RelayStatus{Connected: true, Message: "Connected"})
+	if len(store.saves) != 1 || app.config.ActivationPending || app.status.Message != "Connected" {
+		t.Fatalf("live callback saved %d times; config/status = %#v/%#v", len(store.saves), app.config, app.status)
 	}
 }
 

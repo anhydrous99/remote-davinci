@@ -50,6 +50,62 @@ enum CompanionFailure: LocalizedError {
     }
 }
 
+private func canonicalBase64URL32(_ value: String) -> Bool {
+    guard value.count == 43 else { return false }
+    let padded = value.replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/") + "="
+    guard let bytes = Data(base64Encoded: padded), bytes.count == 32 else { return false }
+    return bytes.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .trimmingCharacters(in: CharacterSet(charactersIn: "=")) == value
+}
+
+private func canonicalUUID(_ value: String) -> Bool {
+    guard let uuid = UUID(uuidString: value) else { return false }
+    return uuid.uuidString.lowercased() == value
+}
+
+private func validDeviceLabel(_ value: String) -> Bool {
+    guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+          (1...80).contains(value.unicodeScalars.count)
+    else { return false }
+    return value.unicodeScalars.allSatisfy { scalar in
+        switch scalar.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator:
+            return false
+        default:
+            return true
+        }
+    }
+}
+
+private func validProtocolName(_ value: String) -> Bool {
+    let scalars = value.unicodeScalars
+    guard (1...128).contains(scalars.count),
+          let first = scalars.first,
+          (97...122).contains(first.value)
+    else { return false }
+    var separator = false
+    for scalar in scalars.dropFirst() {
+        let value = scalar.value
+        if (97...122).contains(value) || (48...57).contains(value) {
+            separator = false
+        } else if value == 45 || value == 46 || value == 95 {
+            if separator { return false }
+            separator = true
+        } else {
+            return false
+        }
+    }
+    return !separator
+}
+
+private func displayDeviceLabel(_ value: String?) -> String {
+    guard let value, validDeviceLabel(value) else { return "Unknown controller" }
+    return value
+}
+
 enum CompanionLaunchArguments {
     static let relayEnvironmentKey = "REMOTE_DAVINCI_RELAY_URL"
 
@@ -99,7 +155,7 @@ enum ReadinessValidator {
               items.count == 1,
               items[0].name == "token",
               let token = items[0].value,
-              validToken(token)
+              canonicalBase64URL32(token)
         else {
             throw CompanionFailure.invalidReadiness
         }
@@ -120,16 +176,6 @@ enum ReadinessValidator {
         default:
             return "The server helper could not start."
         }
-    }
-
-    private static func validToken(_ token: String) -> Bool {
-        let padded = token.replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/") + "="
-        guard let bytes = Data(base64Encoded: padded), bytes.count == 32 else { return false }
-        return bytes.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "=")) == token
     }
 
     private static func isNumericLoopback(_ host: String) -> Bool {
@@ -178,6 +224,17 @@ struct CompanionState: Decodable, Equatable, Sendable {
         if connected { return "Connected to relay" }
         return status
     }
+
+    var controllerDisplayLabel: String {
+        displayDeviceLabel(controllerLabel)
+    }
+}
+
+struct PairingApprovalDetails: Equatable, Sendable {
+    let pairID: String
+    let controllerLabel: String
+    let controllerFingerprint: String
+    let requestedPermissions: [String]
 }
 
 struct PairingSnapshot: Decodable, Equatable, Sendable {
@@ -193,17 +250,58 @@ struct PairingSnapshot: Decodable, Equatable, Sendable {
         case pairID = "pairId"
     }
 
+    private static let supportedPermissions: Set<String> = [
+        "resolve.page.media",
+        "resolve.page.cut",
+        "resolve.page.edit",
+        "resolve.page.fusion",
+        "resolve.page.color",
+        "resolve.page.fairlight",
+        "resolve.page.deliver",
+        "host.volume.toggle-mute",
+    ]
+
     var isShowingInvite: Bool {
-        phase == "inviting" || phase == "showingQR" || phase == "waiting_for_scan"
+        phase == "showingQR"
     }
 
     var isAwaitingApproval: Bool {
-        phase == "awaitingApproval" || phase == "awaiting_approval"
+        phase == "awaitingApproval"
     }
 
     var isTerminal: Bool {
         ["cancelled", "expired", "failed", "rejected"].contains(phase)
     }
+
+    var validPairID: String? {
+        guard let pairID, canonicalUUID(pairID) else { return nil }
+        return pairID
+    }
+
+    var approvalDetails: PairingApprovalDetails? {
+        guard isAwaitingApproval,
+              let pairID = validPairID,
+              let controllerLabel,
+              validDeviceLabel(controllerLabel),
+              let controllerFingerprint,
+              controllerFingerprint.hasPrefix("sha256:"),
+              canonicalBase64URL32(String(controllerFingerprint.dropFirst("sha256:".count))),
+              let requestedPermissions,
+              !requestedPermissions.isEmpty,
+              requestedPermissions.count <= 64,
+              Set(requestedPermissions).count == requestedPermissions.count,
+              requestedPermissions.allSatisfy(validProtocolName),
+              requestedPermissions.contains(where: Self.supportedPermissions.contains)
+        else { return nil }
+        return PairingApprovalDetails(
+            pairID: pairID,
+            controllerLabel: controllerLabel,
+            controllerFingerprint: controllerFingerprint,
+            requestedPermissions: requestedPermissions
+        )
+    }
+
+    var isApprovable: Bool { approvalDetails != nil }
 }
 
 struct PairingInvite: Codable, Equatable, Sendable {
@@ -799,7 +897,7 @@ final class CompanionModel: ObservableObject {
     }
 
     func approvePairing() {
-        guard let pairID = state?.pairing?.pairID else { return }
+        guard let pairID = state?.pairing?.approvalDetails?.pairID else { return }
         mutate { [weak self] api in
             try await api.approvePairing(pairID: pairID)
             self?.clearPairingInvite()
@@ -808,7 +906,7 @@ final class CompanionModel: ObservableObject {
     }
 
     func rejectPairing() {
-        guard let pairID = state?.pairing?.pairID else { return }
+        guard let pairID = state?.pairing?.validPairID else { return }
         mutate { [weak self] api in
             try await api.rejectPairing(pairID: pairID)
             self?.clearPairingInvite()
@@ -817,12 +915,20 @@ final class CompanionModel: ObservableObject {
     }
 
     func cancelPairing() {
-        guard let pairID = state?.pairing?.pairID ?? pairingInvite?.pairID else { return }
+        guard let pairID = pairingCancellationID else { return }
         mutate { [weak self] api in
             try await api.cancelPairing(pairID: pairID)
             self?.clearPairingInvite()
             self?.feedback = "Pairing cancelled."
         }
+    }
+
+    var canCancelPairing: Bool { pairingCancellationID != nil }
+
+    private var pairingCancellationID: String? {
+        if let pairID = state?.pairing?.validPairID { return pairID }
+        guard let pairID = pairingInvite?.pairID, canonicalUUID(pairID) else { return nil }
+        return pairID
     }
 
     func copyEnrollmentResponse() {

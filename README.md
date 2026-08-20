@@ -59,7 +59,7 @@ Network scripting, port 9060, raw keyboard access, or Accessibility permission.
 open -a Xcode apps/controller/RemoteDavinciController.swiftpm
 ```
 
-In Xcode, select the **RemoteDavinciController** scheme, then choose a run
+In Xcode, select the **Remote DaVinci** scheme, then choose a run
 destination:
 
 - For a simulator, choose an iPhone or iPad simulator and press Run.
@@ -76,8 +76,9 @@ enrolled.
 
 1. On iOS, keep or edit **Device label**, then tap **Scan Mac QR Code**.
 2. Allow camera access and scan the one-time code shown by the Mac companion.
-3. When the Mac shows the controller label, security fingerprint, and eight
-   requested controls, verify the device and click **Approve**.
+3. When both devices show the controller security fingerprint, verify that the
+   values match, review the controller label and eight requested controls, and
+   click **Approve** on the Mac.
 4. Both apps save the pairing in Keychain and the controller connects
    automatically. Success is **Connected** with **Ready** on iOS and
    **Secure controller session** on the Mac.

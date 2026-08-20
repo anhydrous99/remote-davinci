@@ -18,6 +18,7 @@ V1 is single-region, relay-only, and live-only. It has no mailbox, offline queue
 - WebSocket messages are UTF-8 JSON text. Binary WebSocket frames are invalid.
 - IDs are canonical lowercase UUID strings.
 - Binary fields are unpadded RFC 4648 base64url unless a field explicitly says hexadecimal.
+- JSON number tokens are at most 128 bytes and have an absolute exponent no greater than 4,096; parsers enforce this before schema evaluation.
 - Outer rendezvous timestamps are Unix epoch seconds (matching DynamoDB TTL). Inner control `sentAt` and `expiresAt` are Unix epoch milliseconds.
 - The outer API Gateway frame is at most 32 KiB. A decoded relay `payload` is at most 16 KiB.
 - Every sent message gets a fresh `id`. A response copies that ID to `replyTo`.
@@ -142,7 +143,7 @@ Use a reviewed implementation compatible with Magic Wormhole's `python-spake2==0
 4. Let the SPAKE output be `K`. For every encrypted message derive a 32-byte phase key with RFC 5869 HKDF-SHA256: input key `K`, no salt, and info `ASCII("wormhole:phase:") || SHA256(ASCII(senderSideId)) || SHA256(ASCII(phase))`.
 5. Encrypt `version` and numeric phases with NaCl SecretBox (XSalsa20-Poly1305), using a fresh random 24-byte nonce prepended to the authenticated ciphertext, then lowercase-hex encode the result into `body`.
 6. The `version` plaintext is UTF-8 JSON containing `{ "app_versions": { "remote-davinci": { "v": 1 } } }`. Successfully decrypting any peer encrypted phase proves key possession; failure immediately closes the pairing. The optional 32-byte verifier is HKDF-SHA256(`K`, no salt, info `wormhole:verifier`).
-7. After key confirmation, each side sends one numeric phase `0` whose decrypted plaintext matches `pairing-v1.schema.json`. The creator generates `linkId`; the joiner echoes it. `noiseFingerprint` is exactly `"sha256:" + base64url(SHA-256(raw 32-byte noiseKey))`; receivers recompute it and reject a mismatch. The Noise implementation also rejects invalid or low-order X25519 public keys. Noise keys, fingerprints, labels, permissions, and capabilities stay inside this encrypted document and local storage.
+7. After key confirmation, each side sends one numeric phase `0` whose decrypted plaintext matches `pairing-v1.schema.json`. The creator generates `linkId`; the joiner echoes it. `noiseFingerprint` is exactly `"sha256:" + base64url(SHA-256(raw 32-byte noiseKey))`; receivers recompute it and reject a mismatch. The Noise implementation also rejects invalid or low-order X25519 public keys. Device labels contain 1–80 Unicode scalars and reject control, format, line-separator, and paragraph-separator characters. Noise keys, fingerprints, labels, permissions, and capabilities stay inside this encrypted document and local storage.
 8. The controller's permissions are its request. The companion's permissions are its grant; a future implementation must persist only the intersection after local user approval and enforce it centrally. Each then sends the minimal outer `pair.commit`.
 
 The compact phase-`0` wrapper plus SecretBox and hex overhead limits the decrypted pairing identity document to `MAX_PAIRING_PLAINTEXT_BYTES` (8,140 bytes). Pairing state is `OPEN -> READY -> HALF_COMMITTED -> ACTIVE`; any non-active state can become `CLOSED`.
