@@ -46,12 +46,19 @@ struct ControllerView: View {
         NavigationStack {
             TabView(selection: pageSelection) {
                 ForEach(ResolvePage.allCases, id: \.self) { page in
+                    let available = model.isPageAvailable(page)
                     Color.clear
                         .accessibilityElement()
                         .accessibilityLabel("\(page.rawValue.capitalized) page")
-                        .accessibilityHint("Opens this page in DaVinci Resolve on the Mac")
+                        .accessibilityHint(available
+                            ? "Opens this page in DaVinci Resolve on the Mac"
+                            : "This page is not granted by the enrolled companion"
+                        )
                         .tabItem {
-                            Label(page.rawValue.capitalized, systemImage: page.systemImage)
+                            Label(
+                                page.rawValue.capitalized,
+                                systemImage: available ? page.systemImage : "lock.fill"
+                            )
                         }
                         .tag(page)
                 }
@@ -63,6 +70,15 @@ struct ControllerView: View {
                         .accessibilityLabel(
                             "Opening \(page.rawValue.capitalized) page in DaVinci Resolve"
                         )
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if !model.feedback.isEmpty {
+                    Text(model.feedback)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal)
+                        .accessibilityLabel("Command status: \(model.feedback)")
                 }
             }
             .navigationTitle("Remote DaVinci")
@@ -126,6 +142,17 @@ private struct ControllerSettingsView: View {
                     if model.isPairing {
                         ProgressView(model.pairingStatus)
                             .accessibilityLabel("Pairing status: \(model.pairingStatus)")
+
+                        if !model.pairingFingerprint.isEmpty {
+                            Text("Compare this fingerprint with the one shown on your Mac before approving:")
+                                .font(.caption)
+                            Text(model.pairingFingerprint)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                                .accessibilityLabel(
+                                    "Controller pairing fingerprint: \(model.pairingFingerprint)"
+                                )
+                        }
 
                         Button("Cancel Pairing", role: .cancel) {
                             model.cancelPairing()

@@ -31,8 +31,6 @@ struct StoredEnrollment: Codable, Equatable {
     var linkRevocationConfirmed: Bool? = nil
     var activationPending: Bool? = nil
     var grantedPermissions: [String]? = nil
-    var companionNoiseFingerprint: String? = nil
-    var pairingProtocol: String? = nil
     var pairingExpiresAt: Int64? = nil
 }
 
@@ -90,7 +88,7 @@ enum Enrollment {
     ) throws -> (EnrollmentRequest, StoredEnrollment) {
         let relayURL = try validatedRelayURL(relayURL)
         let label = deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (1...80).contains(label.unicodeScalars.count) else {
+        guard validDeviceLabel(label) else {
             throw EnrollmentError.invalidDeviceLabel
         }
 
@@ -116,17 +114,17 @@ enum Enrollment {
         guard isCanonicalUUID(stored.controllerEndpointId),
               let secret = Base64URL.decode32(stored.controllerSecret),
               let privateKeyData = Base64URL.decode32(stored.controllerNoisePrivateKey),
-              let privateKey = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKeyData),
-              (1...80).contains(stored.deviceLabel.unicodeScalars.count)
+              let privateKey = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKeyData)
         else {
             throw EnrollmentError.invalidResponse
         }
+        let deviceLabel = validDeviceLabel(stored.deviceLabel) ? stored.deviceLabel : "Legacy device"
         return EnrollmentRequest(
             v: 1,
             controllerEndpointId: stored.controllerEndpointId,
             controllerCredentialHash: Base64URL.encode(Data(SHA256.hash(data: secret))),
             controllerNoiseKey: Base64URL.encode(privateKey.publicKey.rawRepresentation),
-            deviceLabel: stored.deviceLabel
+            deviceLabel: deviceLabel
         )
     }
 
@@ -153,6 +151,8 @@ enum Enrollment {
 
     static func importResponse(_ json: String, into stored: StoredEnrollment) throws -> StoredEnrollment {
         guard let data = json.data(using: .utf8),
+              let object = ProtocolJSON.object(data),
+              jsonInt64(object["v"]) == 1,
               let response = try? JSONDecoder().decode(EnrollmentResponse.self, from: data)
         else {
             throw EnrollmentError.invalidJSON
@@ -432,24 +432,44 @@ enum RelayLifecycleResponse: Equatable {
     case event
 }
 
+enum RelayRecoveryDisposition: Equatable {
+    case reconnect
+    case stop
+}
+
 enum RelayLifecycle {
-    private static let errorCodes = Set([
-        "INVALID_MESSAGE", "UNSUPPORTED_VERSION", "UNAUTHENTICATED", "FORBIDDEN",
-        "PAIR_UNAVAILABLE", "PAIR_FULL", "PAIR_EXPIRED", "PEER_OFFLINE", "PEER_BUSY",
-        "SESSION_NOT_FOUND", "PAYLOAD_TOO_LARGE", "RATE_LIMITED", "CONFLICT", "INTERNAL",
-    ])
+    static let sessionSetupTimeoutSeconds: Double = 15
+    static let reconnectStabilitySeconds: Double = 30
 
     static func reconnectDelaySeconds(attempt: Int, randomUnit: Double) -> Double {
         let ceiling = min(900, pow(2, Double(min(max(attempt, 0), 10))))
         return ceiling * min(max(randomUnit, 0), 1)
     }
 
+    static func reconnectAttempt(
+        current: Int,
+        afterStableSession stable: Bool
+    ) -> Int {
+        stable ? 0 : current
+    }
+
     static func rotationDelaySeconds(randomUnit: Double) -> Double {
         5_400 + 1_200 * min(max(randomUnit, 0), 1)
     }
 
-    static func shouldReconnect(code: String, retryable: Bool) -> Bool {
-        retryable && code != "UNAUTHENTICATED" && code != "FORBIDDEN"
+    static func remainingMilliseconds(expiresAt: Int64, now: Int64) -> Int64 {
+        max(0, expiresAt - now)
+    }
+
+    static func isCurrentSessionFrame(
+        receivedSessionID: String,
+        currentSessionID: String?
+    ) -> Bool {
+        receivedSessionID == currentSessionID
+    }
+
+    static func recoveryDisposition(code: String, retryable: Bool) -> RelayRecoveryDisposition {
+        retryable || code == "SESSION_NOT_FOUND" ? .reconnect : .stop
     }
 
     static func terminalHandshakeAuthorizationStatus(
@@ -472,18 +492,13 @@ enum RelayLifecycle {
     }
 
     static func isCurrentSessionClose(
-        envelope: [String: Any],
-        body: [String: Any],
+        _ envelope: RendezvousEnvelope,
         currentSessionID: String?
     ) throws -> Bool {
-        guard envelope["replyTo"] == nil,
-              let eventID = envelope["id"] as? String,
-              isCanonicalUUID(eventID),
-              let closedSessionID = body["sessionId"] as? String,
+        guard let closedSessionID = envelope.body["sessionId"] as? String,
               isCanonicalUUID(closedSessionID),
-              let reason = body["reason"] as? String,
-              !reason.isEmpty,
-              reason.count <= 64
+              let reason = envelope.body["reason"] as? String,
+              ["requested", "peer-disconnected", "expired", "revoked", "replaced"].contains(reason)
         else {
             throw ControllerProtocolError.invalidMessage
         }
@@ -495,37 +510,27 @@ enum RelayLifecycle {
         requestID: String,
         requestType: String
     ) throws -> RelayLifecycleResponse {
-        guard let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              envelope["protocol"] as? String == "remote-davinci.rendezvous",
-              jsonInt64(envelope["v"]) == 1,
-              let type = envelope["type"] as? String,
-              let id = envelope["id"] as? String,
-              isCanonicalUUID(id),
-              let body = envelope["body"] as? [String: Any]
+        guard let envelope = RendezvousEnvelope(
+            data,
+            allowedTypes: ["ok", "error", "session.closed", "link.revoked"]
+        )
         else {
             throw ControllerProtocolError.invalidMessage
         }
 
-        switch type {
+        switch envelope.type {
         case "session.closed":
-            _ = try isCurrentSessionClose(
-                envelope: envelope,
-                body: body,
-                currentSessionID: nil
-            )
+            _ = try isCurrentSessionClose(envelope, currentSessionID: nil)
             return .event
         case "link.revoked":
-            guard envelope["replyTo"] == nil,
-                  let linkID = body["linkId"] as? String,
+            guard let linkID = envelope.body["linkId"] as? String,
                   isCanonicalUUID(linkID)
             else {
                 throw ControllerProtocolError.invalidMessage
             }
             return .event
         case "ok", "error":
-            guard let replyTo = envelope["replyTo"] as? String,
-                  isCanonicalUUID(replyTo),
-                  replyTo == requestID
+            guard envelope.replyTo == requestID
             else {
                 throw ControllerProtocolError.unexpectedMessage
             }
@@ -533,9 +538,9 @@ enum RelayLifecycle {
             throw ControllerProtocolError.unexpectedMessage
         }
 
-        if type == "ok" {
-            guard body["requestType"] as? String == requestType,
-                  let result = body["result"] as? [String: Any],
+        if envelope.type == "ok" {
+            guard envelope.body["requestType"] as? String == requestType,
+                  let result = envelope.body["result"] as? [String: Any],
                   jsonBool(result["revoked"]) == true
             else {
                 throw ControllerProtocolError.invalidMessage
@@ -543,14 +548,14 @@ enum RelayLifecycle {
             return .success
         }
 
-        guard let code = body["code"] as? String,
-              errorCodes.contains(code),
-              let retryable = jsonBool(body["retryable"])
+        guard let code = envelope.body["code"] as? String,
+              RendezvousEnvelope.errorCodes.contains(code),
+              let retryable = jsonBool(envelope.body["retryable"])
         else {
             throw ControllerProtocolError.invalidMessage
         }
-        if body.keys.contains("retryAfterMs") {
-            guard let retryAfter = jsonInt64(body["retryAfterMs"]),
+        if envelope.body.keys.contains("retryAfterMs") {
+            guard let retryAfter = jsonInt64(envelope.body["retryAfterMs"]),
                   (0...3_600_000).contains(retryAfter)
             else {
                 throw ControllerProtocolError.invalidMessage
@@ -595,20 +600,34 @@ public enum ResolvePage: String, CaseIterable, Sendable {
 }
 
 enum ResolvePageControl {
+    enum Result: Equatable {
+        case page(ResolvePage)
+        case muted(Bool)
+    }
+
     static func displayedPage(selected: ResolvePage, pending: ResolvePage?) -> ResolvePage {
         pending ?? selected
     }
 
-    static func responsePage(operation: String, result: Any) throws -> ResolvePage? {
-        guard let expected = ResolvePage(operation: operation) else { return nil }
-        guard let result = result as? [String: Any],
-              let rawPage = result["page"] as? String,
-              let page = ResolvePage(rawValue: rawPage),
-              page == expected
+    static func response(operation: String, result: Any) throws -> Result {
+        guard let result = result as? [String: Any] else {
+            throw ControllerProtocolError.invalidMessage
+        }
+        if let expected = ResolvePage(operation: operation) {
+            guard let rawPage = result["page"] as? String,
+                  let page = ResolvePage(rawValue: rawPage),
+                  page == expected
+            else {
+                throw ControllerProtocolError.invalidMessage
+            }
+            return .page(page)
+        }
+        guard operation == "host.volume.toggle-mute",
+              let muted = jsonBool(result["muted"])
         else {
             throw ControllerProtocolError.invalidMessage
         }
-        return page
+        return .muted(muted)
     }
 
     static func eventPage(body: [String: Any]) throws -> ResolvePage? {
@@ -644,6 +663,7 @@ public final class ControllerModel: ObservableObject {
     @Published public private(set) var isResetting = false
     @Published public private(set) var isPairing = false
     @Published public private(set) var pairingStatus = ""
+    @Published public private(set) var pairingFingerprint = ""
     @Published public private(set) var companionCapabilities = Set<String>()
     @Published public private(set) var grantedPermissions = Set<String>()
     @Published public private(set) var selectedPage: ResolvePage = .edit
@@ -666,12 +686,16 @@ public final class ControllerModel: ObservableObject {
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectStabilityTask: Task<Void, Never>?
     private var rotationTask: Task<Void, Never>?
+    private var sessionSetupTask: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
     private var pairingTask: Task<Void, Never>?
     private var pairingAttemptID: UUID?
     private var activeEnrollment: ActiveEnrollment?
     private var sessionID: String?
+    private var sessionOpenRequestID: String?
+    private var expectedSessionID: String?
     private var nextSendSequence: Int64 = 1
     private var receivedFrames = RelayFrameBuffer()
     private var noise: NoiseIKInitiator?
@@ -679,6 +703,7 @@ public final class ControllerModel: ObservableObject {
     private var receivedHello = false
     private var pendingCommand: PendingCommand?
     private var lateResponses = LateResponseWindow()
+    private var outerRequestIDs = LateResponseWindow()
     private var reconnectAttempt = 0
     private var credentialStoreUnavailable = false
     private let keychainLoad: () throws -> StoredEnrollment?
@@ -763,6 +788,10 @@ public final class ControllerModel: ObservableObject {
             grantedPermissions.contains(operation)
     }
 
+    public func isPageAvailable(_ page: ResolvePage) -> Bool {
+        companionCapabilities.contains(page.operation) && grantedPermissions.contains(page.operation)
+    }
+
     public var canConnect: Bool {
         (isEnrolled || hasPendingPairingActivation) && storedEnrollment?.response != nil &&
             storedEnrollment?.linkRevocationConfirmed != true && !isResetting && !isPairing
@@ -826,7 +855,8 @@ public final class ControllerModel: ObservableObject {
         let attemptID = UUID()
         pairingAttemptID = attemptID
         isPairing = true
-        pairingStatus = PairingProgress.joining.rawValue
+        pairingStatus = PairingProgress.joining.status
+        pairingFingerprint = ""
         enrollmentStatus = "Pairing"
         pairingTask = Task { [weak self] in
             guard let self else { return }
@@ -836,7 +866,8 @@ public final class ControllerModel: ObservableObject {
                     deviceLabel: deviceLabel
                 ) { [weak self] progress in
                     guard self?.pairingAttemptID == attemptID else { return }
-                    self?.pairingStatus = progress.rawValue
+                    self?.pairingStatus = progress.status
+                    self?.pairingFingerprint = progress.fingerprint ?? ""
                 }
                 try Task.checkCancellation()
                 guard pairingAttemptID == attemptID else { return }
@@ -849,6 +880,7 @@ public final class ControllerModel: ObservableObject {
                 enrollmentResponseJSON = ""
                 enrollmentStatus = "Enrolled"
                 pairingStatus = "Paired"
+                pairingFingerprint = ""
                 pairingAttemptID = nil
                 pairingTask = nil
                 isPairing = false
@@ -860,6 +892,7 @@ public final class ControllerModel: ObservableObject {
                     : error.localizedDescription
                 let activeWasSaved = adoptPairingCheckpointIfPresent(fallbackStatus: status)
                 pairingStatus = activeWasSaved ? "Paired" : enrollmentStatus
+                pairingFingerprint = ""
                 pairingAttemptID = nil
                 pairingTask = nil
                 isPairing = false
@@ -874,6 +907,7 @@ public final class ControllerModel: ObservableObject {
         guard isPairing else { return }
         pairingTask?.cancel()
         pairingStatus = "Cancelling pairing"
+        pairingFingerprint = ""
         enrollmentStatus = "Cancelling pairing"
     }
 
@@ -889,6 +923,10 @@ public final class ControllerModel: ObservableObject {
     }
 
     public func requestPage(_ page: ResolvePage) {
+        guard isPageAvailable(page) else {
+            feedback = "\(page.rawValue.capitalized) page is not granted by this companion"
+            return
+        }
         sendCommand(page.operation)
     }
 
@@ -960,7 +998,16 @@ public final class ControllerModel: ObservableObject {
         startRotation(for: task)
 
         do {
-            try await sendOuter(type: "session.open", body: ["linkId": active.linkID], on: task)
+            let requestID = UUID().uuidString.lowercased()
+            sessionOpenRequestID = requestID
+            startSessionSetupDeadline(for: task)
+            try await sendOuter(
+                type: "session.open",
+                id: requestID,
+                body: ["linkId": active.linkID],
+                on: task
+            )
+            guard socket === task else { return }
             connectionStatus = "Waiting for companion"
         } catch {
             connectionFailed(task, error: error)
@@ -1004,44 +1051,58 @@ public final class ControllerModel: ObservableObject {
     }
 
     private func handleOuter(_ data: Data, on task: URLSessionWebSocketTask) async throws {
-        guard let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              envelope["protocol"] as? String == "remote-davinci.rendezvous",
-              jsonInt64(envelope["v"]) == 1,
-              let type = envelope["type"] as? String,
-              let body = envelope["body"] as? [String: Any]
+        guard let envelope = RendezvousEnvelope(
+            data,
+            allowedTypes: [
+                "ok", "error", "session.opened", "session.frame", "session.closed", "link.revoked",
+            ]
+        )
         else {
             throw ControllerProtocolError.invalidMessage
         }
 
-        switch type {
+        switch envelope.type {
         case "ok":
+            guard envelope.replyTo == sessionOpenRequestID,
+                  envelope.body["requestType"] as? String == "session.open",
+                  let result = envelope.body["result"] as? [String: Any],
+                  let openedSessionID = result["sessionId"] as? String,
+                  isCanonicalUUID(openedSessionID),
+                  sessionID == nil || sessionID == openedSessionID
+            else {
+                throw ControllerProtocolError.unexpectedMessage
+            }
+            expectedSessionID = openedSessionID
             return
         case "error":
-            guard let code = body["code"] as? String,
-                  let retryable = jsonBool(body["retryable"])
+            guard let replyTo = envelope.replyTo,
+                  replyTo == sessionOpenRequestID || outerRequestIDs.contains(replyTo),
+                  let code = envelope.body["code"] as? String,
+                  RendezvousEnvelope.errorCodes.contains(code),
+                  let retryable = jsonBool(envelope.body["retryable"])
             else {
                 throw ControllerProtocolError.invalidMessage
             }
+            if envelope.body.keys.contains("retryAfterMs") {
+                guard let retryAfter = jsonInt64(envelope.body["retryAfterMs"]),
+                      (0...3_600_000).contains(retryAfter)
+                else {
+                    throw ControllerProtocolError.invalidMessage
+                }
+            }
             throw RelayConnectionError.server(code: code, retryable: retryable)
         case "session.opened":
-            try await handleSessionOpened(body, on: task)
+            try await handleSessionOpened(envelope.body, on: task)
         case "session.frame":
-            try await handleSessionFrame(body, on: task)
+            try await handleSessionFrame(envelope.body, on: task)
         case "session.closed":
-            guard try RelayLifecycle.isCurrentSessionClose(
-                envelope: envelope,
-                body: body,
-                currentSessionID: sessionID
-            ) else {
+            guard try RelayLifecycle.isCurrentSessionClose(envelope, currentSessionID: sessionID) else {
                 return
             }
             throw RelayConnectionError.sessionClosed
         case "link.revoked":
-            guard envelope["replyTo"] == nil,
-                  let eventID = envelope["id"] as? String,
-                  isCanonicalUUID(eventID),
-                  let activeEnrollment,
-                  body["linkId"] as? String == activeEnrollment.linkID
+            guard let activeEnrollment,
+                  envelope.body["linkId"] as? String == activeEnrollment.linkID
             else {
                 throw ControllerProtocolError.invalidMessage
             }
@@ -1054,7 +1115,7 @@ public final class ControllerModel: ObservableObject {
             }
             throw RelayConnectionError.linkRevoked
         default:
-            return
+            throw ControllerProtocolError.unexpectedMessage
         }
     }
 
@@ -1067,6 +1128,7 @@ public final class ControllerModel: ObservableObject {
               let linkID = body["linkId"] as? String,
               let peerEndpointID = body["peerEndpointId"] as? String,
               isCanonicalUUID(receivedSessionID),
+              expectedSessionID == nil || expectedSessionID == receivedSessionID,
               linkID == activeEnrollment.linkID,
               peerEndpointID == activeEnrollment.companionEndpointID
         else {
@@ -1099,8 +1161,8 @@ public final class ControllerModel: ObservableObject {
         _ body: [String: Any],
         on task: URLSessionWebSocketTask
     ) async throws {
-        guard let sessionID,
-              body["sessionId"] as? String == sessionID,
+        guard let receivedSessionID = body["sessionId"] as? String,
+              isCanonicalUUID(receivedSessionID),
               let sequence = jsonInt64(body["seq"]),
               sequence >= 1,
               let payload = body["payload"] as? String,
@@ -1109,6 +1171,12 @@ public final class ControllerModel: ObservableObject {
               frame.count <= 16 * 1024
         else {
             throw ControllerProtocolError.invalidMessage
+        }
+        guard RelayLifecycle.isCurrentSessionFrame(
+            receivedSessionID: receivedSessionID,
+            currentSessionID: sessionID
+        ) else {
+            return
         }
 
         for orderedFrame in try receivedFrames.insert(sequence: sequence, frame: frame) {
@@ -1129,7 +1197,9 @@ public final class ControllerModel: ObservableObject {
                 body: [
                     "role": "controller",
                     "capabilities": Self.operations,
-                    "appVersion": "0.1.0",
+                    "appVersion": Self.appVersion(
+                        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+                    ),
                 ],
                 on: task
             )
@@ -1138,12 +1208,12 @@ public final class ControllerModel: ObservableObject {
         }
 
         let plaintext = try noise.decryptTransport(frame)
-        try handleControl(plaintext)
+        try handleControl(plaintext, on: task)
     }
 
-    private func handleControl(_ data: Data) throws {
+    private func handleControl(_ data: Data, on task: URLSessionWebSocketTask) throws {
         guard data.count <= NoiseIKInitiator.maxPlaintextBytes,
-              let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let envelope = ProtocolJSON.object(data),
               envelope["protocol"] as? String == "remote-davinci.control",
               jsonInt64(envelope["v"]) == 1,
               let type = envelope["type"] as? String,
@@ -1167,10 +1237,12 @@ public final class ControllerModel: ObservableObject {
                 throw ControllerProtocolError.unexpectedMessage
             }
             receivedHello = true
+            sessionSetupTask?.cancel()
+            sessionSetupTask = nil
             try finalizePendingActivation()
-            reconnectAttempt = 0
             companionCapabilities = Set(capabilities)
             isReady = true
+            startReconnectStabilityInterval(for: task)
             connectionStatus = "Connected"
             feedback = Self.operations.contains(where: companionCapabilities.contains)
                 ? "Ready"
@@ -1205,13 +1277,16 @@ public final class ControllerModel: ObservableObject {
         }
 
         if jsonBool(body["ok"]) == true, let result = body["result"] {
-            if let page = try ResolvePageControl.responsePage(
+            switch try ResolvePageControl.response(
                 operation: pendingCommand.operation,
                 result: result
             ) {
+            case let .page(page):
                 selectedPage = page
+                feedback = "\(pendingCommand.operation) succeeded"
+            case let .muted(muted):
+                feedback = muted ? "Host volume muted" : "Host volume unmuted"
             }
-            feedback = "\(pendingCommand.operation) succeeded"
         } else if jsonBool(body["ok"]) == false,
                   let error = body["error"] as? [String: Any],
                   let code = error["code"] as? String
@@ -1230,6 +1305,16 @@ public final class ControllerModel: ObservableObject {
         pendingCommand = PendingCommand(id: id, operation: operation, expiresAt: expiresAt)
         pendingPage = ResolvePage(operation: operation)
         feedback = "Sending \(operation)"
+        expiryTask?.cancel()
+        expiryTask = Task { [weak self] in
+            let remaining = RelayLifecycle.remainingMilliseconds(
+                expiresAt: expiresAt,
+                now: nowMilliseconds()
+            )
+            try? await Task.sleep(for: .milliseconds(remaining))
+            guard !Task.isCancelled else { return }
+            self?.expireCommand(id)
+        }
 
         Task {
             do {
@@ -1246,11 +1331,6 @@ public final class ControllerModel: ObservableObject {
                 )
                 guard socket === task, pendingCommand?.id == id else { return }
                 feedback = "Waiting for \(operation)"
-                expiryTask = Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(5))
-                    guard !Task.isCancelled else { return }
-                    self?.expireCommand(id)
-                }
             } catch {
                 connectionFailed(task, error: error)
             }
@@ -1481,7 +1561,7 @@ public final class ControllerModel: ObservableObject {
 
         let timeout = Task {
             do {
-                try await Task.sleep(for: .seconds(15))
+                try await Task.sleep(for: .seconds(RelayLifecycle.sessionSetupTimeoutSeconds))
             } catch {
                 return
             }
@@ -1548,9 +1628,7 @@ public final class ControllerModel: ObservableObject {
             )
             return
         }
-        if case let .server(code, retryable) = error as? RelayConnectionError,
-           !RelayLifecycle.shouldReconnect(code: code, retryable: retryable)
-        {
+        if case let .server(code, retryable) = error as? RelayConnectionError {
             if hasPendingPairingActivation, ["UNAUTHENTICATED", "FORBIDDEN"].contains(code) {
                 enrollmentStatus = "Pairing activation is unconfirmed; retrying securely"
                 teardownConnection(
@@ -1560,17 +1638,24 @@ public final class ControllerModel: ObservableObject {
                 scheduleReconnect()
                 return
             }
-            stopMaintainingConnection(
-                status: "Recovery required",
-                feedback: "Relay rejected the enrollment (\(code)). Forget local credentials and re-enroll."
-            )
+            switch RelayLifecycle.recoveryDisposition(code: code, retryable: retryable) {
+            case .reconnect:
+                teardownConnection(status: "Disconnected", feedback: "Relay error: \(code)")
+                scheduleReconnect()
+            case .stop:
+                stopMaintainingConnection(
+                    status: "Disconnected",
+                    feedback: "Relay rejected the current session (\(code)). Enrollment was kept; tap Connect to retry."
+                )
+            }
             return
         }
         if error is ControllerProtocolError || error is NoiseError {
-            stopMaintainingConnection(
-                status: "Recovery required",
-                feedback: "Secure session validation failed. Forget local credentials and re-enroll."
+            teardownConnection(
+                status: "Disconnected",
+                feedback: "Secure session failed; opening a fresh session"
             )
+            scheduleReconnect()
             return
         }
         teardownConnection(status: "Disconnected", feedback: error.localizedDescription)
@@ -1631,6 +1716,59 @@ public final class ControllerModel: ObservableObject {
         return min(proposedDelay, remaining)
     }
 
+    nonisolated static func appVersion(_ value: Any?) -> String {
+        guard let value = value as? String,
+              !value.isEmpty,
+              value.count <= 64
+        else {
+            return "unknown"
+        }
+        return value
+    }
+
+    private func startSessionSetupDeadline(for task: URLSessionWebSocketTask) {
+        sessionSetupTask?.cancel()
+        sessionSetupTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(RelayLifecycle.sessionSetupTimeoutSeconds))
+            } catch {
+                return
+            }
+            self?.expireSessionSetup(task)
+        }
+    }
+
+    private func startReconnectStabilityInterval(for task: URLSessionWebSocketTask) {
+        reconnectStabilityTask?.cancel()
+        reconnectStabilityTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(RelayLifecycle.reconnectStabilitySeconds))
+            } catch {
+                return
+            }
+            self?.finishReconnectStabilityInterval(for: task)
+        }
+    }
+
+    private func finishReconnectStabilityInterval(for task: URLSessionWebSocketTask) {
+        let stable = socket === task && isReady
+        reconnectAttempt = RelayLifecycle.reconnectAttempt(
+            current: reconnectAttempt,
+            afterStableSession: stable
+        )
+        if stable { reconnectStabilityTask = nil }
+    }
+
+    private func expireSessionSetup(_ task: URLSessionWebSocketTask) {
+        guard socket === task, !isReady else { return }
+        sessionSetupTask = nil
+        teardownConnection(
+            status: "Disconnected",
+            feedback: "Secure session setup timed out"
+        )
+        scheduleReconnect()
+    }
+
     private func startRotation(for task: URLSessionWebSocketTask) {
         let delay = RelayLifecycle.rotationDelaySeconds(randomUnit: Double.random(in: 0...1))
         rotationTask = Task { [weak self] in
@@ -1659,7 +1797,7 @@ public final class ControllerModel: ObservableObject {
         body: [String: Any],
         on task: URLSessionWebSocketTask
     ) async throws {
-        guard let noise else { throw ControllerProtocolError.unexpectedMessage }
+        guard socket === task, let noise else { throw ControllerProtocolError.unexpectedMessage }
         let envelope: [String: Any] = [
             "protocol": "remote-davinci.control",
             "v": 1,
@@ -1680,8 +1818,11 @@ public final class ControllerModel: ObservableObject {
         }
         let sequence = nextSendSequence
         nextSendSequence += 1
+        let requestID = UUID().uuidString.lowercased()
+        outerRequestIDs.remember(requestID)
         try await sendOuter(
             type: "session.frame",
+            id: requestID,
             body: [
                 "sessionId": sessionID,
                 "seq": sequence,
@@ -1693,6 +1834,7 @@ public final class ControllerModel: ObservableObject {
 
     private func sendOuter(
         type: String,
+        id: String = UUID().uuidString.lowercased(),
         body: [String: Any],
         on task: URLSessionWebSocketTask
     ) async throws {
@@ -1700,7 +1842,7 @@ public final class ControllerModel: ObservableObject {
             "protocol": "remote-davinci.rendezvous",
             "v": 1,
             "type": type,
-            "id": UUID().uuidString.lowercased(),
+            "id": id,
             "body": body,
         ]
         let data = try JSONSerialization.data(
@@ -1727,6 +1869,10 @@ public final class ControllerModel: ObservableObject {
         pingTask = nil
         rotationTask?.cancel()
         rotationTask = nil
+        reconnectStabilityTask?.cancel()
+        reconnectStabilityTask = nil
+        sessionSetupTask?.cancel()
+        sessionSetupTask = nil
         expiryTask?.cancel()
         expiryTask = nil
         let currentSocket = socket
@@ -1734,6 +1880,8 @@ public final class ControllerModel: ObservableObject {
         currentSocket?.cancel(with: .goingAway, reason: nil)
         activeEnrollment = nil
         sessionID = nil
+        sessionOpenRequestID = nil
+        expectedSessionID = nil
         nextSendSequence = 1
         receivedFrames = RelayFrameBuffer()
         noise = nil
@@ -1742,6 +1890,7 @@ public final class ControllerModel: ObservableObject {
         pendingCommand = nil
         pendingPage = nil
         lateResponses = LateResponseWindow()
+        outerRequestIDs = LateResponseWindow()
         companionCapabilities = []
         isConnected = false
         isReady = false
@@ -1772,30 +1921,6 @@ private extension Encodable {
         }
         return string
     }
-}
-
-private func isCanonicalUUID(_ value: String) -> Bool {
-    UUID(uuidString: value)?.uuidString.lowercased() == value
-}
-
-private func jsonInt64(_ value: Any?) -> Int64? {
-    guard let number = value as? NSNumber,
-          CFGetTypeID(number) != CFBooleanGetTypeID(),
-          number.doubleValue.rounded(.towardZero) == number.doubleValue,
-          abs(number.doubleValue) <= 9_007_199_254_740_991
-    else {
-        return nil
-    }
-    return number.int64Value
-}
-
-private func jsonBool(_ value: Any?) -> Bool? {
-    guard let number = value as? NSNumber,
-          CFGetTypeID(number) == CFBooleanGetTypeID()
-    else {
-        return nil
-    }
-    return number.boolValue
 }
 
 private func nowMilliseconds() -> Int64 {

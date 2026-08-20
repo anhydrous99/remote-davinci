@@ -74,7 +74,7 @@ func newPairingAttempt(parent, setup context.Context, relay, label string, persi
 		return nil, err
 	}
 	label = strings.TrimSpace(label)
-	if len([]rune(label)) < 1 || len([]rune(label)) > 80 {
+	if !validDeviceLabel(label) {
 		return nil, errors.New("invalid companion device label")
 	}
 
@@ -157,7 +157,11 @@ func companionDeviceLabel() string {
 	if len(runes) > 80 {
 		runes = runes[:80]
 	}
-	return string(runes)
+	label = string(runes)
+	if !validDeviceLabel(label) {
+		return "Remote DaVinci Companion"
+	}
+	return label
 }
 
 func (attempt *pairingAttempt) snapshot() PairingState {
@@ -223,7 +227,6 @@ func (attempt *pairingAttempt) finished() bool {
 }
 
 func (attempt *pairingAttempt) run() (Config, bool, error) {
-	defer close(attempt.done)
 	defer attempt.peer.close()
 	defer func() {
 		if !attempt.activated {
@@ -425,7 +428,8 @@ func (attempt *pairingAttempt) resolveCommitFailure(config Config, err error) (C
 
 func validateControllerPairingIdentity(data []byte, linkID, companionEndpointID string, companionPrivate []byte) (protocol.PairingIdentityEnvelope, error) {
 	identity, err := protocol.ParsePairing(data)
-	if err != nil || identity.Body.Role != protocol.Controller || identity.Body.LinkID != linkID || identity.Body.EndpointID == companionEndpointID {
+	if err != nil || identity.Body.Role != protocol.Controller || identity.Body.LinkID != linkID || identity.Body.EndpointID == companionEndpointID ||
+		!validDeviceLabel(identity.Body.DeviceLabel) {
 		return protocol.PairingIdentityEnvelope{}, errors.New("invalid controller pairing identity")
 	}
 	capabilities := make(map[string]bool, len(identity.Body.Capabilities))

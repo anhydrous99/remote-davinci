@@ -59,7 +59,7 @@ struct CompanionView: View {
                     .accessibilityLabel("Connection status: \(model.statusText)")
 
                 if let state = model.state {
-                    LabeledContent("Controller", value: state.controllerLabel ?? "No controller enrolled")
+                    LabeledContent("Controller", value: state.configured ? state.controllerDisplayLabel : "No controller enrolled")
                     if let linkID = state.linkID {
                         LabeledContent("Link", value: linkID)
                             .textSelection(.enabled)
@@ -170,25 +170,37 @@ private struct PairingSection: View {
     var body: some View {
         Section("Pair iPhone or iPad") {
             if let pairing = model.state?.pairing, pairing.isAwaitingApproval {
-                Text("Allow this controller?")
-                    .font(.headline)
-                LabeledContent("Controller", value: pairing.controllerLabel ?? "Unknown controller")
-                if let fingerprint = pairing.controllerFingerprint {
-                    LabeledContent("Security fingerprint", value: fingerprint)
+                if let details = pairing.approvalDetails {
+                    Text("Allow this controller?")
+                        .font(.headline)
+                    LabeledContent("Controller", value: details.controllerLabel)
+                    LabeledContent("Security fingerprint", value: details.controllerFingerprint)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
+                    Text("Requested controls")
+                        .font(.subheadline.weight(.semibold))
+                    ForEach(details.requestedPermissions, id: \.self) { permission in
+                        Label(permissionLabel(permission), systemImage: "checkmark.circle")
+                    }
+                    HStack {
+                        Button("Approve") { model.approvePairing() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.isMutating || !pairing.isApprovable)
+                        Button("Reject", role: .destructive) { model.rejectPairing() }
+                            .disabled(model.isMutating)
+                    }
+                } else {
+                    Label("Pairing details could not be verified.", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text("Reject this request and create a new pairing code.")
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button("Reject", role: .destructive) { model.rejectPairing() }
+                            .disabled(model.isMutating || pairing.validPairID == nil)
+                        Button("Cancel Pairing", role: .cancel) { model.cancelPairing() }
+                            .disabled(model.isMutating || !model.canCancelPairing)
+                    }
                 }
-                Text("Requested controls")
-                    .font(.subheadline.weight(.semibold))
-                ForEach(pairing.requestedPermissions ?? [], id: \.self) { permission in
-                    Label(permissionLabel(permission), systemImage: "checkmark.circle")
-                }
-                HStack {
-                    Button("Approve") { model.approvePairing() }
-                        .buttonStyle(.borderedProminent)
-                    Button("Reject", role: .destructive) { model.rejectPairing() }
-                }
-                .disabled(model.isMutating)
             } else if let image = model.pairingQRCode, let invite = model.pairingInvite {
                 Text("On iPhone or iPad, open Remote DaVinci and tap Scan Mac QR Code.")
                 Image(nsImage: image)
@@ -209,11 +221,11 @@ private struct PairingSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Cancel Pairing", role: .cancel) { model.cancelPairing() }
-                    .disabled(model.isMutating)
+                    .disabled(model.isMutating || !model.canCancelPairing)
             } else if let pairing = model.state?.pairing, !pairing.isTerminal {
                 ProgressView(pairingStatus(pairing.phase))
                 Button("Cancel Pairing", role: .cancel) { model.cancelPairing() }
-                    .disabled(model.isMutating || pairing.pairID == nil)
+                    .disabled(model.isMutating || !model.canCancelPairing)
             } else {
                 Text("Create a one-time code, then scan it with the camera in the Remote DaVinci app.")
                     .foregroundStyle(.secondary)

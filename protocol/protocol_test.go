@@ -119,7 +119,7 @@ func TestRendezvousFixturesAndMessageTypes(t *testing.T) {
 }
 
 func TestSchemaValidIntegerSpellings(t *testing.T) {
-	for _, spelling := range []string{"1.0", "1e0"} {
+	for _, spelling := range []string{"1", "1.0", "1e0"} {
 		clientJSON := strings.ReplaceAll(`{"protocol":"remote-davinci.rendezvous","v":NUMBER,"type":"pair.frame","id":"00000000-0000-4000-8000-000000000007","body":{"pairId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","seq":NUMBER,"payload":"AQ"}}`, "NUMBER", spelling)
 		client, err := ParseClient(clientJSON)
 		if err != nil {
@@ -136,6 +136,24 @@ func TestSchemaValidIntegerSpellings(t *testing.T) {
 			t.Fatalf("%s control = %#v, error = %v", spelling, control, err)
 		}
 	}
+}
+
+func TestJSONNumberComplexityLimits(t *testing.T) {
+	frame := func(number string) string {
+		return strings.Replace(`{"protocol":"remote-davinci.rendezvous","v":1,"type":"pair.frame","id":"00000000-0000-4000-8000-000000000007","body":{"pairId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","seq":1,"payload":"AQ","futureNumber":NUMBER}}`, "NUMBER", number, 1)
+	}
+	for _, number := range []string{strings.Repeat("9", maxJSONNumberBytes), "1e4096", "1e-4096"} {
+		if _, err := ParseClient(frame(number)); err != nil {
+			t.Fatalf("accepted boundary %q: %v", number, err)
+		}
+	}
+	for _, number := range []string{strings.Repeat("9", maxJSONNumberBytes+1), "1e4097", "1e-4097"} {
+		_, err := ParseClient(frame(number))
+		requireCode(t, InvalidMessage, err)
+	}
+	knownInteger := strings.Replace(`{"protocol":"remote-davinci.rendezvous","v":1,"type":"pair.frame","id":"00000000-0000-4000-8000-000000000007","body":{"pairId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","seq":NUMBER,"payload":"AQ"}}`, "NUMBER", "1e4097", 1)
+	_, err := ParseClient(knownInteger)
+	requireCode(t, InvalidMessage, err)
 }
 
 func TestQRPairingInviteAndTokenAdmission(t *testing.T) {

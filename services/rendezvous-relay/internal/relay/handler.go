@@ -173,6 +173,10 @@ func constantTimeEqual(left, right string) bool {
 }
 
 func (h *Handler) notify(ctx context.Context, connectionID string, message Message, event WebSocketEvent) (bool, error) {
+	return h.notifyWithPairEvent(ctx, connectionID, message, event, false)
+}
+
+func (h *Handler) notifyWithPairEvent(ctx context.Context, connectionID string, message Message, event WebSocketEvent, sendPairEvent bool) (bool, error) {
 	if connectionID == "" {
 		return false, nil
 	}
@@ -180,7 +184,7 @@ func (h *Handler) notify(ctx context.Context, connectionID string, message Messa
 		if !gone(err) {
 			return false, err
 		}
-		if err := h.cleanup(ctx, connectionID, "peer-disconnected", event, false); err != nil {
+		if err := h.cleanup(ctx, connectionID, "peer-disconnected", event, sendPairEvent); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -449,7 +453,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 			}
 			return nil, retryableError(protocol.PeerOffline)
 		}
-		if delivered, err := h.notify(ctx, side.ConnectionID, readyForB, event); err != nil || !delivered {
+		if delivered, err := h.notifyWithPairEvent(ctx, side.ConnectionID, readyForB, event, true); err != nil || !delivered {
 			if err != nil {
 				return nil, err
 			}

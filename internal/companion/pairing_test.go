@@ -30,7 +30,7 @@ const (
 	testPairingController = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 )
 
-func TestQRPairingRequiresApprovalAndCompletesNNpsk0(t *testing.T) {
+func TestQRPairingCompletesNNpsk0UnderEnrollmentSerialization(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
@@ -195,18 +195,14 @@ func TestQRPairingRequiresApprovalAndCompletesNNpsk0(t *testing.T) {
 		t.Fatal(err)
 	}
 	controllerFirst <- message1
-	runResult := make(chan struct {
-		config Config
-		staged bool
-		err    error
-	}, 1)
+	relayCtx, stopRelay := context.WithCancel(t.Context())
+	stopRelay()
+	app := &App{ctx: relayCtx, relayURL: relay, pairing: attempt, status: RelayStatus{Message: "Pairing"}}
+	app.enrollMu.Lock()
+	finishDone := make(chan struct{})
 	go func() {
-		config, staged, err := attempt.run()
-		runResult <- struct {
-			config Config
-			staged bool
-			err    error
-		}{config, staged, err}
+		app.finishPairing(attempt)
+		close(finishDone)
 	}()
 
 	message2 := receivePairingValue(t, ctx, companionHandshake, "companion handshake")
@@ -278,15 +274,20 @@ func TestQRPairingRequiresApprovalAndCompletesNNpsk0(t *testing.T) {
 		t.Fatalf("unexpected companion grant: %#v", companionIdentityEnvelope.Body)
 	}
 
-	result := receivePairingValue(t, ctx, runResult, "pairing result")
+	app.enrollMu.Unlock()
+	receivePairingValue(t, ctx, finishDone, "pairing installation")
 	release()
-	if result.err != nil || !result.staged || result.config.ActivationPending {
-		t.Fatalf("pairing result = %#v, staged = %v, error = %v", result.config, result.staged, result.err)
+	app.mu.RLock()
+	result := app.config
+	started := app.cancel != nil
+	app.mu.RUnlock()
+	if result == nil || result.ActivationPending || !started {
+		t.Fatalf("pairing result = %#v, relay started = %v", result, started)
 	}
-	if result.config.ControllerFingerprint != controllerFingerprint || result.config.PermissionMask != 1<<1 {
-		t.Fatalf("stored trust metadata = %#v", result.config)
+	if result.ControllerFingerprint != controllerFingerprint || result.PermissionMask != 1<<1 {
+		t.Fatalf("stored trust metadata = %#v", result)
 	}
-	if err := result.config.validate(); err != nil {
+	if err := result.validate(); err != nil {
 		t.Fatalf("stored pairing config is invalid: %v", err)
 	}
 	savedMu.Lock()
@@ -298,6 +299,54 @@ func TestQRPairingRequiresApprovalAndCompletesNNpsk0(t *testing.T) {
 	case err := <-serverErrors:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestUncertainPairingCommitIsNotFinishedBeforeReconciliation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	attempt := &pairingAttempt{
+		done:  make(chan struct{}),
+		state: PairingState{Phase: pairingFailed, PairID: testPairingPairID},
+	}
+	config := Config{V: 1, ActivationPending: true}
+	app := &App{ctx: ctx, relayURL: DefaultRelayURL, uiToken: "test-token", pairing: attempt}
+
+	retry := pairingAPIRequest(app, "/api/pairing/start", `{}`)
+	if retry.Code != http.StatusConflict {
+		t.Fatalf("retry before reconciliation status = %d, body = %s", retry.Code, retry.Body.String())
+	}
+
+	app.enrollMu.Lock()
+	reconciled := make(chan struct{})
+	go func() {
+		app.reconcilePairing(attempt, config, true, errors.New("relay disconnected after commit"))
+		close(reconciled)
+	}()
+
+	if attempt.finished() {
+		app.enrollMu.Unlock()
+		t.Fatal("staged pairing became replaceable before reconciliation")
+	}
+	app.mu.RLock()
+	installed := app.config != nil
+	app.mu.RUnlock()
+	if installed {
+		app.enrollMu.Unlock()
+		t.Fatal("staged pairing was installed across enrollment serialization")
+	}
+	app.enrollMu.Unlock()
+	wait, stopWaiting := context.WithTimeout(t.Context(), 2*time.Second)
+	defer stopWaiting()
+	receivePairingValue(t, wait, reconciled, "pairing reconciliation")
+
+	app.mu.RLock()
+	result := app.config
+	current := app.pairing
+	started := app.cancel != nil
+	app.mu.RUnlock()
+	if !attempt.finished() || result == nil || *result != config || current != nil || !started {
+		t.Fatalf("finished = %v, config = %#v, pairing = %#v, relay started = %v", attempt.finished(), result, current, started)
 	}
 }
 
@@ -353,6 +402,15 @@ func TestControllerPairingIdentityIsBoundToTheApprovedLink(t *testing.T) {
 	if _, err := validateControllerPairingIdentity(data, testLinkID, testCompanionID, companionKey.Private); err != nil {
 		t.Fatalf("valid identity was rejected: %v", err)
 	}
+	identity.Body.DeviceLabel = "spoof\u202e"
+	data, err = json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateControllerPairingIdentity(data, testLinkID, testCompanionID, companionKey.Private); err == nil {
+		t.Fatal("accepted an identity with an unsafe device label")
+	}
+	identity.Body.DeviceLabel = "Test iPhone"
 	identity.Body.LinkID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 	data, err = json.Marshal(identity)
 	if err != nil {

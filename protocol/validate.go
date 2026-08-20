@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -19,6 +20,8 @@ const (
 	controlSchemaID       = "https://remote-davinci.dev/schemas/control-v1.schema.json"
 	pairingSchemaID       = "https://remote-davinci.dev/schemas/pairing-v1.schema.json"
 	pairingInviteSchemaID = "https://remote-davinci.dev/schemas/pairing-invite-v1.schema.json"
+	maxJSONNumberBytes    = 128
+	maxJSONNumberExponent = 4096
 )
 
 //go:embed schemas/*.json
@@ -203,6 +206,9 @@ func parse(input any, schema *jsonschema.Schema, maxBytes int) ([]byte, error) {
 	if err != nil {
 		return nil, validationError(InvalidMessage, "Protocol frame is not valid JSON")
 	}
+	if !numbersWithinLimits(value) {
+		return nil, validationError(InvalidMessage, "Protocol frame does not match the v1 contract")
+	}
 	if err := preflightFramePayload(value); err != nil {
 		return nil, err
 	}
@@ -218,6 +224,33 @@ func parse(input any, schema *jsonschema.Schema, maxBytes int) ([]byte, error) {
 		return nil, validationError(InvalidMessage, "Protocol frame is not valid JSON")
 	}
 	return data, nil
+}
+
+func numbersWithinLimits(value any) bool {
+	switch value := value.(type) {
+	case map[string]any:
+		for _, item := range value {
+			if !numbersWithinLimits(item) {
+				return false
+			}
+		}
+	case []any:
+		for _, item := range value {
+			if !numbersWithinLimits(item) {
+				return false
+			}
+		}
+	case json.Number:
+		literal := string(value)
+		if len(literal) > maxJSONNumberBytes {
+			return false
+		}
+		if marker := strings.IndexAny(literal, "eE"); marker >= 0 {
+			exponent, err := strconv.ParseInt(literal[marker+1:], 10, 64)
+			return err == nil && exponent >= -maxJSONNumberExponent && exponent <= maxJSONNumberExponent
+		}
+	}
+	return true
 }
 
 func normalizeIntegers(value any) any {

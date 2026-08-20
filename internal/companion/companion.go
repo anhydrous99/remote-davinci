@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/anhydrous99/remote-davinci/protocol"
@@ -157,7 +158,7 @@ func contributoryX25519PublicKey(publicKey, privateKey []byte) bool {
 
 func validateEnrollment(request EnrollmentRequest) error {
 	if request.V != 1 || !uuidPattern.MatchString(request.ControllerEndpointID) ||
-		utf8.RuneCountInString(request.DeviceLabel) < 1 || utf8.RuneCountInString(request.DeviceLabel) > 80 {
+		!validDeviceLabel(request.DeviceLabel) {
 		return errors.New("invalid enrollment request")
 	}
 	if _, err := decode32(request.ControllerCredentialHash); err != nil {
@@ -194,10 +195,30 @@ func ParseEnrollmentRequest(data []byte) (EnrollmentRequest, error) {
 
 func relayURL(value string) (*url.URL, error) {
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "wss" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || parsed.Scheme != "wss" || parsed.Host == "" || parsed.User != nil || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.String() != value {
 		return nil, errors.New("relay URL must be a credential-free wss URL")
 	}
 	return parsed, nil
+}
+
+func validDeviceLabel(value string) bool {
+	if value != strings.TrimSpace(value) || utf8.RuneCountInString(value) < 1 || utf8.RuneCountInString(value) > 80 {
+		return false
+	}
+	for _, character := range value {
+		if unicode.Is(unicode.Cc, character) || unicode.Is(unicode.Cf, character) ||
+			unicode.Is(unicode.Zl, character) || unicode.Is(unicode.Zp, character) {
+			return false
+		}
+	}
+	return true
+}
+
+func displayDeviceLabel(value string) string {
+	if validDeviceLabel(value) {
+		return value
+	}
+	return "Unknown controller"
 }
 
 func decode32(value string) ([]byte, error) {

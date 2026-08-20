@@ -196,12 +196,12 @@ func runRelayConnection(parent context.Context, config Config, update func(Relay
 				}
 				update(RelayStatus{Connected: true, Message: "Controller connected; securing session…"})
 			case "session.frame":
-				if secure == nil {
-					return errors.New("received a frame outside a session")
+				frame, err := currentSessionFrame(envelope, secure)
+				if err != nil {
+					return err
 				}
-				var frame protocol.SessionFrameBody
-				if envelope.DecodeBody(&frame) != nil || frame.SessionID != secure.sessionID {
-					return errors.New("received a frame for an unexpected session")
+				if frame == nil {
+					continue
 				}
 				packets, ready, err := secure.receive(ctx, frame.Seq, frame.Payload)
 				if err != nil {
@@ -240,6 +240,17 @@ func runRelayConnection(parent context.Context, config Config, update func(Relay
 			}
 		}
 	}
+}
+
+func currentSessionFrame(envelope protocol.ServerEnvelope, secure *secureChannel) (*protocol.SessionFrameBody, error) {
+	var frame protocol.SessionFrameBody
+	if envelope.DecodeBody(&frame) != nil {
+		return nil, errors.New("relay returned an invalid session frame")
+	}
+	if secure == nil || frame.SessionID != secure.sessionID {
+		return nil, nil
+	}
+	return &frame, nil
 }
 
 type relayRead struct {

@@ -389,8 +389,6 @@ final class ControllerTests: XCTestCase {
         var activationPending = migrated
         activationPending.activationPending = true
         activationPending.grantedPermissions = ["resolve.page.edit"]
-        activationPending.companionNoiseFingerprint = "sha256:test"
-        activationPending.pairingProtocol = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
         activationPending.pairingExpiresAt = 300
         XCTAssertEqual(
             try Enrollment.active(from: activationPending).linkID,
@@ -498,10 +496,35 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(RelayLifecycle.reconnectDelaySeconds(attempt: 100, randomUnit: 1), 900)
         XCTAssertEqual(RelayLifecycle.rotationDelaySeconds(randomUnit: 0), 5_400)
         XCTAssertEqual(RelayLifecycle.rotationDelaySeconds(randomUnit: 1), 6_600)
-        XCTAssertTrue(RelayLifecycle.shouldReconnect(code: "PEER_OFFLINE", retryable: true))
-        XCTAssertFalse(RelayLifecycle.shouldReconnect(code: "PEER_OFFLINE", retryable: false))
-        XCTAssertFalse(RelayLifecycle.shouldReconnect(code: "UNAUTHENTICATED", retryable: true))
-        XCTAssertFalse(RelayLifecycle.shouldReconnect(code: "FORBIDDEN", retryable: true))
+        XCTAssertEqual(RelayLifecycle.sessionSetupTimeoutSeconds, 15)
+        XCTAssertEqual(RelayLifecycle.reconnectStabilitySeconds, 30)
+        let attemptAfterHello = RelayLifecycle.reconnectAttempt(
+            current: 4,
+            afterStableSession: false
+        )
+        XCTAssertEqual(attemptAfterHello, 4)
+        XCTAssertEqual(
+            RelayLifecycle.reconnectDelaySeconds(attempt: attemptAfterHello, randomUnit: 1),
+            16
+        )
+        XCTAssertEqual(
+            RelayLifecycle.reconnectAttempt(current: attemptAfterHello, afterStableSession: true),
+            0
+        )
+        XCTAssertEqual(RelayLifecycle.remainingMilliseconds(expiresAt: 6_000, now: 1_000), 5_000)
+        XCTAssertEqual(RelayLifecycle.remainingMilliseconds(expiresAt: 1_000, now: 6_000), 0)
+        XCTAssertEqual(
+            RelayLifecycle.recoveryDisposition(code: "PEER_OFFLINE", retryable: true),
+            .reconnect
+        )
+        XCTAssertEqual(
+            RelayLifecycle.recoveryDisposition(code: "PEER_OFFLINE", retryable: false),
+            .stop
+        )
+        XCTAssertEqual(
+            RelayLifecycle.recoveryDisposition(code: "SESSION_NOT_FOUND", retryable: false),
+            .reconnect
+        )
     }
 
     func testOnlyAuthorizationHandshakeResponsesAreTerminal() throws {
@@ -557,22 +580,31 @@ final class ControllerTests: XCTestCase {
     func testSessionCloseCorrelationIgnoresStaleSession() throws {
         let oldSessionID = "11111111-1111-4111-8111-111111111111"
         let currentSessionID = "22222222-2222-4222-8222-222222222222"
-        let envelope: [String: Any] = [
-            "id": "33333333-3333-4333-8333-333333333333",
-        ]
-        let body: [String: Any] = [
-            "sessionId": oldSessionID,
-            "reason": "peer-disconnected",
-        ]
+        let data = Data("""
+        {"protocol":"remote-davinci.rendezvous","v":1,"type":"session.closed",
+        "id":"33333333-3333-4333-8333-333333333333",
+        "body":{"sessionId":"\(oldSessionID)","reason":"peer-disconnected"}}
+        """.utf8)
+        let envelope = try XCTUnwrap(RendezvousEnvelope(data, allowedTypes: ["session.closed"]))
 
         XCTAssertFalse(try RelayLifecycle.isCurrentSessionClose(
-            envelope: envelope,
-            body: body,
+            envelope,
             currentSessionID: currentSessionID
         ))
         XCTAssertTrue(try RelayLifecycle.isCurrentSessionClose(
-            envelope: envelope,
-            body: body,
+            envelope,
+            currentSessionID: oldSessionID
+        ))
+        XCTAssertFalse(RelayLifecycle.isCurrentSessionFrame(
+            receivedSessionID: oldSessionID,
+            currentSessionID: nil
+        ))
+        XCTAssertFalse(RelayLifecycle.isCurrentSessionFrame(
+            receivedSessionID: oldSessionID,
+            currentSessionID: currentSessionID
+        ))
+        XCTAssertTrue(RelayLifecycle.isCurrentSessionFrame(
+            receivedSessionID: oldSessionID,
             currentSessionID: oldSessionID
         ))
     }
@@ -618,25 +650,36 @@ final class ControllerTests: XCTestCase {
 
     func testResolvePageResponseRequiresMatchingReadback() throws {
         XCTAssertEqual(
-            try ResolvePageControl.responsePage(
+            try ResolvePageControl.response(
                 operation: "resolve.page.color",
                 result: ["page": "color"]
             ),
-            .color
+            .page(.color)
         )
-        XCTAssertNil(try ResolvePageControl.responsePage(
-            operation: "host.volume.toggle-mute",
-            result: ["muted": true]
-        ))
-        XCTAssertThrowsError(try ResolvePageControl.responsePage(
+        XCTAssertEqual(
+            try ResolvePageControl.response(
+                operation: "host.volume.toggle-mute",
+                result: ["muted": true]
+            ),
+            .muted(true)
+        )
+        XCTAssertThrowsError(try ResolvePageControl.response(
             operation: "resolve.page.color",
             result: ["page": "edit"]
         )) { error in
             XCTAssertEqual(error as? ControllerProtocolError, .invalidMessage)
         }
-        XCTAssertThrowsError(try ResolvePageControl.responsePage(
+        XCTAssertThrowsError(try ResolvePageControl.response(
             operation: "resolve.page.color",
             result: [:]
+        ))
+        XCTAssertThrowsError(try ResolvePageControl.response(
+            operation: "host.volume.toggle-mute",
+            result: [:]
+        ))
+        XCTAssertThrowsError(try ResolvePageControl.response(
+            operation: "host.volume.toggle-mute",
+            result: ["muted": "yes"]
         ))
     }
 
@@ -670,7 +713,9 @@ final class ControllerTests: XCTestCase {
           "controllerEndpointId":"11111111-1111-4111-8111-111111111111",
           "controllerSecret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "controllerNoisePrivateKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-          "deviceLabel":"Old install",
+          "deviceLabel":"Old \\u202einstall",
+          "companionNoiseFingerprint":"obsolete",
+          "pairingProtocol":"obsolete",
           "response":null
         }
         """
@@ -682,14 +727,12 @@ final class ControllerTests: XCTestCase {
         XCTAssertNil(stored.expectedRelayUrl)
         XCTAssertNil(stored.activationPending)
         XCTAssertNil(stored.grantedPermissions)
-        XCTAssertNil(stored.companionNoiseFingerprint)
-        XCTAssertNil(stored.pairingProtocol)
         stored = try Enrollment.migrateLegacy(
             stored,
             deploymentRelayURL: "wss://self-hosted.example/v1"
         )
         XCTAssertEqual(stored.expectedRelayUrl, "wss://self-hosted.example/v1")
-        XCTAssertNoThrow(try Enrollment.request(for: stored))
+        XCTAssertEqual(try Enrollment.request(for: stored).deviceLabel, "Legacy device")
         stored.linkRevocationConfirmed = true
         XCTAssertEqual(
             try JSONDecoder().decode(
@@ -817,6 +860,114 @@ final class ControllerTests: XCTestCase {
             ),
             .failure(code: "CONFLICT", retryable: true)
         )
+    }
+
+    func testProtocolJSONRequiresExactSafeIntegers() throws {
+        let validIntegers: [(String, Int64)] = [
+            ("1", 1), ("1.0", 1), ("1e0", 1), ("1.2e1", 12), ("100e-2", 1),
+            ("1.0000000000000000000000000000000000000000", 1),
+            ("900719925474099100e-2", 9_007_199_254_740_991),
+        ]
+        for (spelling, expected) in validIntegers {
+            let object = try XCTUnwrap(ProtocolJSON.object(Data("{\"n\":\(spelling)}".utf8)))
+            XCTAssertEqual(jsonInt64(object["n"]), expected, spelling)
+        }
+        for spelling in [
+            "1.0000000000000001", "1.0000000000000000000000000000000000000001",
+            "9007199254740990.0000000000000000000000001", "9007199254740990.5",
+            "9007199254740992", "true",
+        ] {
+            let object = try XCTUnwrap(ProtocolJSON.object(Data("{\"n\":\(spelling)}".utf8)))
+            XCTAssertNil(jsonInt64(object["n"]), spelling)
+        }
+        XCTAssertNil(ProtocolJSON.object(Data("{\"n\":1} trailing".utf8)))
+
+        func additiveEnvelope(_ number: String) -> Data {
+            Data("""
+            {"protocol":"remote-davinci.rendezvous","v":1,"type":"session.closed",
+            "id":"11111111-1111-4111-8111-111111111111",
+            "body":{"sessionId":"22222222-2222-4222-8222-222222222222","reason":"expired",
+            "futureNumber":\(number)}}
+            """.utf8)
+        }
+        for boundary in [String(repeating: "9", count: 128), "1e4096", "1e-4096"] {
+            XCTAssertNotNil(
+                RendezvousEnvelope(additiveEnvelope(boundary), allowedTypes: ["session.closed"]),
+                boundary
+            )
+        }
+        for excessive in [String(repeating: "9", count: 129), "1e4097", "1e-4097"] {
+            XCTAssertNil(
+                RendezvousEnvelope(additiveEnvelope(excessive), allowedTypes: ["session.closed"]),
+                excessive
+            )
+        }
+        for malformed in ["1e", "1e+", "1.", "01", "--1", "+1"] {
+            XCTAssertNil(ProtocolJSON.object(Data("{\"n\":\(malformed)}".utf8)), malformed)
+        }
+    }
+
+    func testPairingInviteRejectsFractionalWireIntegersThatFoundationRounds() throws {
+        let data = try JSONSerialization.data(withJSONObject: pairingInviteObject(expiresAt: 300))
+        let json = String(decoding: data, as: UTF8.self)
+        XCTAssertThrowsError(try PairingInvite.parse(
+            json.replacingOccurrences(of: "\"v\":1", with: "\"v\":1.0000000000000001"),
+            expectedRelayURL: "wss://relay.example/v1",
+            now: 1
+        ))
+        XCTAssertThrowsError(try PairingInvite.parse(
+            json.replacingOccurrences(of: "\"expiresAt\":300", with: "\"expiresAt\":300.5"),
+            expectedRelayURL: "wss://relay.example/v1",
+            now: 1
+        ))
+    }
+
+    func testRendezvousEnvelopeFailsClosed() throws {
+        let valid = """
+        {"protocol":"remote-davinci.rendezvous","v":1,"type":"session.closed",
+        "id":"11111111-1111-4111-8111-111111111111",
+        "body":{"sessionId":"22222222-2222-4222-8222-222222222222","reason":"expired"}}
+        """
+        XCTAssertNotNil(RendezvousEnvelope(Data(valid.utf8), allowedTypes: ["session.closed"]))
+        XCTAssertNil(RendezvousEnvelope(
+            Data(valid.replacingOccurrences(of: "\"v\":1", with: "\"v\":1.0000000000000001").utf8),
+            allowedTypes: ["session.closed"]
+        ))
+        XCTAssertNil(RendezvousEnvelope(
+            Data(valid.replacingOccurrences(of: "\"session.closed\"", with: "\"future.event\"").utf8),
+            allowedTypes: ["session.closed"]
+        ))
+        XCTAssertNil(RendezvousEnvelope(
+            Data(valid.replacingOccurrences(
+                of: "\"body\":",
+                with: "\"replyTo\":\"33333333-3333-4333-8333-333333333333\",\"body\":"
+            ).utf8),
+            allowedTypes: ["session.closed"]
+        ))
+    }
+
+    func testDeviceLabelsRejectInvisibleAndControlCharacters() throws {
+        XCTAssertNoThrow(try Enrollment.create(deviceLabel: "Jules’s iPad 🚀", relayURL: "wss://relay.example/v1"))
+        for label in ["line\nbreak", "right\u{202E}to-left", "zero\u{200B}width"] {
+            XCTAssertThrowsError(try Enrollment.create(
+                deviceLabel: label,
+                relayURL: "wss://relay.example/v1"
+            )) { error in
+                XCTAssertEqual(error as? EnrollmentError, .invalidDeviceLabel)
+            }
+        }
+    }
+
+    func testPairingFingerprintProgressAndBundleVersionFallback() {
+        let fingerprint = "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        XCTAssertEqual(PairingProgress.waitingForApproval(fingerprint: fingerprint).fingerprint, fingerprint)
+        XCTAssertEqual(
+            PairingProgress.waitingForApproval(fingerprint: fingerprint).status,
+            "Waiting for approval on Mac"
+        )
+        XCTAssertEqual(ControllerModel.appVersion("1.2.3"), "1.2.3")
+        XCTAssertEqual(ControllerModel.appVersion(""), "unknown")
+        XCTAssertEqual(ControllerModel.appVersion(nil), "unknown")
     }
 }
 

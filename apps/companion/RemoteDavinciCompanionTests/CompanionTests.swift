@@ -137,12 +137,63 @@ final class CompanionTests: XCTestCase {
     }
 
     func testPairingStateMatchesHelperJSON() throws {
-        let data = Data(#"{"configured":false,"relayUrl":"wss://relay.example/v1","connected":false,"secure":false,"status":"Awaiting approval","pairing":{"phase":"awaiting_approval","pairId":"11111111-1111-4111-8111-111111111111","expiresAt":1800000000,"controllerLabel":"My iPhone","controllerFingerprint":"sha256:test","requestedPermissions":["resolve.page.edit"]}}"#.utf8)
+        let data = Data(#"{"configured":false,"relayUrl":"wss://relay.example/v1","connected":false,"secure":false,"status":"Awaiting approval","pairing":{"phase":"awaitingApproval","pairId":"11111111-1111-4111-8111-111111111111","expiresAt":1800000000,"controllerLabel":"My iPhone","controllerFingerprint":"sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","requestedPermissions":["resolve.page.edit"]}}"#.utf8)
         let state = try JSONDecoder().decode(CompanionState.self, from: data)
 
         XCTAssertTrue(state.pairing?.isAwaitingApproval == true)
+        XCTAssertTrue(state.pairing?.isApprovable == true)
         XCTAssertEqual(state.pairing?.controllerLabel, "My iPhone")
         XCTAssertEqual(state.pairing?.requestedPermissions, ["resolve.page.edit"])
+    }
+
+    func testPairingApprovalFailsClosedForInvalidDetails() {
+        let valid = pairingSnapshot()
+        XCTAssertEqual(valid.approvalDetails?.pairID, "11111111-1111-4111-8111-111111111111")
+        XCTAssertTrue(valid.isApprovable)
+        XCTAssertTrue(pairingSnapshot(requestedPermissions: ["resolve.page.edit", "future.action"]).isApprovable)
+
+        let invalid = [
+            pairingSnapshot(pairID: nil),
+            pairingSnapshot(pairID: "not-a-pair-id"),
+            pairingSnapshot(controllerLabel: nil),
+            pairingSnapshot(controllerLabel: "spoof\u{202E}"),
+            pairingSnapshot(controllerFingerprint: nil),
+            pairingSnapshot(controllerFingerprint: "sha256:not-canonical"),
+            pairingSnapshot(requestedPermissions: nil),
+            pairingSnapshot(requestedPermissions: []),
+            pairingSnapshot(requestedPermissions: ["resolve.page.edit", "resolve.page.edit"]),
+            pairingSnapshot(requestedPermissions: ["resolve.page.unknown"]),
+            pairingSnapshot(requestedPermissions: ["resolve.page.edit", "future action"]),
+        ]
+        for snapshot in invalid {
+            XCTAssertNil(snapshot.approvalDetails)
+            XCTAssertFalse(snapshot.isApprovable)
+        }
+    }
+
+    func testPairingCancellationMatchesHelperPhases() {
+        for phase in ["showingQR", "handshaking", "awaitingApproval"] {
+            XCTAssertNotNil(pairingSnapshot(phase: phase).cancellablePairID)
+        }
+        for phase in ["committing", "cancelled", "expired", "failed", "rejected"] {
+            XCTAssertNil(pairingSnapshot(phase: phase).cancellablePairID)
+        }
+    }
+
+    func testLegacyUnsafeControllerLabelIsNotRendered() {
+        let state = CompanionState(
+            configured: true,
+            relayURL: "wss://relay.example/v1",
+            endpointID: "endpoint",
+            linkID: "link",
+            controllerLabel: "Trusted\u{202E}spoof",
+            connected: false,
+            secure: false,
+            status: "Waiting",
+            pairing: nil,
+            enrollmentResponse: nil
+        )
+        XCTAssertEqual(state.controllerDisplayLabel, "Unknown controller")
     }
 
     @MainActor
@@ -174,5 +225,22 @@ final class CompanionTests: XCTestCase {
             responseConnection: original,
             currentConnection: replacement
         ))
+    }
+
+    private func pairingSnapshot(
+        phase: String = "awaitingApproval",
+        pairID: String? = "11111111-1111-4111-8111-111111111111",
+        controllerLabel: String? = "My iPhone",
+        controllerFingerprint: String? = "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        requestedPermissions: [String]? = ["resolve.page.edit"]
+    ) -> PairingSnapshot {
+        PairingSnapshot(
+            phase: phase,
+            pairID: pairID,
+            expiresAt: 1_800_000_000,
+            controllerLabel: controllerLabel,
+            controllerFingerprint: controllerFingerprint,
+            requestedPermissions: requestedPermissions
+        )
     }
 }
