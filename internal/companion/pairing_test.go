@@ -274,19 +274,6 @@ func TestQRPairingCompletesNNpsk0UnderEnrollmentSerialization(t *testing.T) {
 		t.Fatalf("unexpected companion grant: %#v", companionIdentityEnvelope.Body)
 	}
 
-	select {
-	case <-attempt.done:
-	case <-ctx.Done():
-		app.enrollMu.Unlock()
-		t.Fatal("timed out waiting for pairing commit")
-	}
-	app.mu.RLock()
-	installedWhileSerialized := app.config != nil || app.cancel != nil
-	app.mu.RUnlock()
-	if installedWhileSerialized {
-		app.enrollMu.Unlock()
-		t.Fatal("pairing installed credentials or started a relay across enrollment serialization")
-	}
 	app.enrollMu.Unlock()
 	receivePairingValue(t, ctx, finishDone, "pairing installation")
 	release()
@@ -312,6 +299,54 @@ func TestQRPairingCompletesNNpsk0UnderEnrollmentSerialization(t *testing.T) {
 	case err := <-serverErrors:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestUncertainPairingCommitIsNotFinishedBeforeReconciliation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	attempt := &pairingAttempt{
+		done:  make(chan struct{}),
+		state: PairingState{Phase: pairingFailed, PairID: testPairingPairID},
+	}
+	config := Config{V: 1, ActivationPending: true}
+	app := &App{ctx: ctx, relayURL: DefaultRelayURL, uiToken: "test-token", pairing: attempt}
+
+	retry := pairingAPIRequest(app, "/api/pairing/start", `{}`)
+	if retry.Code != http.StatusConflict {
+		t.Fatalf("retry before reconciliation status = %d, body = %s", retry.Code, retry.Body.String())
+	}
+
+	app.enrollMu.Lock()
+	reconciled := make(chan struct{})
+	go func() {
+		app.reconcilePairing(attempt, config, true, errors.New("relay disconnected after commit"))
+		close(reconciled)
+	}()
+
+	if attempt.finished() {
+		app.enrollMu.Unlock()
+		t.Fatal("staged pairing became replaceable before reconciliation")
+	}
+	app.mu.RLock()
+	installed := app.config != nil
+	app.mu.RUnlock()
+	if installed {
+		app.enrollMu.Unlock()
+		t.Fatal("staged pairing was installed across enrollment serialization")
+	}
+	app.enrollMu.Unlock()
+	wait, stopWaiting := context.WithTimeout(t.Context(), 2*time.Second)
+	defer stopWaiting()
+	receivePairingValue(t, wait, reconciled, "pairing reconciliation")
+
+	app.mu.RLock()
+	result := app.config
+	current := app.pairing
+	started := app.cancel != nil
+	app.mu.RUnlock()
+	if !attempt.finished() || result == nil || *result != config || current != nil || !started {
+		t.Fatalf("finished = %v, config = %#v, pairing = %#v, relay started = %v", attempt.finished(), result, current, started)
 	}
 }
 

@@ -278,6 +278,11 @@ struct PairingSnapshot: Decodable, Equatable, Sendable {
         return pairID
     }
 
+    var cancellablePairID: String? {
+        guard ["showingQR", "handshaking", "awaitingApproval"].contains(phase) else { return nil }
+        return validPairID
+    }
+
     var approvalDetails: PairingApprovalDetails? {
         guard isAwaitingApproval,
               let pairID = validPairID,
@@ -926,7 +931,7 @@ final class CompanionModel: ObservableObject {
     var canCancelPairing: Bool { pairingCancellationID != nil }
 
     private var pairingCancellationID: String? {
-        if let pairID = state?.pairing?.validPairID { return pairID }
+        if let pairing = state?.pairing { return pairing.cancellablePairID }
         guard let pairID = pairingInvite?.pairID, canonicalUUID(pairID) else { return nil }
         return pairID
     }

@@ -314,6 +314,11 @@ func (app *App) handlePairingStart(response http.ResponseWriter, request *http.R
 
 func (app *App) finishPairing(attempt *pairingAttempt) {
 	config, staged, err := attempt.run()
+	app.reconcilePairing(attempt, config, staged, err)
+}
+
+func (app *App) reconcilePairing(attempt *pairingAttempt, config Config, staged bool, err error) {
+	defer close(attempt.done)
 	app.enrollMu.Lock()
 	defer app.enrollMu.Unlock()
 	app.mu.Lock()

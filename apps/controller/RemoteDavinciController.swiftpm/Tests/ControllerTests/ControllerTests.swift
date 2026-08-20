@@ -497,6 +497,20 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(RelayLifecycle.rotationDelaySeconds(randomUnit: 0), 5_400)
         XCTAssertEqual(RelayLifecycle.rotationDelaySeconds(randomUnit: 1), 6_600)
         XCTAssertEqual(RelayLifecycle.sessionSetupTimeoutSeconds, 15)
+        XCTAssertEqual(RelayLifecycle.reconnectStabilitySeconds, 30)
+        let attemptAfterHello = RelayLifecycle.reconnectAttempt(
+            current: 4,
+            afterStableSession: false
+        )
+        XCTAssertEqual(attemptAfterHello, 4)
+        XCTAssertEqual(
+            RelayLifecycle.reconnectDelaySeconds(attempt: attemptAfterHello, randomUnit: 1),
+            16
+        )
+        XCTAssertEqual(
+            RelayLifecycle.reconnectAttempt(current: attemptAfterHello, afterStableSession: true),
+            0
+        )
         XCTAssertEqual(RelayLifecycle.remainingMilliseconds(expiresAt: 6_000, now: 1_000), 5_000)
         XCTAssertEqual(RelayLifecycle.remainingMilliseconds(expiresAt: 1_000, now: 6_000), 0)
         XCTAssertEqual(

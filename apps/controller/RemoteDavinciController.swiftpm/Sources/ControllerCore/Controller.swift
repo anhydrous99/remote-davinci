@@ -439,10 +439,18 @@ enum RelayRecoveryDisposition: Equatable {
 
 enum RelayLifecycle {
     static let sessionSetupTimeoutSeconds: Double = 15
+    static let reconnectStabilitySeconds: Double = 30
 
     static func reconnectDelaySeconds(attempt: Int, randomUnit: Double) -> Double {
         let ceiling = min(900, pow(2, Double(min(max(attempt, 0), 10))))
         return ceiling * min(max(randomUnit, 0), 1)
+    }
+
+    static func reconnectAttempt(
+        current: Int,
+        afterStableSession stable: Bool
+    ) -> Int {
+        stable ? 0 : current
     }
 
     static func rotationDelaySeconds(randomUnit: Double) -> Double {
@@ -678,6 +686,7 @@ public final class ControllerModel: ObservableObject {
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectStabilityTask: Task<Void, Never>?
     private var rotationTask: Task<Void, Never>?
     private var sessionSetupTask: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
@@ -1199,10 +1208,10 @@ public final class ControllerModel: ObservableObject {
         }
 
         let plaintext = try noise.decryptTransport(frame)
-        try handleControl(plaintext)
+        try handleControl(plaintext, on: task)
     }
 
-    private func handleControl(_ data: Data) throws {
+    private func handleControl(_ data: Data, on task: URLSessionWebSocketTask) throws {
         guard data.count <= NoiseIKInitiator.maxPlaintextBytes,
               let envelope = ProtocolJSON.object(data),
               envelope["protocol"] as? String == "remote-davinci.control",
@@ -1231,9 +1240,9 @@ public final class ControllerModel: ObservableObject {
             sessionSetupTask?.cancel()
             sessionSetupTask = nil
             try finalizePendingActivation()
-            reconnectAttempt = 0
             companionCapabilities = Set(capabilities)
             isReady = true
+            startReconnectStabilityInterval(for: task)
             connectionStatus = "Connected"
             feedback = Self.operations.contains(where: companionCapabilities.contains)
                 ? "Ready"
@@ -1729,6 +1738,27 @@ public final class ControllerModel: ObservableObject {
         }
     }
 
+    private func startReconnectStabilityInterval(for task: URLSessionWebSocketTask) {
+        reconnectStabilityTask?.cancel()
+        reconnectStabilityTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(RelayLifecycle.reconnectStabilitySeconds))
+            } catch {
+                return
+            }
+            self?.finishReconnectStabilityInterval(for: task)
+        }
+    }
+
+    private func finishReconnectStabilityInterval(for task: URLSessionWebSocketTask) {
+        let stable = socket === task && isReady
+        reconnectAttempt = RelayLifecycle.reconnectAttempt(
+            current: reconnectAttempt,
+            afterStableSession: stable
+        )
+        if stable { reconnectStabilityTask = nil }
+    }
+
     private func expireSessionSetup(_ task: URLSessionWebSocketTask) {
         guard socket === task, !isReady else { return }
         sessionSetupTask = nil
@@ -1839,6 +1869,8 @@ public final class ControllerModel: ObservableObject {
         pingTask = nil
         rotationTask?.cancel()
         rotationTask = nil
+        reconnectStabilityTask?.cancel()
+        reconnectStabilityTask = nil
         sessionSetupTask?.cancel()
         sessionSetupTask = nil
         expiryTask?.cancel()

@@ -227,7 +227,6 @@ func (attempt *pairingAttempt) finished() bool {
 }
 
 func (attempt *pairingAttempt) run() (Config, bool, error) {
-	defer close(attempt.done)
 	defer attempt.peer.close()
 	defer func() {
 		if !attempt.activated {

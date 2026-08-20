@@ -171,6 +171,15 @@ final class CompanionTests: XCTestCase {
         }
     }
 
+    func testPairingCancellationMatchesHelperPhases() {
+        for phase in ["showingQR", "handshaking", "awaitingApproval"] {
+            XCTAssertNotNil(pairingSnapshot(phase: phase).cancellablePairID)
+        }
+        for phase in ["committing", "cancelled", "expired", "failed", "rejected"] {
+            XCTAssertNil(pairingSnapshot(phase: phase).cancellablePairID)
+        }
+    }
+
     func testLegacyUnsafeControllerLabelIsNotRendered() {
         let state = CompanionState(
             configured: true,
@@ -219,13 +228,14 @@ final class CompanionTests: XCTestCase {
     }
 
     private func pairingSnapshot(
+        phase: String = "awaitingApproval",
         pairID: String? = "11111111-1111-4111-8111-111111111111",
         controllerLabel: String? = "My iPhone",
         controllerFingerprint: String? = "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         requestedPermissions: [String]? = ["resolve.page.edit"]
     ) -> PairingSnapshot {
         PairingSnapshot(
-            phase: "awaitingApproval",
+            phase: phase,
             pairID: pairID,
             expiresAt: 1_800_000_000,
             controllerLabel: controllerLabel,
