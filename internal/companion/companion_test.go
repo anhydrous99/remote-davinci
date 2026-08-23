@@ -220,7 +220,7 @@ func TestOperationDiagnosticsAreTimedAndRedacted(t *testing.T) {
 	}
 }
 
-func TestRelayReconnectDelayResetsOnlyAfterStableSecureSession(t *testing.T) {
+func TestRelayReconnectDelayResetsAfterStableConnectedUptime(t *testing.T) {
 	started := time.Unix(1_000, 0)
 	const backedOff = 8 * time.Second
 	for _, test := range []struct {
@@ -229,7 +229,7 @@ func TestRelayReconnectDelayResetsOnlyAfterStableSecureSession(t *testing.T) {
 		want      time.Duration
 	}{
 		{"never stable", false, backedOff},
-		{"stable secure session", true, time.Second},
+		{"stable relay connection", true, time.Second},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := resetRelayReconnectDelay(backedOff, test.wasStable); got != test.want {
@@ -238,13 +238,13 @@ func TestRelayReconnectDelayResetsOnlyAfterStableSecureSession(t *testing.T) {
 		})
 	}
 
-	stable := relayConnectionHadStableSession(false, started, started.Add(relayReconnectStability))
-	stable = relayConnectionHadStableSession(stable, time.Time{}, started.Add(time.Hour))
+	stable := relayConnectionHadStableUptime(false, started, started.Add(relayReconnectStability))
+	stable = relayConnectionHadStableUptime(stable, time.Time{}, started.Add(time.Hour))
 	if got := resetRelayReconnectDelay(backedOff, stable); got != time.Second {
-		t.Fatalf("reconnect delay after secure -> nonsecure -> disconnect = %v, want 1s", got)
+		t.Fatalf("reconnect delay after sustained connection = %v, want 1s", got)
 	}
-	if relayConnectionHadStableSession(false, started, started.Add(relayReconnectStability-time.Nanosecond)) {
-		t.Fatal("short secure session marked stable")
+	if relayConnectionHadStableUptime(false, started, started.Add(relayReconnectStability-time.Nanosecond)) {
+		t.Fatal("brief connection marked stable")
 	}
 }
 

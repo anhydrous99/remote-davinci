@@ -27,7 +27,7 @@ type RelayStatus struct {
 
 var errEnrollmentTerminal = errors.New("enrollment is no longer authorized")
 
-// Match the controller's continuous secure-session window before resetting retry backoff.
+// Require sustained authenticated relay uptime before resetting retry backoff.
 const relayReconnectStability = 30 * time.Second
 
 func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) error {
@@ -37,19 +37,19 @@ func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) erro
 	delay := time.Second
 	for ctx.Err() == nil {
 		update(RelayStatus{Message: "Connecting to relay…"})
-		var secureSince time.Time
-		hadStableSecureSession := false
+		var connectedSince time.Time
+		hadStableConnection := false
 		err := runRelayConnection(ctx, config, func(status RelayStatus) {
 			now := time.Now()
-			if status.Secure {
-				if secureSince.IsZero() {
-					secureSince = now
+			if status.Connected {
+				if connectedSince.IsZero() {
+					connectedSince = now
 				}
 			} else {
-				hadStableSecureSession = relayConnectionHadStableSession(
-					hadStableSecureSession, secureSince, now,
+				hadStableConnection = relayConnectionHadStableUptime(
+					hadStableConnection, connectedSince, now,
 				)
-				secureSince = time.Time{}
+				connectedSince = time.Time{}
 			}
 			update(status)
 		})
@@ -60,10 +60,10 @@ func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) erro
 			update(RelayStatus{Message: "Enrollment revoked or unauthorized; reset required"})
 			return err
 		}
-		hadStableSecureSession = relayConnectionHadStableSession(
-			hadStableSecureSession, secureSince, time.Now(),
+		hadStableConnection = relayConnectionHadStableUptime(
+			hadStableConnection, connectedSince, time.Now(),
 		)
-		delay = resetRelayReconnectDelay(delay, hadStableSecureSession)
+		delay = resetRelayReconnectDelay(delay, hadStableConnection)
 		update(RelayStatus{Message: "Disconnected; retrying…"})
 		if err := fullJitterSleep(ctx, delay); err != nil {
 			return nil
@@ -79,12 +79,12 @@ func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) erro
 	return nil
 }
 
-func relayConnectionHadStableSession(alreadyStable bool, secureSince, observedAt time.Time) bool {
-	return alreadyStable || !secureSince.IsZero() && observedAt.Sub(secureSince) >= relayReconnectStability
+func relayConnectionHadStableUptime(alreadyStable bool, connectedSince, observedAt time.Time) bool {
+	return alreadyStable || !connectedSince.IsZero() && observedAt.Sub(connectedSince) >= relayReconnectStability
 }
 
-func resetRelayReconnectDelay(delay time.Duration, hadStableSecureSession bool) time.Duration {
-	if hadStableSecureSession {
+func resetRelayReconnectDelay(delay time.Duration, hadStableConnection bool) time.Duration {
+	if hadStableConnection {
 		return time.Second
 	}
 	return delay

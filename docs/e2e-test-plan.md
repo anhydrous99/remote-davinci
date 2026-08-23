@@ -380,9 +380,9 @@ endpoints. For each device:
    persists it.
 4. Verify both sides report a secure session and matching peer, and that the
    controller connects automatically only after activation.
-5. Tap each page tab and use the host mute control once. Require remote actions
-   to remain unavailable while disconnected or handshaking, and page commands
-   to remain bounded to one in flight.
+5. Tap each page button in the grid and use the host mute control once. Require
+   remote actions to remain unavailable while disconnected or handshaking, and
+   page commands to remain bounded to one in flight.
 6. Confirm success, stable failure code, and unknown-result UI states are
    distinguishable.
 7. Background while scanning, authenticating, awaiting approval, and after
@@ -418,7 +418,7 @@ real suspension/network behavior, with zero replay or unauthorized execution.
    `resolve.page.changed` snapshot selects Cut in the app without asking Resolve
    to change pages.
 4. Tap Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver in the app. For
-   each tab, verify
+   each selection, verify
    `GetCurrentPage()` returns the matching lowercase page and the correlated
    success result contains that page.
 5. Select Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver inside
@@ -426,8 +426,8 @@ real suspension/network behavior, with zero replay or unauthorized execution.
    the app follows within two 500 ms polls plus relay latency (target under 1.5
    seconds on a healthy connection) and sends no echo request.
 6. If Resolve exposes the optional Photo page, select it and verify the app
-   retains its last supported tab and sends no corrective command. Return to a
-   supported page and verify synchronization resumes.
+   retains its last supported page selection and sends no corrective command.
+   Return to a supported page and verify synchronization resumes.
 7. Exercise rapid app and Resolve page changes. Verify one command remains in
    flight, the final state converges to Resolve, and no event/request loop or
    stale selection appears.
