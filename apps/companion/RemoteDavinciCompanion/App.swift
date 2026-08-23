@@ -1,6 +1,37 @@
 import AppKit
 import SwiftUI
 
+struct CopiedPairingInvite {
+    let pairID: String
+    private let payload: String
+    private let changeCount: Int
+    private let pasteboard: NSPasteboard
+
+    static func copy(
+        pairID: String,
+        payload: String,
+        to pasteboard: NSPasteboard = .general
+    ) -> CopiedPairingInvite? {
+        pasteboard.clearContents()
+        guard pasteboard.setString(payload, forType: .string) else { return nil }
+        return CopiedPairingInvite(
+            pairID: pairID,
+            payload: payload,
+            changeCount: pasteboard.changeCount,
+            pasteboard: pasteboard
+        )
+    }
+
+    @discardableResult
+    func clearIfUnchanged() -> Bool {
+        guard pasteboard.changeCount == changeCount,
+              pasteboard.string(forType: .string) == payload
+        else { return false }
+        pasteboard.clearContents()
+        return true
+    }
+}
+
 @main
 @MainActor
 struct RemoteDavinciCompanionApp: App {
@@ -162,7 +193,6 @@ struct CompanionView: View {
 
 private struct PairingSection: View {
     @ObservedObject var model: CompanionModel
-    @State private var copiedPairID: String?
     @State private var pairingCodeCopyMessage = ""
     @State private var pairingCodeCopySucceeded = false
 
@@ -224,21 +254,16 @@ private struct PairingSection: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 HStack {
-                    Button(copiedPairID == invite.pairID ? "Pairing Code Copied" : "Copy Pairing Code") {
+                    Button(model.copiedPairingInviteID == invite.pairID ? "Pairing Code Copied" : "Copy Pairing Code") {
                         do {
-                            let payload = try invite.qrPayload()
-                            NSPasteboard.general.clearContents()
-                            if NSPasteboard.general.setString(payload, forType: .string) {
-                                copiedPairID = invite.pairID
+                            if try model.copyPairingInvite(invite) {
                                 pairingCodeCopyMessage = "Pairing code copied."
                                 pairingCodeCopySucceeded = true
                             } else {
-                                copiedPairID = nil
                                 pairingCodeCopyMessage = "The pairing code could not be copied."
                                 pairingCodeCopySucceeded = false
                             }
                         } catch {
-                            copiedPairID = nil
                             pairingCodeCopyMessage = "The pairing code could not be prepared. Generate a new code."
                             pairingCodeCopySucceeded = false
                         }
@@ -247,11 +272,6 @@ private struct PairingSection: View {
                         "Copies the one-time code for pasting on a device without camera access")
                     Button("Cancel Pairing", role: .cancel) { model.cancelPairing() }
                         .disabled(model.isMutating || !model.canCancelPairing)
-                }
-                .onChange(of: invite.pairID) { _, _ in
-                    copiedPairID = nil
-                    pairingCodeCopyMessage = ""
-                    pairingCodeCopySucceeded = false
                 }
                 if !pairingCodeCopyMessage.isEmpty {
                     Text(pairingCodeCopyMessage)
@@ -271,6 +291,10 @@ private struct PairingSection: View {
                     .disabled(model.isMutating || model.state == nil)
             }
 
+        }
+        .onChange(of: model.pairingInvite?.pairID) { _, _ in
+            pairingCodeCopyMessage = ""
+            pairingCodeCopySucceeded = false
         }
     }
 

@@ -274,10 +274,28 @@ func (failure *relayUpgradeError) Error() string {
 type relayResponseError struct {
 	requestType string
 	code        protocol.ErrorCode
+	retryable   *bool
+	retryAfter  *int64
 }
 
 func (failure *relayResponseError) Error() string {
 	return fmt.Sprintf("relay rejected %s: %s", failure.requestType, failure.code)
+}
+
+func relayResponseFailure(envelope protocol.ServerEnvelope, requestType string) *relayResponseError {
+	var body struct {
+		Code         protocol.ErrorCode `json:"code"`
+		Retryable    *bool              `json:"retryable"`
+		RetryAfterMS *int64             `json:"retryAfterMs"`
+	}
+	_ = envelope.DecodeBody(&body)
+	if body.Code == "" {
+		body.Code = protocol.Internal
+	}
+	return &relayResponseError{
+		requestType: requestType, code: body.Code,
+		retryable: body.Retryable, retryAfter: body.RetryAfterMS,
+	}
 }
 
 var errConfigPersistence = errors.New("could not persist companion credentials")
@@ -328,14 +346,7 @@ func (peer *relayPeer) request(ctx context.Context, messageType string, body any
 			continue
 		}
 		if envelope.Type == "error" {
-			var failure struct {
-				Code string `json:"code"`
-			}
-			_ = envelope.DecodeBody(&failure)
-			if failure.Code == "" {
-				failure.Code = string(protocol.Internal)
-			}
-			return &relayResponseError{requestType: messageType, code: protocol.ErrorCode(failure.Code)}
+			return relayResponseFailure(envelope, messageType)
 		}
 		var success struct {
 			RequestType string          `json:"requestType"`

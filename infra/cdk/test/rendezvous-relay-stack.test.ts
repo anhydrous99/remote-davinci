@@ -15,6 +15,8 @@ function template(
   environment: 'dev' | 'prod' = 'dev',
   accessLogs?: boolean,
   pairActivationsPerSourceHour?: number,
+  lambdaMemory?: 128 | 256 | 512,
+  performanceMode?: boolean,
 ): Template {
   const app = new App();
   return Template.fromStack(
@@ -22,9 +24,11 @@ function template(
       ...(accessLogs === undefined ? {} : { accessLogs }),
       ...(environment === 'prod' ? { alarmTopicArn: testAlarmTopicArn } : {}),
       environment,
+      ...(lambdaMemory === undefined ? {} : { lambdaMemory }),
       ...(pairActivationsPerSourceHour === undefined
         ? {}
         : { pairActivationsPerSourceHour }),
+      ...(performanceMode === undefined ? {} : { performanceMode }),
       env: { account: testAccount, region: testRegion },
     }),
   );
@@ -455,6 +459,49 @@ describe('RendezvousRelayStack', () => {
       );
     }
   });
+
+  it('supports only the documented Lambda memory sweep', () => {
+    for (const memory of [128, 256, 512] as const) {
+      template('dev', undefined, undefined, memory).hasResourceProperties(
+        'AWS::Lambda::Function',
+        { MemorySize: memory },
+      );
+    }
+    assert.throws(
+      () =>
+        new RendezvousRelayStack(new App(), 'InvalidMemory', {
+          environment: 'dev',
+          lambdaMemory: 1024 as 512,
+        }),
+      /lambdaMemory must be 128, 256, or 512/,
+    );
+  });
+
+  it('raises only the dev session-frame route for performance measurements', () => {
+    const stack = template('dev', undefined, undefined, undefined, true);
+    stack.hasResourceProperties('AWS::ApiGatewayV2::Stage', {
+      RouteSettings: Match.objectLike({
+        '$connect': Match.objectLike({
+          ThrottlingBurstLimit: 100,
+          ThrottlingRateLimit: 50,
+        }),
+        'session.frame': Match.objectLike({
+          ThrottlingBurstLimit: 5_000,
+          ThrottlingRateLimit: 4_000,
+        }),
+      }),
+    });
+    assert.throws(
+      () =>
+        new RendezvousRelayStack(new App(), 'InvalidProdPerformanceMode', {
+          alarmTopicArn: testAlarmTopicArn,
+          environment: 'prod',
+          env: { account: testAccount, region: testRegion },
+          performanceMode: true,
+        }),
+      /performanceMode is available only for dev/,
+    );
+  });
 });
 
 describe('deploymentConfig', () => {
@@ -528,5 +575,53 @@ describe('deploymentConfig', () => {
         /must be an integer from 1 through 10000/,
       );
     }
+  });
+
+  it('validates the Lambda memory sweep context', () => {
+    assert.deepEqual(
+      deploymentConfig(new App({ context: { lambdaMemory: '128' } }), {}),
+      {
+        environment: 'dev',
+        lambdaMemory: 128,
+        region: 'us-east-1',
+      },
+    );
+    for (const value of ['0', '1.5', '127', '129', '1024']) {
+      assert.throws(
+        () =>
+          deploymentConfig(new App({ context: { lambdaMemory: value } }), {}),
+        /lambdaMemory must be 128, 256, or 512/,
+      );
+    }
+  });
+
+  it('allows performance mode only for development', () => {
+    assert.deepEqual(
+      deploymentConfig(new App({ context: { performanceMode: 'true' } }), {}),
+      {
+        environment: 'dev',
+        performanceMode: true,
+        region: 'us-east-1',
+      },
+    );
+    assert.throws(
+      () =>
+        deploymentConfig(
+          new App({
+            context: {
+              alarmTopicArn: testAlarmTopicArn,
+              environment: 'prod',
+              performanceMode: true,
+              productionAccount: testAccount,
+              productionRegion: testRegion,
+            },
+          }),
+          {
+            CDK_DEFAULT_ACCOUNT: testAccount,
+            CDK_DEFAULT_REGION: testRegion,
+          },
+        ),
+      /performanceMode is available only for dev/,
+    );
   });
 });

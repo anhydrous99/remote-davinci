@@ -53,6 +53,23 @@ func TestRelayURLRequiresCanonicalForm(t *testing.T) {
 	}
 }
 
+func TestRelayResponseFailurePreservesRateLimitMetadata(t *testing.T) {
+	envelope, err := protocol.ParseServer([]byte(`{
+		"protocol":"remote-davinci.rendezvous","v":1,"type":"error",
+		"id":"10000000-0000-4000-8000-000000000001",
+		"replyTo":"10000000-0000-4000-8000-000000000002",
+		"body":{"code":"RATE_LIMITED","retryable":false,"retryAfterMs":1234}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := relayResponseFailure(envelope, "pair.commit")
+	if failure.code != protocol.RateLimited || failure.retryable == nil || *failure.retryable ||
+		failure.retryAfter == nil || *failure.retryAfter != 1234 {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
 func TestDeviceLabelsRejectInvisibleControls(t *testing.T) {
 	for _, value := range []string{"Alex's iPad", "Téléphone 猫 📱"} {
 		if !validDeviceLabel(value) {
@@ -1043,6 +1060,50 @@ func TestGUIUsesOneTimeBrowserBootstrapAndLaunchScopedToken(t *testing.T) {
 	first.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("authorized API status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRelayWakeAPIRequiresConfiguredAuthenticatedEmptyRequest(t *testing.T) {
+	configured := validTestConfig(t)
+	parent, cancelParent := context.WithCancel(t.Context())
+	cancelParent()
+	cancelled := false
+	app := &App{
+		ctx: parent, config: &configured, uiToken: "test-token",
+		cancel: func() { cancelled = true }, status: RelayStatus{Connected: true},
+	}
+	defer app.Close()
+
+	request := func(target *App, token, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:7314/api/relay/wake", strings.NewReader(body))
+		req.Header.Set(uiTokenHeader, token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:7314")
+		response := httptest.NewRecorder()
+		target.Handler().ServeHTTP(response, req)
+		return response
+	}
+
+	if response := request(app, "", `{}`); response.Code != http.StatusForbidden || cancelled {
+		t.Fatalf("unauthorized wake status = %d, cancelled = %v", response.Code, cancelled)
+	}
+	if response := request(app, app.uiToken, `{"extra":true}`); response.Code != http.StatusBadRequest || cancelled {
+		t.Fatalf("invalid wake status = %d, cancelled = %v", response.Code, cancelled)
+	}
+	unconfigured := &App{ctx: parent, uiToken: app.uiToken}
+	if response := request(unconfigured, unconfigured.uiToken, `{}`); response.Code != http.StatusConflict {
+		t.Fatalf("unconfigured wake status = %d, want %d", response.Code, http.StatusConflict)
+	}
+	revokedConfig := configured
+	revokedConfig.LinkRevoked = true
+	revoked := &App{ctx: parent, config: &revokedConfig, uiToken: app.uiToken}
+	if response := request(revoked, revoked.uiToken, `{}`); response.Code != http.StatusConflict {
+		t.Fatalf("revoked wake status = %d, want %d", response.Code, http.StatusConflict)
+	}
+
+	response := request(app, app.uiToken, `{}`)
+	if response.Code != http.StatusOK || !cancelled || app.state().Status != "Connecting to relay…" || !strings.Contains(response.Body.String(), `"woken":true`) {
+		t.Fatalf("wake status = %d, cancelled = %v, relay = %q, body = %s", response.Code, cancelled, app.state().Status, response.Body.String())
 	}
 }
 

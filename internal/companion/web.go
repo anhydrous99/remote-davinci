@@ -193,6 +193,7 @@ func (app *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/pairing/approve", app.handlePairingApprove)
 	mux.HandleFunc("POST /api/pairing/reject", app.handlePairingReject)
 	mux.HandleFunc("POST /api/pairing/cancel", app.handlePairingCancel)
+	mux.HandleFunc("POST /api/relay/wake", app.handleRelayWake)
 	mux.HandleFunc("POST /api/reset", app.handleReset)
 	mux.HandleFunc("POST /api/forget", app.handleForget)
 	mux.HandleFunc("POST /api/action", app.handleAction)
@@ -269,6 +270,30 @@ func (app *App) handleIndex(response http.ResponseWriter, request *http.Request)
 
 func (app *App) handleState(response http.ResponseWriter, _ *http.Request) {
 	writeJSON(response, http.StatusOK, app.state())
+}
+
+func (app *App) handleRelayWake(response http.ResponseWriter, request *http.Request) {
+	var body map[string]json.RawMessage
+	if !decodeJSONBody(response, request, &body, "invalid relay wake request") {
+		return
+	}
+	if body == nil || len(body) != 0 {
+		writeError(response, http.StatusBadRequest, "invalid relay wake request")
+		return
+	}
+
+	app.enrollMu.Lock()
+	defer app.enrollMu.Unlock()
+	app.mu.RLock()
+	if app.config == nil || app.config.LinkRevoked {
+		app.mu.RUnlock()
+		writeError(response, http.StatusConflict, "no active controller enrollment")
+		return
+	}
+	config := *app.config
+	app.mu.RUnlock()
+	app.startRelay(config)
+	writeJSON(response, http.StatusOK, map[string]bool{"woken": true})
 }
 
 func (app *App) handlePairingStart(response http.ResponseWriter, request *http.Request) {

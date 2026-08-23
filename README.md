@@ -157,7 +157,8 @@ Keychain; changing it later requires revocation and pairing again.
 - [`docs/capacity.md`](docs/capacity.md): relay quotas, load targets, and cost
   model.
 - [`docs/performance-results-template.md`](docs/performance-results-template.md):
-  dated live latency and capacity evidence.
+  blank release record plus executable latency, load, and Lambda-memory
+  measurement workflow; it contains no live result until a dated run fills it.
 - [`docs/improvement-roadmap.md`](docs/improvement-roadmap.md): implemented
   customer-readiness work, acceptance targets, and remaining live gates.
 - [`docs/release-checklist.md`](docs/release-checklist.md): signing,
@@ -196,16 +197,25 @@ Xcode:
 ```sh
 make companion-app-check
 make controller-check
+make controller-ios-tests
 make controller-ios-build
 make companion-release-check
 ```
 
-`controller-check` runs fast Mac Catalyst tests. `controller-ios-build` compiles
-the real iOS-only paths in Release against the simulator SDK, while
-`companion-release-check` builds the unsigned Release configuration. Neither is
-a physical-device, signed-distribution, or live-service test. The complete
-deployment, device, failure-path, host-effect, and cleanup matrix is in
-[`docs/e2e-test-plan.md`](docs/e2e-test-plan.md).
+`controller-check` runs fast Mac Catalyst tests. `controller-ios-tests` runs the
+same test target on one available iPhone and one iPad simulator.
+`controller-ios-build` compiles the real iOS-only paths in Release against the
+simulator SDK, while `companion-release-check` builds the unsigned Release
+configuration. None is a physical-device, signed-distribution, or live-service
+test. The complete deployment, device, failure-path, host-effect, and cleanup
+matrix is in [`docs/e2e-test-plan.md`](docs/e2e-test-plan.md).
+
+`go run ./cmd/relay-perf` is an explicitly gated disposable-stack load probe for
+the opaque relay hot path. `go run ./cmd/latency-summary` converts one duration
+per line into the nearest-rank percentiles used by the performance record. See
+[`docs/performance-results-template.md`](docs/performance-results-template.md)
+for the safety gates and exact commands; neither tool contains a live benchmark
+result.
 
 ## AWS infrastructure development
 
@@ -214,6 +224,10 @@ the development stack with `npm --prefix infra/cdk run synth`. It targets
 `us-east-1` by default; pass CDK context `region` to select another region.
 Deployment requires a CDK-bootstrapped AWS account and is intentionally not
 performed by the test suite.
+The optional `lambdaMemory` context accepts only `128`, `256`, or `512` MiB for
+the documented isolated-stack sweep and otherwise defaults to `256` MiB. The
+dev-only `performanceMode=true` context raises the `session.frame` route for
+that workload and is rejected for production.
 
 Production synthesis and deployment require an explicit account/region
 allowlist plus an existing SNS topic in that same account and region:

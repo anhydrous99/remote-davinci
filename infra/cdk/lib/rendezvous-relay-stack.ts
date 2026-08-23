@@ -23,7 +23,9 @@ export interface RendezvousRelayStackProps extends StackProps {
   readonly environment: 'dev' | 'prod';
   readonly accessLogs?: boolean;
   readonly alarmTopicArn?: string;
+  readonly lambdaMemory?: 128 | 256 | 512;
   readonly pairActivationsPerSourceHour?: number;
+  readonly performanceMode?: boolean;
 }
 
 export class RendezvousRelayStack extends Stack {
@@ -31,7 +33,15 @@ export class RendezvousRelayStack extends Stack {
     super(scope, id, props);
 
     const production = props.environment === 'prod';
+    const performanceMode = props.performanceMode ?? false;
+    if (production && performanceMode) {
+      throw new Error('performanceMode is available only for dev');
+    }
     const accessLogging = props.accessLogs ?? true;
+    const lambdaMemory = props.lambdaMemory ?? 256;
+    if (lambdaMemory !== 128 && lambdaMemory !== 256 && lambdaMemory !== 512) {
+      throw new Error('lambdaMemory must be 128, 256, or 512');
+    }
     const pairActivationsPerSourceHour =
       props.pairActivationsPerSourceHour ?? 10;
     if (
@@ -120,7 +130,7 @@ export class RendezvousRelayStack extends Stack {
         TABLE_NAME: table.tableName,
       },
       loggingFormat: lambda.LoggingFormat.JSON,
-      memorySize: 256,
+      memorySize: lambdaMemory,
       ...(production
         ? {
             applicationLogLevelV2: lambda.ApplicationLogLevel.INFO,
@@ -262,8 +272,8 @@ export class RendezvousRelayStack extends Stack {
       '$disconnect': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
       'pair.frame': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
       'session.frame': routeSettings(
-        production ? 4_000 : 50,
-        production ? 5_000 : 100,
+        production || performanceMode ? 4_000 : 50,
+        production || performanceMode ? 5_000 : 100,
       ),
     };
 

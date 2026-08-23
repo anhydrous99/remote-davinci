@@ -7,7 +7,9 @@ export interface DeploymentConfig {
   readonly account?: string;
   readonly accessLogs?: boolean;
   readonly alarmTopicArn?: string;
+  readonly lambdaMemory?: 128 | 256 | 512;
   readonly pairActivationsPerSourceHour?: number;
+  readonly performanceMode?: boolean;
   readonly region: string;
 }
 
@@ -58,6 +60,19 @@ function positiveIntegerContext(app: App, name: string): number | undefined {
   return value;
 }
 
+function lambdaMemoryContext(app: App): 128 | 256 | 512 | undefined {
+  const raw: unknown = app.node.tryGetContext('lambdaMemory');
+  if (raw === undefined) return undefined;
+  const value =
+    typeof raw === 'string' && /^[1-9][0-9]*$/.test(raw)
+      ? Number(raw)
+      : raw;
+  if (value !== 128 && value !== 256 && value !== 512) {
+    throw new Error('CDK context lambdaMemory must be 128, 256, or 512');
+  }
+  return value;
+}
+
 export function deploymentConfig(
   app: App,
   processEnvironment: NodeJS.ProcessEnv = process.env,
@@ -69,11 +84,16 @@ export function deploymentConfig(
 
   const accessLogs = booleanContext(app, 'accessLogs');
   const alarmTopicArn = stringContext(app, 'alarmTopicArn');
+  const lambdaMemory = lambdaMemoryContext(app);
+  const performanceMode = booleanContext(app, 'performanceMode');
   const pairActivationsPerSourceHour = positiveIntegerContext(
     app,
     'pairActivationsPerSourceHour',
   );
   if (environment === 'prod') {
+    if (performanceMode === true) {
+      throw new Error('CDK context performanceMode is available only for dev');
+    }
     const account = requiredStringContext(app, 'productionAccount');
     const region = requiredStringContext(app, 'productionRegion');
     const productionAlarmTopicArn = requiredStringContext(app, 'alarmTopicArn');
@@ -91,9 +111,11 @@ export function deploymentConfig(
       account,
       alarmTopicArn: productionAlarmTopicArn,
       environment,
+      ...(lambdaMemory === undefined ? {} : { lambdaMemory }),
       ...(pairActivationsPerSourceHour === undefined
         ? {}
         : { pairActivationsPerSourceHour }),
+      ...(performanceMode === undefined ? {} : { performanceMode }),
       region,
     };
   }
@@ -106,9 +128,11 @@ export function deploymentConfig(
     ...(accessLogs === undefined ? {} : { accessLogs }),
     ...(alarmTopicArn === undefined ? {} : { alarmTopicArn }),
     environment,
+    ...(lambdaMemory === undefined ? {} : { lambdaMemory }),
     ...(pairActivationsPerSourceHour === undefined
       ? {}
       : { pairActivationsPerSourceHour }),
+    ...(performanceMode === undefined ? {} : { performanceMode }),
     region,
   };
 }
@@ -121,12 +145,18 @@ export function main(): void {
     ...(config.alarmTopicArn === undefined
       ? {}
       : { alarmTopicArn: config.alarmTopicArn }),
+    ...(config.lambdaMemory === undefined
+      ? {}
+      : { lambdaMemory: config.lambdaMemory }),
     ...(config.pairActivationsPerSourceHour === undefined
       ? {}
       : {
           pairActivationsPerSourceHour:
             config.pairActivationsPerSourceHour,
         }),
+    ...(config.performanceMode === undefined
+      ? {}
+      : { performanceMode: config.performanceMode }),
     environment: config.environment,
     env: config.account
       ? { account: config.account, region: config.region }

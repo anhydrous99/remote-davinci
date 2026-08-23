@@ -3,6 +3,7 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Darwin
 import Foundation
+import Network
 import OSLog
 import ServiceManagement
 
@@ -480,6 +481,10 @@ private struct ForgetReply: Decodable {
     let warning: String
 }
 
+private struct RelayWakeReply: Decodable {
+    let woken: Bool
+}
+
 private struct ActionReply: Decodable {
     let page: String?
     let muted: Bool?
@@ -539,6 +544,12 @@ struct CompanionAPI {
 
     func cancelPairing(pairID: String) async throws {
         try await pairingAction("/api/pairing/cancel", pairID: pairID)
+    }
+
+    func wakeRelay() async throws {
+        let reply: RelayWakeReply = try await request(
+            "/api/relay/wake", method: "POST", body: Data("{}".utf8))
+        guard reply.woken else { throw CompanionFailure.invalidResponse }
     }
 
     func reset(linkID: String) async throws {
@@ -908,11 +919,14 @@ final class CompanionModel: ObservableObject {
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private let host = CompanionHost()
+    private let pathMonitor = NWPathMonitor()
     private var started = false
     private var connection: CompanionConnection?
     private var api: CompanionAPI?
     private var pollTask: Task<Void, Never>?
     private var attemptedAutomaticPairing = false
+    private var lastNetworkPathSatisfied: Bool?
+    private var copiedPairingInvite: CopiedPairingInvite?
 
     private init() {
         host.onChange = { [weak self] snapshot in
@@ -937,10 +951,13 @@ final class CompanionModel: ObservableObject {
         return (try? response.formattedJSON()) ?? ""
     }
 
+    var copiedPairingInviteID: String? { copiedPairingInvite?.pairID }
+
     func start() {
         guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
         guard !started else { return }
         started = true
+        startPathMonitor()
         host.start()
     }
 
@@ -948,12 +965,42 @@ final class CompanionModel: ObservableObject {
         started = false
         pollTask?.cancel()
         pollTask = nil
+        pathMonitor.cancel()
         clearPairingInvite()
         host.stop()
     }
 
     func retryServer() {
         host.retry()
+    }
+
+    nonisolated static func shouldWakeRelay(
+        previousPathSatisfied: Bool?,
+        pathSatisfied: Bool,
+        configured: Bool
+    ) -> Bool {
+        previousPathSatisfied == false && pathSatisfied && configured
+    }
+
+    private func startPathMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                self?.networkPathChanged(isSatisfied: satisfied)
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "RemoteDaVinci.CompanionNetworkPath"))
+    }
+
+    private func networkPathChanged(isSatisfied: Bool) {
+        let shouldWake = Self.shouldWakeRelay(
+            previousPathSatisfied: lastNetworkPathSatisfied,
+            pathSatisfied: isSatisfied,
+            configured: state?.configured == true
+        )
+        lastNetworkPathSatisfied = isSatisfied
+        guard shouldWake, let api else { return }
+        Task { try? await api.wakeRelay() }
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -990,6 +1037,7 @@ final class CompanionModel: ObservableObject {
                     currentConnection: self.connection
                   )
             else { return }
+            clearPairingInvite()
             pairingInvite = reply.invite
             pairingQRCode = image
             feedback = "Scan this code with Remote DaVinci on iPhone or iPad."
@@ -1044,6 +1092,21 @@ final class CompanionModel: ObservableObject {
         return pairID
     }
 
+    @discardableResult
+    func copyPairingInvite(
+        _ invite: PairingInvite,
+        to pasteboard: NSPasteboard = .general
+    ) throws -> Bool {
+        let payload = try invite.qrPayload()
+        copiedPairingInvite?.clearIfUnchanged()
+        copiedPairingInvite = CopiedPairingInvite.copy(
+            pairID: invite.pairID,
+            payload: payload,
+            to: pasteboard
+        )
+        return copiedPairingInvite != nil
+    }
+
     func copyEnrollmentResponse() {
         let response = manualEnrollmentResponse
         guard !response.isEmpty else { return }
@@ -1087,6 +1150,8 @@ final class CompanionModel: ObservableObject {
     }
 
     private func clearPairingInvite() {
+        copiedPairingInvite?.clearIfUnchanged()
+        copiedPairingInvite = nil
         pairingInvite = nil
         pairingQRCode = nil
     }

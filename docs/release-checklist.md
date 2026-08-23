@@ -19,6 +19,7 @@ evidence.
   go test -race -count=1 ./...
   make companion-app-check
   make controller-check
+  make controller-ios-tests
   make controller-ios-build
   make companion-release-check
   go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...

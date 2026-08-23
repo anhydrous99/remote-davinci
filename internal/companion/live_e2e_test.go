@@ -267,6 +267,95 @@ func TestLiveRelayLifecycle(t *testing.T) {
 	}
 }
 
+func TestLivePairActivationLimiter(t *testing.T) {
+	if os.Getenv("REMOTE_DAVINCI_E2E") != "1" {
+		t.Skip("set REMOTE_DAVINCI_E2E=1 to run the destructive, self-cleaning live relay canary")
+	}
+	if os.Getenv("REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT") == "" {
+		t.Skip("set REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT=1 after deploying a fresh disposable stack with that limit")
+	}
+	if os.Getenv("REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT") != "1" ||
+		os.Getenv("REMOTE_DAVINCI_E2E_DISPOSABLE") != "1" ||
+		os.Getenv("REMOTE_DAVINCI_E2E_ALLOW_PRODUCTION") != "" {
+		t.Fatal("activation limiter canary requires a disposable stack configured with a per-source limit of exactly 1")
+	}
+	relay := os.Getenv("REMOTE_DAVINCI_RELAY_URL")
+	if relay == "" {
+		t.Fatal("REMOTE_DAVINCI_RELAY_URL is required")
+	}
+	if err := liveCanaryTargetError(relay, "1", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	newEnrollment := func(label string) (EnrollmentRequest, string, error) {
+		endpointID, err := randomUUID()
+		if err != nil {
+			return EnrollmentRequest{}, "", err
+		}
+		secret, err := random32()
+		if err != nil {
+			return EnrollmentRequest{}, "", err
+		}
+		key, err := noise.DH25519.GenerateKeypair(rand.Reader)
+		if err != nil {
+			return EnrollmentRequest{}, "", err
+		}
+		digest := sha256.Sum256(secret)
+		return EnrollmentRequest{
+			V: 1, ControllerEndpointID: endpointID,
+			ControllerCredentialHash: base64.RawURLEncoding.EncodeToString(digest[:]),
+			ControllerNoiseKey:       base64.RawURLEncoding.EncodeToString(key.Public),
+			DeviceLabel:              label,
+		}, bearerAuthorization(endpointID, base64.RawURLEncoding.EncodeToString(secret)), nil
+	}
+	cleanup := func(config Config, controllerAuth string) {
+		if config.V != 1 {
+			return
+		}
+		companionAuth := bearerAuthorization(config.EndpointID, config.Secret)
+		t.Cleanup(func() {
+			cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			if err := revokeLiveIdentities(cleanupContext, relay, config.LinkID, controllerAuth, companionAuth); err != nil {
+				t.Errorf("activation limiter canary cleanup: %v", err)
+			}
+		})
+	}
+
+	acceptedRequest, acceptedControllerAuth, err := newEnrollment("Accepted activation canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, _, err := Provision(ctx, relay, acceptedRequest)
+	cleanup(accepted, acceptedControllerAuth)
+	if err != nil {
+		t.Fatalf("first pair activation: %v", err)
+	}
+
+	rejectedRequest, rejectedControllerAuth, err := newEnrollment("Rejected activation canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected, _, err := Provision(ctx, relay, rejectedRequest)
+	// Provision returns the generated identity after the final commit is sent, so
+	// clean it up even when a lost response makes activation uncertain.
+	cleanup(rejected, rejectedControllerAuth)
+	var failure *relayResponseError
+	if !errors.As(err, &failure) || failure.code != protocol.RateLimited ||
+		failure.retryable == nil || *failure.retryable || failure.retryAfter == nil ||
+		*failure.retryAfter < 1 || *failure.retryAfter > 3_600_000 {
+		t.Fatalf("second pair activation error = %#v, want stable nonretryable %s", failure, protocol.RateLimited)
+	}
+	if err := requireUnauthorized(ctx, relay, rejectedControllerAuth); err != nil {
+		t.Fatalf("rate-limited controller endpoint was activated: %v", err)
+	}
+	if err := requireUnauthorized(ctx, relay, bearerAuthorization(rejected.EndpointID, rejected.Secret)); err != nil {
+		t.Fatalf("rate-limited companion endpoint was activated: %v", err)
+	}
+}
+
 type liveRelayError struct {
 	operation string
 	code      protocol.ErrorCode

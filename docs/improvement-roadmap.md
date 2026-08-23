@@ -38,8 +38,8 @@ media transfer, or arbitrary scripting.
 
 - Preserved connection intent across background suspension and opens a fresh
   Noise session on foreground. Explicit Disconnect remains disconnected.
-- Added a native network-path wake-up that only short-circuits an existing
-  reconnect delay on an unsatisfied-to-satisfied transition.
+- Added native controller and Mac network-path wake-ups that only short-circuit
+  an existing reconnect delay on an unsatisfied-to-satisfied transition.
 - Added a ten-second watchdog around the five-minute native WebSocket ping and
   routes failure through the normal fresh-session reconnect path.
 - Resets controller and companion retry backoff only after a continuous
@@ -62,19 +62,32 @@ media transfer, or arbitrary scripting.
 - Converts native helper operation logs into bounded JSON, then reconstructs
   only allowlisted operation, outcome, and duration fields in macOS unified
   logging. Raw helper stderr is discarded.
+- Clears an unchanged copied one-time pairing invitation on replacement,
+  approval, rejection, cancellation, expiry, helper loss, or app termination
+  without overwriting newer customer clipboard content.
+- Adds a fresh-stack, disposable live canary and exact metric/log/state checks
+  for the atomic pair-activation limiter. The canary remains a live release
+  gate until an operator runs it against AWS.
 - Retains the login-Keychain implementation for the embedded Go helper. Moving
   a bare helper to the Data Protection Keychain is blocked until it has
   app-like packaging and authorized access-group entitlements.
 
-### Performance and latency evidence
+### Performance and latency evidence tooling
 
 - Added API Gateway integration latency to metadata-only access logs.
 - Expanded the gated disposable live canary to sample 1 through 100 sequential
   encrypted control round trips (20 by default) and report nearest-rank p50,
   p95, and p99.
-- Added a dated performance-results template for workload, percentiles,
-  capacity signals, Lambda memory sweep, cost, and the final tuning decision.
-- Added unsigned Release and real iOS-SDK builds to local and CI checks.
+- Added a disposable-only, shardable opaque-relay load probe and a local duration
+  summarizer. The probe retains the existing pairing limits and is not the
+  separate 200,000-socket fleet required for the full capacity gate.
+- Made the 128/256/512 MiB Lambda sweep configurable and added an explicit
+  dev-only route-capacity mode for the isolated smoke workload.
+- Added an executable blank performance-results workflow for workload,
+  percentiles, capacity signals, the 128/256/512 MiB Lambda sweep, cost, and the
+  final tuning decision. It contains no live result until a dated run fills it.
+- Added iPhone and iPad simulator tests, unsigned Release builds, and real
+  iOS-SDK builds to local and CI checks.
 
 ## Acceptance targets
 
@@ -103,10 +116,12 @@ These are candidate gates, not claims about the current deployment.
 3. Against a disposable AWS stack and supported Resolve Studio installation,
    run every phase in [`e2e-test-plan.md`](e2e-test-plan.md), including
    revocation, half-open connection, rotation, and secret-free log inspection.
-4. Run the staged workload and Lambda memory sweep in
-   [`performance-results-template.md`](performance-results-template.md). Change
-   route limits, Lambda memory, region strategy, or the Resolve worker model
-   only when a measured segment misses its gate.
+4. Run the smoke workload and Lambda memory sweep in
+   [`performance-results-template.md`](performance-results-template.md), then
+   validate the 1,000 sustained and 2,000 peak round-trip targets with reviewed
+   open-loop distributed load hosts. Change route limits, Lambda memory, region
+   strategy, or the Resolve worker model only when measured evidence misses its
+   gate.
 5. Start an internal beta, review activation limiter false positives and support
    failures, then expand gradually with the previous signed artifact and relay
    commit retained for rollback.

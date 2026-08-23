@@ -69,11 +69,14 @@ make check
 go test -race -count=1 ./...
 make companion-app-check
 make controller-check
+make controller-ios-tests
+make controller-ios-build
+make companion-release-check
 ```
 
-Also run the controller test target with warnings as errors on one iPhone and
-one iPad simulator. Inspect each `.xcresult` summary and require zero failures,
-skips, or expected failures.
+`controller-ios-tests` selects one available iPhone and one iPad simulator and
+runs the controller tests with warnings as errors. Inspect each `.xcresult`
+summary and require zero failures, skips, or expected failures.
 
 Coverage required:
 
@@ -186,6 +189,121 @@ The canary must prove:
 
 Pass: all assertions succeed, cleanup succeeds, and no secret appears in test,
 Lambda, API, or terminal output.
+
+Run the activation-limiter canary separately on a fresh `RemoteDavinci-dev`
+stack, before any other pair activation. Destroy an older disposable stack per
+Phase 9 first; an existing hourly source bucket or link makes the exact counts
+below invalid. Deploy the fresh stack with the test-only limit of one:
+
+```sh
+AWS_REGION='us-east-1'
+npm --prefix infra/cdk run build
+./infra/cdk/node_modules/.bin/cdk deploy RemoteDavinci-dev \
+  --app 'node infra/cdk/dist/bin/remote-davinci.js' \
+  -c environment=dev \
+  -c region="$AWS_REGION" \
+  -c pairActivationsPerSourceHour=1
+
+RELAY_URL="$(aws cloudformation describe-stacks \
+  --region "$AWS_REGION" \
+  --stack-name RemoteDavinci-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='WebSocketUrl'].OutputValue | [0]" \
+  --output text)"
+CANARY_START_UTC="$(date -u +%Y-%m-%dT%H:%M:00Z)"
+CANARY_START_MS="$(( $(date -u +%s) * 1000 ))"
+REMOTE_DAVINCI_E2E=1 \
+REMOTE_DAVINCI_E2E_DISPOSABLE=1 \
+REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT=1 \
+REMOTE_DAVINCI_RELAY_URL="$RELAY_URL" \
+go test -v -count=1 -run '^TestLivePairActivationLimiter$' ./internal/companion
+CANARY_END_UTC="$(date -u +%Y-%m-%dT%H:%M:59Z)"
+CANARY_END_MS="$(( $(date -u +%s) * 1000 ))"
+```
+
+The first activation must succeed. The second must return `RATE_LIMITED`, an
+explicit non-retryable flag, and a positive `retryAfterMs` no greater than one
+hour. Both rejected bearer credentials must then fail upgrade with HTTP 401.
+Because the link and both endpoint writes share the limiter transaction, those
+two failures plus the fresh-stack counts below prove that the rejection did not
+create another activated link.
+
+Resolve the test resources without copying record contents:
+
+```sh
+RELAY_LOG_GROUP="$(aws cloudformation list-stack-resources \
+  --region "$AWS_REGION" \
+  --stack-name RemoteDavinci-dev \
+  --query "StackResourceSummaries[?ResourceType=='AWS::Logs::LogGroup' && contains(LogicalResourceId, 'RelayLogs')].PhysicalResourceId | [0]" \
+  --output text)"
+STATE_TABLE="$(aws cloudformation list-stack-resources \
+  --region "$AWS_REGION" \
+  --stack-name RemoteDavinci-dev \
+  --query "StackResourceSummaries[?ResourceType=='AWS::DynamoDB::Table'].PhysicalResourceId | [0]" \
+  --output text)"
+```
+
+After the metric filter has caught up, run these checks with the captured UTC
+window. Poll the same commands rather than widening the window to unrelated
+traffic:
+
+```sh
+aws cloudwatch get-metric-statistics \
+  --region "$AWS_REGION" \
+  --namespace RemoteDavinci/dev \
+  --metric-name PairActivations \
+  --statistics Sum \
+  --period 60 \
+  --start-time "$CANARY_START_UTC" \
+  --end-time "$CANARY_END_UTC" \
+  --query 'sum(Datapoints[].Sum)' \
+  --output text
+
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --filter-pattern '{ $.action = "pair.activate" }' \
+  --query 'length(events)' \
+  --output text
+
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --filter-pattern '{ $.msg = "message-rejected" && $.error = "RATE_LIMITED" }' \
+  --query 'length(events)' \
+  --output text
+
+aws dynamodb scan \
+  --region "$AWS_REGION" \
+  --table-name "$STATE_TABLE" \
+  --consistent-read \
+  --select COUNT \
+  --filter-expression '#kind = :kind' \
+  --expression-attribute-names '{"#kind":"kind"}' \
+  --expression-attribute-values '{":kind":{"S":"link"}}' \
+  --query Count \
+  --output text
+
+aws dynamodb scan \
+  --region "$AWS_REGION" \
+  --table-name "$STATE_TABLE" \
+  --consistent-read \
+  --select COUNT \
+  --filter-expression '#kind = :kind' \
+  --expression-attribute-names '{"#kind":"kind"}' \
+  --expression-attribute-values '{":kind":{"S":"endpoint"}}' \
+  --query Count \
+  --output text
+```
+
+The five outputs must be `1`, `1`, `1`, `1`, and `2`, respectively: one
+successful activation metric, one metadata-only activation event, one stable
+rate-limit rejection, one accepted link, and its two endpoints. The canary
+revokes that accepted link and both endpoints during cleanup, so the retained
+records are tombstones rather than usable credentials.
 
 ## Phase 5: native companion and loopback boundary
 
@@ -359,6 +477,32 @@ Before teardown, inspect the disposable stack:
 - Sanitized logs for validation codes; search explicitly for bearer prefixes,
   enrollment/invitation field names, join tokens, PSKs, Noise material, and full
   payloads.
+
+For the activation-limiter window, the preceding `PairActivations` and live-log
+counts are required evidence. Also require this metadata-field search to return
+zero. Manually inspect the activation, rate-limit rejection, and cleanup
+lifecycle messages plus the two expected unauthorized-upgrade rejections in
+the same exact window. Confirm that every relay application event contains
+routing metadata only, never a request body or ciphertext:
+
+```sh
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --filter-pattern '?sourceKey ?credentialHash ?joinToken ?joinTokenHash ?psk ?noiseKey ?noisePublicKey ?noisePrivateKey ?"rd1." ?Authorization ?payload ?body' \
+  --query 'length(events)' \
+  --output text
+
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --query 'events[].message' \
+  --output text
+```
 
 Then:
 
