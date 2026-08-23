@@ -470,12 +470,16 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 			Self: PairEndpointCommit{EndpointID: body.Self.EndpointID, Role: body.Self.Role, CredentialHash: body.Self.CredentialHash},
 			Peer: PairIdentity{EndpointID: body.Peer.EndpointID, Role: body.Peer.Role},
 		}
-		result, err := h.store.CommitPair(ctx, body.PairID, commit, timestamp)
+		result, err := h.store.CommitPair(ctx, body.PairID, commit, connection.SourceKey, timestamp)
 		if err != nil {
 			return nil, err
 		}
 		if result.Link == nil {
 			return map[string]any{"pending": true}, nil
+		}
+		if result.ActivatedNow {
+			h.logger.InfoContext(ctx, "security-lifecycle", "action", "pair.activate", "pairId", result.Pair.PairID,
+				"linkId", result.Link.LinkID)
 		}
 		for _, value := range []*PairCommit{result.Pair.CommitA, result.Pair.CommitB} {
 			if value == nil {
@@ -554,6 +558,8 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err != nil {
 			return nil, err
 		}
+		h.logger.InfoContext(ctx, "security-lifecycle", "action", "link.revoke", "linkId", revoked.Link.LinkID,
+			"endpointId", connection.EndpointID)
 		if err := h.notifyClosedSession(ctx, revoked.Session, "revoked", event, ""); err != nil {
 			return nil, err
 		}
@@ -576,6 +582,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err := h.store.RotateEndpoint(ctx, connection.EndpointID, connection.ConnectionID, body.CredentialHash, timestamp); err != nil {
 			return nil, err
 		}
+		h.logger.InfoContext(ctx, "security-lifecycle", "action", "endpoint.rotate", "endpointId", connection.EndpointID)
 		return map[string]any{"rotated": true}, nil
 	case "endpoint.revoke":
 		if connection.EndpointID == "" {
@@ -585,6 +592,7 @@ func (h *Handler) dispatch(ctx context.Context, message protocol.ClientEnvelope,
 		if err != nil {
 			return nil, err
 		}
+		h.logger.InfoContext(ctx, "security-lifecycle", "action", "endpoint.revoke", "endpointId", connection.EndpointID)
 		if err := h.notifyClosedSession(ctx, revoked.Session, "revoked", event, ""); err != nil {
 			return nil, err
 		}

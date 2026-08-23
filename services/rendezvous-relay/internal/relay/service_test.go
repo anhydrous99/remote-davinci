@@ -28,7 +28,7 @@ type fakeStore struct {
 	createPair     func(context.Context, Pair) error
 	pairByID       func(context.Context, string, int64) (Pair, error)
 	joinPair       func(context.Context, string, string, PairSide, int64) (Pair, error)
-	commitPair     func(context.Context, string, PairCommit, int64) (CommitPairResult, error)
+	commitPair     func(context.Context, string, PairCommit, string, int64) (CommitPairResult, error)
 	cancelPair     func(context.Context, string, string, int64) (*Pair, error)
 	link           func(context.Context, string) (*Link, error)
 	revokeLink     func(context.Context, string, string, string, int64) (RevokeLinkResult, error)
@@ -95,11 +95,11 @@ func (f *fakeStore) JoinPair(ctx context.Context, locator, joinTokenHash string,
 	return f.joinPair(ctx, locator, joinTokenHash, side, now)
 }
 
-func (f *fakeStore) CommitPair(ctx context.Context, id string, commit PairCommit, now int64) (CommitPairResult, error) {
+func (f *fakeStore) CommitPair(ctx context.Context, id string, commit PairCommit, sourceKey string, now int64) (CommitPairResult, error) {
 	if f.commitPair == nil {
 		return CommitPairResult{}, unexpected
 	}
-	return f.commitPair(ctx, id, commit, now)
+	return f.commitPair(ctx, id, commit, sourceKey, now)
 }
 
 func (f *fakeStore) CancelPair(ctx context.Context, pairID, connectionID string, now int64) (*Pair, error) {
@@ -278,6 +278,27 @@ func TestConnectAuthenticatesBearerAndStoresOnlySourceHash(t *testing.T) {
 	response, err = handler.Handle(context.Background(), event)
 	if err != nil || response.StatusCode != 401 || connectCalls != 1 {
 		t.Fatalf("bad credential response = %#v, calls = %d, error = %v", response, connectCalls, err)
+	}
+}
+
+func TestConnectRejectsRevokedEndpointWithoutCredentialHash(t *testing.T) {
+	endpointID := uuid(10)
+	connectCalls := 0
+	store := &fakeStore{
+		getEndpoint: func(context.Context, string) (*Endpoint, error) {
+			return &Endpoint{EndpointID: endpointID, RevokedAt: 100}, nil
+		},
+		connect: func(context.Context, Connection, string) (*CloseSessionResult, error) {
+			connectCalls++
+			return nil, nil
+		},
+	}
+	handler := testHandler(store, func(context.Context, string, Message, WebSocketEvent) error { return nil })
+	event := socketEvent("revoked", "$connect", "")
+	event.Headers["Authorization"] = "Bearer rd1." + endpointID + "." + base64.RawURLEncoding.EncodeToString(bytesOf(32, 7))
+	response, err := handler.Handle(context.Background(), event)
+	if err != nil || response.StatusCode != 401 || connectCalls != 0 {
+		t.Fatalf("response = %#v, connect calls = %d, error = %v", response, connectCalls, err)
 	}
 }
 
@@ -520,6 +541,55 @@ func TestGonePeerDuringPairCancelDoesNotNotifyCancellerClosed(t *testing.T) {
 	}
 	if want := "[joiner:pair.closed]"; fmt.Sprint(posts) != want {
 		t.Fatalf("posts = %v, want %s", posts, want)
+	}
+}
+
+func TestPairActivationLimitsAndAuditsOnce(t *testing.T) {
+	pairID, linkID := uuid(25), uuid(26)
+	controllerID, companionID := uuid(27), uuid(28)
+	credentialHash := base64.RawURLEncoding.EncodeToString(bytesOf(32, 9))
+	sourceKey := SourceKey("203.0.113.42")
+	activation := true
+	store := &fakeStore{commitPair: func(_ context.Context, gotPairID string, commit PairCommit, gotSourceKey string, _ int64) (CommitPairResult, error) {
+		if gotPairID != pairID || gotSourceKey != sourceKey || commit.ConnectionID != "creator" ||
+			commit.Self.CredentialHash != credentialHash {
+			t.Fatalf("pair/source/commit = %s/%s/%#v", gotPairID, gotSourceKey, commit)
+		}
+		result := CommitPairResult{
+			Pair:         Pair{PairID: pairID, Status: "ACTIVE"},
+			Link:         &Link{LinkID: linkID, ControllerID: controllerID, CompanionID: companionID, Status: "ACTIVE"},
+			ActivatedNow: activation,
+		}
+		activation = false
+		return result, nil
+	}}
+	var output bytes.Buffer
+	handler := testHandlerWithLogger(store, func(context.Context, string, Message, WebSocketEvent) error { return nil },
+		slog.New(slog.NewJSONHandler(&output, nil)))
+	message, err := protocol.ParseClient(envelope("pair.commit", map[string]any{
+		"pairId": pairID, "sideId": uuid(29), "linkId": linkID,
+		"self": map[string]any{"endpointId": controllerID, "role": "controller", "credentialHash": credentialHash},
+		"peer": map[string]any{"endpointId": companionID, "role": "companion"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := Connection{ConnectionID: "creator", AuthMode: "pairing", SourceKey: sourceKey, ExpiresAt: 1_000}
+	for range 2 {
+		result, err := handler.dispatch(context.Background(), message, connection, socketEvent("creator", "$default", ""))
+		if err != nil || result["active"] != true || result["linkId"] != linkID {
+			t.Fatalf("result = %#v, error = %v", result, err)
+		}
+	}
+	logged := output.String()
+	if strings.Count(logged, `"action":"pair.activate"`) != 1 ||
+		!strings.Contains(logged, pairID) || !strings.Contains(logged, linkID) {
+		t.Fatalf("activation audit = %s", logged)
+	}
+	for _, forbidden := range []string{sourceKey, credentialHash} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("sensitive value logged: %q in %s", forbidden, logged)
+		}
 	}
 }
 
@@ -1036,7 +1106,9 @@ func TestLifecycleMutatorsReceiveCurrentConnectionFence(t *testing.T) {
 			return nil, nil
 		},
 	}
-	handler := testHandler(store, func(context.Context, string, Message, WebSocketEvent) error { return nil })
+	var output bytes.Buffer
+	handler := testHandlerWithLogger(store, func(context.Context, string, Message, WebSocketEvent) error { return nil },
+		slog.New(slog.NewJSONHandler(&output, nil)))
 	connection := Connection{ConnectionID: "controller", AuthMode: "endpoint", EndpointID: endpointID, ExpiresAt: 1_000}
 	for _, test := range []struct {
 		messageType string
@@ -1057,6 +1129,15 @@ func TestLifecycleMutatorsReceiveCurrentConnectionFence(t *testing.T) {
 	}
 	if calls != 4 {
 		t.Fatalf("calls = %d", calls)
+	}
+	logged := output.String()
+	for _, action := range []string{"link.revoke", "endpoint.rotate", "endpoint.revoke"} {
+		if strings.Count(logged, `"action":"`+action+`"`) != 1 {
+			t.Fatalf("missing lifecycle audit %s in %s", action, logged)
+		}
+	}
+	if strings.Contains(logged, base64.RawURLEncoding.EncodeToString(bytesOf(32, 1))) {
+		t.Fatalf("credential hash logged: %s", logged)
 	}
 }
 

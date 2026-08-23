@@ -25,7 +25,7 @@ struct PairingScannerSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 20) {
-                    Text("Scan the QR code shown by the Remote DaVinci companion on your Mac.")
+                    Text("Scan the Mac QR code, or paste the copied pairing code below.")
                         .multilineTextAlignment(.center)
 
                     cameraContent

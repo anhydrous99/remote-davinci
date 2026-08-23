@@ -47,7 +47,14 @@ func run(address, configPath, relay string, openBrowser, allowInsecureFileConfig
 }
 
 func runNative(configPath, relay string) error {
+	previousLogger := slog.Default()
+	slog.SetDefault(newNativeLogger(os.Stderr))
+	defer slog.SetDefault(previousLogger)
 	return runServer("127.0.0.1:0", configPath, relay, false, os.Stdin, os.Stdout, companion.NewNativeApp)
+}
+
+func newNativeLogger(output io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(output, nil))
 }
 
 type appFactory func(context.Context, string, string) (*companion.App, error)

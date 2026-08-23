@@ -7,6 +7,7 @@ export interface DeploymentConfig {
   readonly account?: string;
   readonly accessLogs?: boolean;
   readonly alarmTopicArn?: string;
+  readonly pairActivationsPerSourceHour?: number;
   readonly region: string;
 }
 
@@ -39,6 +40,24 @@ function requiredStringContext(app: App, name: string): string {
   return value;
 }
 
+function positiveIntegerContext(app: App, name: string): number | undefined {
+  const raw: unknown = app.node.tryGetContext(name);
+  if (raw === undefined) return undefined;
+  const value =
+    typeof raw === 'string' && /^[1-9][0-9]*$/.test(raw)
+      ? Number(raw)
+      : raw;
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > 10_000
+  ) {
+    throw new Error(`CDK context ${name} must be an integer from 1 through 10000`);
+  }
+  return value;
+}
+
 export function deploymentConfig(
   app: App,
   processEnvironment: NodeJS.ProcessEnv = process.env,
@@ -50,6 +69,10 @@ export function deploymentConfig(
 
   const accessLogs = booleanContext(app, 'accessLogs');
   const alarmTopicArn = stringContext(app, 'alarmTopicArn');
+  const pairActivationsPerSourceHour = positiveIntegerContext(
+    app,
+    'pairActivationsPerSourceHour',
+  );
   if (environment === 'prod') {
     const account = requiredStringContext(app, 'productionAccount');
     const region = requiredStringContext(app, 'productionRegion');
@@ -68,6 +91,9 @@ export function deploymentConfig(
       account,
       alarmTopicArn: productionAlarmTopicArn,
       environment,
+      ...(pairActivationsPerSourceHour === undefined
+        ? {}
+        : { pairActivationsPerSourceHour }),
       region,
     };
   }
@@ -80,6 +106,9 @@ export function deploymentConfig(
     ...(accessLogs === undefined ? {} : { accessLogs }),
     ...(alarmTopicArn === undefined ? {} : { alarmTopicArn }),
     environment,
+    ...(pairActivationsPerSourceHour === undefined
+      ? {}
+      : { pairActivationsPerSourceHour }),
     region,
   };
 }
@@ -92,6 +121,12 @@ export function main(): void {
     ...(config.alarmTopicArn === undefined
       ? {}
       : { alarmTopicArn: config.alarmTopicArn }),
+    ...(config.pairActivationsPerSourceHour === undefined
+      ? {}
+      : {
+          pairActivationsPerSourceHour:
+            config.pairActivationsPerSourceHour,
+        }),
     environment: config.environment,
     env: config.account
       ? { account: config.account, region: config.region }

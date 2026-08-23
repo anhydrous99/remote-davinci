@@ -100,9 +100,10 @@ The relay's `expiresAt` remains the authoritative five-minute deadline. Invite p
 
 ## Enrollment boundary
 
-The QR profile is the normal live onboarding path. The existing two-document
-manual bootstrap remains an advanced fallback while physical-device validation
-is pending. The PAKE/manual-code profile below is still deferred.
+The customer apps expose only QR scanning and pasted invites for live onboarding.
+The existing two-document manual bootstrap remains legacy wire compatibility for
+previously created enrollments and protocol testing; it is not a customer-facing
+path. The PAKE/manual-code profile below is still deferred.
 
 The QR controller requests from the current eight fixed operations
 (`resolve.page.media`, `resolve.page.cut`, `resolve.page.edit`,

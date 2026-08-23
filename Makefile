@@ -1,4 +1,4 @@
-.PHONY: bootstrap check companion companion-app companion-app-check controller-check
+.PHONY: bootstrap check companion companion-app companion-app-check controller-check controller-ios-build companion-release-check
 
 bootstrap:
 	go mod download
@@ -23,3 +23,9 @@ companion-app-check:
 
 controller-check:
 	cd apps/controller/RemoteDavinciController.swiftpm && xcodebuild -quiet -scheme 'Remote DaVinci' -destination 'platform=macOS,variant=Mac Catalyst' -derivedDataPath .derivedData CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
+
+controller-ios-build:
+	cd apps/controller/RemoteDavinciController.swiftpm && xcodebuild -quiet -scheme 'Remote DaVinci' -configuration Release -destination 'generic/platform=iOS Simulator' -derivedDataPath .derivedData/ios-build CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES build
+
+companion-release-check:
+	xcodebuild -quiet -project apps/companion/RemoteDavinciCompanion.xcodeproj -scheme RemoteDavinciCompanion -configuration Release -destination 'platform=macOS,arch=arm64' -derivedDataPath .derivedData/companion-release CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES build

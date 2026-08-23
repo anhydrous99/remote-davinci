@@ -23,6 +23,7 @@ export interface RendezvousRelayStackProps extends StackProps {
   readonly environment: 'dev' | 'prod';
   readonly accessLogs?: boolean;
   readonly alarmTopicArn?: string;
+  readonly pairActivationsPerSourceHour?: number;
 }
 
 export class RendezvousRelayStack extends Stack {
@@ -31,6 +32,17 @@ export class RendezvousRelayStack extends Stack {
 
     const production = props.environment === 'prod';
     const accessLogging = props.accessLogs ?? true;
+    const pairActivationsPerSourceHour =
+      props.pairActivationsPerSourceHour ?? 10;
+    if (
+      !Number.isSafeInteger(pairActivationsPerSourceHour) ||
+      pairActivationsPerSourceHour < 1 ||
+      pairActivationsPerSourceHour > 10_000
+    ) {
+      throw new Error(
+        'pairActivationsPerSourceHour must be an integer from 1 through 10000',
+      );
+    }
     const relayRejectionsNamespace = `RemoteDavinci/${props.environment}`;
     const removalPolicy = production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
     const alarmTopicArn = props.alarmTopicArn;
@@ -101,12 +113,17 @@ export class RendezvousRelayStack extends Stack {
 
     const lambdaDefaults = {
       architecture: lambda.Architecture.ARM_64,
-      environment: { TABLE_NAME: table.tableName },
+      environment: {
+        PAIR_ACTIVATIONS_PER_SOURCE_PER_HOUR: String(
+          pairActivationsPerSourceHour,
+        ),
+        TABLE_NAME: table.tableName,
+      },
       loggingFormat: lambda.LoggingFormat.JSON,
       memorySize: 256,
       ...(production
         ? {
-            applicationLogLevelV2: lambda.ApplicationLogLevel.WARN,
+            applicationLogLevelV2: lambda.ApplicationLogLevel.INFO,
             systemLogLevelV2: lambda.SystemLogLevel.WARN,
           }
         : {}),
@@ -142,6 +159,18 @@ export class RendezvousRelayStack extends Stack {
       ),
       logGroup: relayLogs,
       metricName: 'RelayRejections',
+      metricNamespace: relayRejectionsNamespace,
+      metricValue: '1',
+    });
+    new logs.MetricFilter(this, 'PairActivationsMetric', {
+      defaultValue: 0,
+      filterPattern: logs.FilterPattern.stringValue(
+        '$.action',
+        '=',
+        'pair.activate',
+      ),
+      logGroup: relayLogs,
+      metricName: 'PairActivations',
       metricNamespace: relayRejectionsNamespace,
       metricValue: '1',
     });
@@ -209,6 +238,7 @@ export class RendezvousRelayStack extends Stack {
         destinationArn: accessLogs.logGroupArn,
         format: JSON.stringify({
           error: '$context.error.message',
+          integrationLatency: '$context.integrationLatency',
           requestId: '$context.requestId',
           routeKey: '$context.routeKey',
           status: '$context.status',

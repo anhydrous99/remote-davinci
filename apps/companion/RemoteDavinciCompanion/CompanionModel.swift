@@ -3,6 +3,7 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Darwin
 import Foundation
+import OSLog
 import ServiceManagement
 
 struct CompanionConnection: Equatable, Sendable {
@@ -26,6 +27,83 @@ enum ReadinessResult: Equatable {
     case ready(CompanionConnection)
     case startupFailure(String)
 }
+
+struct HelperOperationDiagnostic: Equatable, Sendable {
+    let operation: String
+    let outcome: String
+    let durationNanoseconds: Int64
+}
+
+enum HelperOperationDiagnostics {
+    static let maximumLineBytes = 4 * 1024
+    static let maximumDurationNanoseconds: Int64 = 10_000_000_000
+
+    private static let operations: Set<String> = [
+        "resolve.page.media", "resolve.page.cut", "resolve.page.edit", "resolve.page.fusion",
+        "resolve.page.color", "resolve.page.fairlight", "resolve.page.deliver",
+        "host.volume.toggle-mute",
+    ]
+    private static let outcomes: Set<String> = [
+        "ok", "operation.failed", "operation.unsupported", "resolve.unavailable",
+        "host.control-failed", "host.mute-unsupported",
+    ]
+
+    private struct Record: Decodable {
+        let msg: String
+        let operation: String
+        let outcome: String
+        let duration: Int64
+    }
+
+    static func parse(_ line: Data) -> HelperOperationDiagnostic? {
+        guard !line.isEmpty,
+              line.count <= maximumLineBytes,
+              let record = try? JSONDecoder().decode(Record.self, from: line),
+              record.msg == "control operation completed",
+              operations.contains(record.operation),
+              outcomes.contains(record.outcome),
+              (0...maximumDurationNanoseconds).contains(record.duration)
+        else { return nil }
+        return HelperOperationDiagnostic(
+            operation: record.operation,
+            outcome: record.outcome,
+            durationNanoseconds: record.duration
+        )
+    }
+}
+
+struct HelperStderrBuffer {
+    private var pending = Data()
+    private var droppingOversizedLine = false
+
+    var bufferedByteCount: Int { pending.count }
+
+    mutating func consume(_ data: Data) -> [HelperOperationDiagnostic] {
+        var diagnostics: [HelperOperationDiagnostic] = []
+        for byte in data {
+            if byte == 0x0A {
+                if !droppingOversizedLine, let diagnostic = HelperOperationDiagnostics.parse(pending) {
+                    diagnostics.append(diagnostic)
+                }
+                pending.removeAll(keepingCapacity: true)
+                droppingOversizedLine = false
+            } else if !droppingOversizedLine {
+                if pending.count < HelperOperationDiagnostics.maximumLineBytes {
+                    pending.append(byte)
+                } else {
+                    pending.removeAll(keepingCapacity: false)
+                    droppingOversizedLine = true
+                }
+            }
+        }
+        return diagnostics
+    }
+}
+
+private let helperOperationLogger = Logger(
+    subsystem: "dev.remote-davinci.companion",
+    category: "HelperOperations"
+)
 
 enum CompanionFailure: LocalizedError {
     case invalidReadiness
@@ -541,7 +619,9 @@ final class CompanionHost {
     private var process: Process?
     private var inputPipe: Pipe?
     private var outputPipe: Pipe?
+    private var errorPipe: Pipe?
     private var readinessBuffer = Data()
+    private var diagnosticBuffer = HelperStderrBuffer()
     private var connection: CompanionConnection?
     private var status = "Server stopped"
     private var canRetry = false
@@ -614,11 +694,12 @@ final class CompanionHost {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
+        let errorOutput = Pipe()
         process.executableURL = executable
         process.arguments = arguments
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errorOutput
         process.terminationHandler = { [weak self, weak process] terminated in
             DispatchQueue.main.async {
                 guard let self, let process, process === terminated else { return }
@@ -636,11 +717,24 @@ final class CompanionHost {
                 self.consume(data, from: process)
             }
         }
+        errorOutput.fileHandleForReading.readabilityHandler = { [weak self, weak process] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            DispatchQueue.main.async {
+                guard let self, let process else { return }
+                self.consumeDiagnostics(data, from: process)
+            }
+        }
 
         self.process = process
         inputPipe = input
         outputPipe = output
+        errorPipe = errorOutput
         readinessBuffer.removeAll(keepingCapacity: true)
+        diagnosticBuffer = HelperStderrBuffer()
         connection = nil
         startupFailure = nil
         terminalStartupFailure = nil
@@ -653,9 +747,11 @@ final class CompanionHost {
             scheduleStartupTimeout(for: process)
         } catch {
             output.fileHandleForReading.readabilityHandler = nil
+            errorOutput.fileHandleForReading.readabilityHandler = nil
             self.process = nil
             inputPipe = nil
             outputPipe = nil
+            errorPipe = nil
             scheduleRestart(reason: "The server helper could not start.")
         }
     }
@@ -699,10 +795,20 @@ final class CompanionHost {
         if source.isRunning { source.terminate() }
     }
 
+    private func consumeDiagnostics(_ data: Data, from source: Process) {
+        guard process === source else { return }
+        for diagnostic in diagnosticBuffer.consume(data) {
+            helperOperationLogger.info(
+                "control operation completed operation=\(diagnostic.operation, privacy: .public) outcome=\(diagnostic.outcome, privacy: .public) duration_ns=\(diagnostic.durationNanoseconds, privacy: .public)"
+            )
+        }
+    }
+
     private func didExit(_ source: Process) {
         guard process === source else { return }
         let wasReady = connection != nil
         outputPipe?.fileHandleForReading.readabilityHandler = nil
+        errorPipe?.fileHandleForReading.readabilityHandler = nil
         stableWorkItem?.cancel()
         startupWorkItem?.cancel()
         stableWorkItem = nil
@@ -710,6 +816,8 @@ final class CompanionHost {
         process = nil
         inputPipe = nil
         outputPipe = nil
+        errorPipe = nil
+        diagnosticBuffer = HelperStderrBuffer()
         connection = nil
 
         if let message = terminalStartupFailure {

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -553,7 +554,23 @@ func ExecuteOperation(ctx context.Context, operation string) (map[string]any, er
 	})
 }
 
-func executeOperation(ctx context.Context, operation string, output commandOutput) (map[string]any, error) {
+func executeOperation(ctx context.Context, operation string, output commandOutput) (result map[string]any, err error) {
+	started := time.Now()
+	defer func() {
+		outcome := "ok"
+		var failure *operationError
+		if err != nil {
+			outcome = "operation.failed"
+			if errors.As(err, &failure) {
+				outcome = failure.code
+			}
+		}
+		slog.InfoContext(ctx, "control operation completed",
+			"operation", operation,
+			"outcome", outcome,
+			"duration", time.Since(started),
+		)
+	}()
 	commandContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if page, ok := resolvePageForOperation(operation); ok {
@@ -791,7 +808,9 @@ func (processor *controlProcessor) handle(ctx context.Context, plaintext []byte)
 		if !processor.allowed[body.Operation] {
 			return processor.response(envelope.ID, nil, &operationError{code: "operation.forbidden"})
 		}
-		result, executeErr := processor.execute(ctx, body.Operation)
+		requestContext, cancel := context.WithDeadline(ctx, time.UnixMilli(body.ExpiresAt))
+		defer cancel()
+		result, executeErr := processor.execute(requestContext, body.Operation)
 		return processor.response(envelope.ID, result, executeErr)
 	default:
 		return nil, false, errors.New("unexpected control message")

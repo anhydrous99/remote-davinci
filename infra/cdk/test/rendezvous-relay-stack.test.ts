@@ -14,6 +14,7 @@ const testAlarmTopicArn = `arn:aws:sns:${testRegion}:${testAccount}:remote-davin
 function template(
   environment: 'dev' | 'prod' = 'dev',
   accessLogs?: boolean,
+  pairActivationsPerSourceHour?: number,
 ): Template {
   const app = new App();
   return Template.fromStack(
@@ -21,6 +22,9 @@ function template(
       ...(accessLogs === undefined ? {} : { accessLogs }),
       ...(environment === 'prod' ? { alarmTopicArn: testAlarmTopicArn } : {}),
       environment,
+      ...(pairActivationsPerSourceHour === undefined
+        ? {}
+        : { pairActivationsPerSourceHour }),
       env: { account: testAccount, region: testRegion },
     }),
   );
@@ -39,7 +43,7 @@ describe('RendezvousRelayStack', () => {
     stack.resourceCountIs('AWS::ApiGatewayV2::Route', 5);
     stack.resourceCountIs('AWS::ApiGatewayV2::RouteResponse', 1);
     stack.resourceCountIs('AWS::CloudWatch::Alarm', 5);
-    stack.resourceCountIs('AWS::Logs::MetricFilter', 1);
+    stack.resourceCountIs('AWS::Logs::MetricFilter', 2);
     stack.resourceCountIs('AWS::SQS::Queue', 0);
     stack.resourceCountIs('AWS::EC2::VPC', 0);
     stack.resourceCountIs('AWS::Cognito::UserPool', 0);
@@ -148,14 +152,35 @@ describe('RendezvousRelayStack', () => {
     const metricFilters = Object.values(
       stack.findResources('AWS::Logs::MetricFilter'),
     );
-    assert.equal(metricFilters.length, 1);
-    assert.match(metricFilters[0]?.Properties.FilterPattern, /connect-rejected/);
-    assert.match(metricFilters[0]?.Properties.FilterPattern, /message-rejected/);
-    assert.match(metricFilters[0]?.Properties.FilterPattern, /RATE_LIMITED/);
-    assert.deepEqual(metricFilters[0]?.Properties.MetricTransformations, [
+    assert.equal(metricFilters.length, 2);
+    const rejectionFilter = metricFilters.find(
+      (filter) =>
+        filter.Properties.MetricTransformations[0]?.MetricName ===
+        'RelayRejections',
+    );
+    assert.ok(rejectionFilter);
+    assert.match(rejectionFilter.Properties.FilterPattern, /connect-rejected/);
+    assert.match(rejectionFilter.Properties.FilterPattern, /message-rejected/);
+    assert.match(rejectionFilter.Properties.FilterPattern, /RATE_LIMITED/);
+    assert.deepEqual(rejectionFilter.Properties.MetricTransformations, [
       {
         DefaultValue: 0,
         MetricName: 'RelayRejections',
+        MetricNamespace: 'RemoteDavinci/dev',
+        MetricValue: '1',
+      },
+    ]);
+    const activationFilter = metricFilters.find(
+      (filter) =>
+        filter.Properties.MetricTransformations[0]?.MetricName ===
+        'PairActivations',
+    );
+    assert.ok(activationFilter);
+    assert.match(activationFilter.Properties.FilterPattern, /pair\.activate/);
+    assert.deepEqual(activationFilter.Properties.MetricTransformations, [
+      {
+        DefaultValue: 0,
+        MetricName: 'PairActivations',
         MetricNamespace: 'RemoteDavinci/dev',
         MetricValue: '1',
       },
@@ -183,6 +208,11 @@ describe('RendezvousRelayStack', () => {
     assert.equal(functions[0]?.Properties.Handler, 'bootstrap');
     assert.equal(functions[0]?.Properties.Runtime, 'provided.al2023');
     assert.equal(functions[0]?.Properties.ReservedConcurrentExecutions, undefined);
+    assert.equal(
+      functions[0]?.Properties.Environment.Variables
+        .PAIR_ACTIVATIONS_PER_SOURCE_PER_HOUR,
+      '10',
+    );
     for (const log of Object.values(
       stack.findResources('AWS::Logs::LogGroup'),
     )) {
@@ -272,6 +302,16 @@ describe('RendezvousRelayStack', () => {
         },
       ],
     });
+    stack.hasResourceProperties('AWS::Logs::MetricFilter', {
+      MetricTransformations: [
+        {
+          DefaultValue: 0,
+          MetricName: 'PairActivations',
+          MetricNamespace: 'RemoteDavinci/prod',
+          MetricValue: '1',
+        },
+      ],
+    });
     stack.hasResource('AWS::DynamoDB::Table', {
       DeletionPolicy: 'Retain',
       UpdateReplacePolicy: 'Retain',
@@ -292,7 +332,7 @@ describe('RendezvousRelayStack', () => {
     });
     stack.hasResourceProperties('AWS::Lambda::Function', {
       LoggingConfig: {
-        ApplicationLogLevel: 'WARN',
+        ApplicationLogLevel: 'INFO',
         LogFormat: 'JSON',
         SystemLogLevel: 'WARN',
       },
@@ -342,6 +382,7 @@ describe('RendezvousRelayStack', () => {
     const accessLogSettings = stages[0]?.Properties.AccessLogSettings;
     assert.ok(accessLogSettings);
     const renderedAccessLogSettings = JSON.stringify(accessLogSettings);
+    assert.match(renderedAccessLogSettings, /integrationLatency/);
     assert.match(renderedAccessLogSettings, /requestId/);
     assert.match(renderedAccessLogSettings, /routeKey/);
     assert.doesNotMatch(renderedAccessLogSettings, /connectionId/);
@@ -397,6 +438,23 @@ describe('RendezvousRelayStack', () => {
     stack.hasResourceProperties('AWS::DynamoDB::Table', { Tags: tagMatch });
     stack.hasResourceProperties('AWS::Lambda::Function', { Tags: tagMatch });
   });
+
+  it('passes a validated source activation limit to the relay', () => {
+    const stack = template('dev', undefined, 100);
+    stack.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: {
+        Variables: Match.objectLike({
+          PAIR_ACTIVATIONS_PER_SOURCE_PER_HOUR: '100',
+        }),
+      },
+    });
+    for (const value of [0, 1.5, 10_001]) {
+      assert.throws(
+        () => template('dev', undefined, value),
+        /pairActivationsPerSourceHour must be an integer from 1 through 10000/,
+      );
+    }
+  });
 });
 
 describe('deploymentConfig', () => {
@@ -446,5 +504,29 @@ describe('deploymentConfig', () => {
       environment: 'dev',
       region: 'us-east-1',
     });
+  });
+
+  it('validates the provisional source activation calibration', () => {
+    assert.deepEqual(
+      deploymentConfig(
+        new App({ context: { pairActivationsPerSourceHour: '100' } }),
+        {},
+      ),
+      {
+        environment: 'dev',
+        pairActivationsPerSourceHour: 100,
+        region: 'us-east-1',
+      },
+    );
+    for (const value of ['0', '1.5', 10_001]) {
+      assert.throws(
+        () =>
+          deploymentConfig(
+            new App({ context: { pairActivationsPerSourceHour: value } }),
+            {},
+          ),
+        /must be an integer from 1 through 10000/,
+      );
+    }
   });
 });

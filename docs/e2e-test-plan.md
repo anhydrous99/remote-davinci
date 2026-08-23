@@ -115,16 +115,17 @@ For both an iPhone and iPad simulator:
 1. Build normally for the simulator so the app receives an ad-hoc signature;
    do not use an unsigned build for Keychain launch validation.
 2. Uninstall any prior app, install the fresh product, and cold launch it.
-3. Verify the initial state says `Not enrolled`, shows **Scan Mac QR Code**, and
+3. Verify the initial state says `Not enrolled`, shows **Scan or Paste Pairing Code**, and
    leaves connection and host controls disabled.
 4. Because the simulator camera cannot prove scanning, exercise the paste-invite
    fallback with valid, malformed, expired, and wrong-relay invitations. Verify
    no pending credential is promoted before reciprocal activation.
 5. Verify the controller fingerprint remains visible while approval is pending
    and is cleared after approval, rejection, cancellation, or failure.
-6. Verify all seven page bodies are blank, then inspect portrait phone plus
-   portrait and landscape tablet layouts, Dynamic Type, tab VoiceOver labels,
-   locked tabs for unavailable grants, and destructive confirmation dialogs.
+6. Verify the connection card, seven-page adaptive grid, selected-page state,
+   main-screen mute control, and recovery actions on portrait phone plus
+   portrait and landscape tablet layouts. Check Dynamic Type, VoiceOver labels,
+   locked pages for unavailable grants, and destructive confirmation dialogs.
 7. Exercise explicit local-forget recovery with a deliberately invalid pending
    enrollment; verify it requires its own warning and confirmation.
 
@@ -145,6 +146,8 @@ Verify:
 - The WSS output performs a real HTTP 101 upgrade with pairing authorization.
 - Lambda is active, DynamoDB is active with `expiresAt` TTL enabled, and no
   alarm is in `ALARM`.
+- Metadata-only access logs include integration latency, route, status, and
+  request ID without message bodies or credentials.
 - Production stack resources and outputs did not change.
 
 Pass: the disposable endpoint is live and attributable to the current build,
@@ -157,8 +160,9 @@ Run only against the confirmed disposable URL:
 ```sh
 REMOTE_DAVINCI_E2E=1 \
 REMOTE_DAVINCI_E2E_DISPOSABLE=1 \
+REMOTE_DAVINCI_E2E_LATENCY_SAMPLES=20 \
 REMOTE_DAVINCI_RELAY_URL='wss://DISPOSABLE_HOST/v1' \
-go test -count=1 -run '^TestLiveRelayLifecycle$' ./internal/companion
+go test -v -count=1 -run '^TestLiveRelayLifecycle$' ./internal/companion
 ```
 
 The canary must prove:
@@ -167,9 +171,11 @@ The canary must prove:
 2. A controller-only session open returns `PEER_OFFLINE`.
 3. Both bearer sockets connect and receive one consistent session.
 4. Noise IK authenticates the stored static keys and exchanges encrypted hello.
-5. One encrypted page request executes exactly once and gets a correlated
-   encrypted response; one companion-originated page event traverses the same
-   opaque relay path in the reverse direction.
+5. Twenty sequential encrypted page requests execute exactly once and get
+   correlated encrypted responses. The output records nearest-rank p50, p95,
+   and p99 relay round-trip latency; the sample count may be set from 1 through
+   100. One companion-originated page event traverses the same opaque relay path
+   in the reverse direction.
 6. Frames arriving as sequence 2 then 1 drain in order within the bounded
    window.
 7. A closed session is not reused; an old encrypted frame sent to it returns
@@ -348,6 +354,7 @@ fresh session, and terminal revocation never reconnects indefinitely.
 Before teardown, inspect the disposable stack:
 
 - Lambda errors/throttles and API execution errors.
+- API Gateway integration-latency distribution for the canary routes.
 - DynamoDB throttles, TTL status, and only expected active/tombstoned records.
 - Sanitized logs for validation codes; search explicitly for bearer prefixes,
   enrollment/invitation field names, join tokens, PSKs, Noise material, and full

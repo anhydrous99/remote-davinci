@@ -249,7 +249,7 @@ final class ControllerTests: XCTestCase {
         )
     }
 
-    func testDeploymentRelayValidationAndReplacementPreserveOverride() throws {
+    func testDeploymentRelayValidationAndEnrollmentPreserveOverride() throws {
         let customRelay = "wss://relay.example/custom"
         XCTAssertEqual(try Enrollment.deploymentRelayURL(nil), Enrollment.defaultRelayURL)
         XCTAssertEqual(try Enrollment.deploymentRelayURL(customRelay), customRelay)
@@ -266,7 +266,7 @@ final class ControllerTests: XCTestCase {
             XCTAssertThrowsError(try Enrollment.create(deviceLabel: "Test iPad", relayURL: invalid))
         }
 
-        let (request, stored) = try ControllerModel.replacementEnrollment(
+        let (request, stored) = try Enrollment.create(
             deviceLabel: "Replacement iPad",
             relayURL: customRelay
         )
@@ -407,13 +407,11 @@ final class ControllerTests: XCTestCase {
             deploymentRelayURL: Enrollment.defaultRelayURL
         )
         XCTAssertEqual(effectiveRelay, response.relayUrl)
-        XCTAssertEqual(
-            try ControllerModel.replacementEnrollment(
-                deviceLabel: "Replacement iPad",
-                relayURL: effectiveRelay
-            ).1.expectedRelayUrl,
-            response.relayUrl
+        let (_, replacement) = try Enrollment.create(
+            deviceLabel: "Replacement iPad",
+            relayURL: effectiveRelay
         )
+        XCTAssertEqual(replacement.expectedRelayUrl, response.relayUrl)
 
         XCTAssertEqual(
             try Enrollment.migrateLegacy(
@@ -498,6 +496,8 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(RelayLifecycle.rotationDelaySeconds(randomUnit: 1), 6_600)
         XCTAssertEqual(RelayLifecycle.sessionSetupTimeoutSeconds, 15)
         XCTAssertEqual(RelayLifecycle.reconnectStabilitySeconds, 30)
+        XCTAssertEqual(RelayLifecycle.pingIntervalSeconds, 300)
+        XCTAssertEqual(RelayLifecycle.pingWatchdogSeconds, 10)
         let attemptAfterHello = RelayLifecycle.reconnectAttempt(
             current: 4,
             afterStableSession: false
@@ -525,6 +525,149 @@ final class ControllerTests: XCTestCase {
             RelayLifecycle.recoveryDisposition(code: "SESSION_NOT_FOUND", retryable: false),
             .reconnect
         )
+    }
+
+    func testReachabilityOnlyWakesAnAlreadyPendingReconnectOnReturn() {
+        XCTAssertTrue(RelayLifecycle.shouldWakeReconnect(
+            previousPathSatisfied: false,
+            pathSatisfied: true,
+            hasPendingReconnect: true
+        ))
+        XCTAssertFalse(RelayLifecycle.shouldWakeReconnect(
+            previousPathSatisfied: nil,
+            pathSatisfied: true,
+            hasPendingReconnect: true
+        ))
+        XCTAssertFalse(RelayLifecycle.shouldWakeReconnect(
+            previousPathSatisfied: true,
+            pathSatisfied: true,
+            hasPendingReconnect: true
+        ))
+        XCTAssertFalse(RelayLifecycle.shouldWakeReconnect(
+            previousPathSatisfied: false,
+            pathSatisfied: true,
+            hasPendingReconnect: false
+        ))
+    }
+
+    @MainActor
+    func testColdEnrollmentAutoConnectsAndBackgroundPreservesUserIntent() throws {
+        let relay = "wss://127.0.0.1:1/v1"
+        let (request, pending) = try Enrollment.create(
+            deviceLabel: "Test iPad",
+            relayURL: relay
+        )
+        var stored = pending
+        stored.response = EnrollmentResponse(
+            v: 1,
+            relayUrl: relay,
+            linkId: "22222222-2222-4222-8222-222222222222",
+            controllerEndpointId: request.controllerEndpointId,
+            companionEndpointId: "33333333-3333-4333-8333-333333333333",
+            companionNoiseKey: Base64URL.encode(
+                Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+            )
+        )
+
+        let model = ControllerModel(relayURL: relay, keychainLoad: { stored })
+        XCTAssertTrue(model.isEnrolled)
+        XCTAssertTrue(model.isConnectionDesired)
+
+        model.suspendConnectionForBackground()
+        XCTAssertTrue(model.isConnectionSuspended)
+        XCTAssertTrue(model.isConnectionDesired)
+        XCTAssertEqual(model.connectionStatus, "Paused")
+
+        model.resumeConnectionAfterBackground()
+        XCTAssertFalse(model.isConnectionSuspended)
+        XCTAssertTrue(model.isConnectionDesired)
+
+        model.disconnect()
+        XCTAssertFalse(model.isConnectionDesired)
+        model.suspendConnectionForBackground()
+        model.resumeConnectionAfterBackground()
+        XCTAssertFalse(model.isConnectionDesired)
+    }
+
+    @MainActor
+    func testRevokedColdEnrollmentDoesNotAutoConnect() throws {
+        let relay = "wss://127.0.0.1:1/v1"
+        let (request, pending) = try Enrollment.create(deviceLabel: "Test iPad", relayURL: relay)
+        var stored = pending
+        stored.response = EnrollmentResponse(
+            v: 1,
+            relayUrl: relay,
+            linkId: "22222222-2222-4222-8222-222222222222",
+            controllerEndpointId: request.controllerEndpointId,
+            companionEndpointId: "33333333-3333-4333-8333-333333333333",
+            companionNoiseKey: Base64URL.encode(
+                Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+            )
+        )
+        stored.linkRevocationConfirmed = true
+
+        let model = ControllerModel(relayURL: relay, keychainLoad: { stored })
+        XCTAssertTrue(model.isEnrolled)
+        XCTAssertFalse(model.canConnect)
+        XCTAssertFalse(model.isConnectionDesired)
+    }
+
+    func testOperationFailuresGiveActionableFeedback() {
+        XCTAssertEqual(
+            ControllerModel.operationFailureMessage(
+                operation: "resolve.page.edit",
+                code: "resolve.unavailable"
+            ),
+            "Open DaVinci Resolve Studio, open a project, and enable Local scripting. " +
+                "(resolve.unavailable)"
+        )
+        XCTAssertTrue(ControllerModel.operationFailureMessage(
+            operation: "resolve.page.edit",
+            code: "operation.forbidden"
+        ).contains("Pair again"))
+        XCTAssertTrue(ControllerModel.operationFailureMessage(
+            operation: "resolve.page.edit",
+            code: "request.invalid"
+        ).contains("device clocks"))
+        XCTAssertEqual(
+            ControllerModel.operationFailureMessage(operation: "future.action", code: "future.error"),
+            "future.action failed: future.error"
+        )
+    }
+
+    func testGrantNoticeOnlyIncludesSupportedLiveCapabilitiesMissingFromStoredGrant() {
+        let missing = ControllerModel.missingGrantedOperations(
+            capabilities: [
+                "resolve.page.edit",
+                "host.volume.toggle-mute",
+                "future.unsupported-control",
+            ],
+            grantedPermissions: ["resolve.page.edit"]
+        )
+
+        XCTAssertEqual(missing, ["host.volume.toggle-mute"])
+        XCTAssertTrue(ControllerModel.missingGrantedOperations(
+            capabilities: ["resolve.page.edit"],
+            grantedPermissions: ["resolve.page.edit"]
+        ).isEmpty)
+    }
+
+    func testBackgroundPairingCancellationReconcilesSavedActivation() {
+        XCTAssertTrue(ControllerModel.shouldReconnectAfterPairing(
+            checkpointAvailable: true,
+            taskCancelled: true,
+            reconcileCancelledPairing: true
+        ))
+        XCTAssertFalse(ControllerModel.shouldReconnectAfterPairing(
+            checkpointAvailable: true,
+            taskCancelled: true,
+            reconcileCancelledPairing: false
+        ))
+        XCTAssertFalse(ControllerModel.shouldReconnectAfterPairing(
+            checkpointAvailable: false,
+            taskCancelled: false,
+            reconcileCancelledPairing: true
+        ))
     }
 
     func testOnlyAuthorizationHandshakeResponsesAreTerminal() throws {

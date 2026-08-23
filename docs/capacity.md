@@ -96,6 +96,19 @@ discarded by the receiver's local revocation gate. Relay rejection,
 Lambda/DynamoDB throttle, Lambda error, and API execution alarms all notify the
 required production SNS topic.
 
+For the public beta, a successful pair activation also increments an hourly
+bucket keyed by the SHA-256 source key already derived from an IPv4 address or
+IPv6 `/64`; raw source addresses are not stored in this bucket. The default is
+10 successful activations per source prefix per hour, in the same transaction
+as link activation, while the existing 10,000-activation daily global bucket
+remains an emergency circuit breaker. Operators may tune the provisional
+shared-NAT calibration from 1 through 10,000 with CDK context
+`pairActivationsPerSourceHour`; CDK passes the validated value to the Lambda as
+`PAIR_ACTIVATIONS_PER_SOURCE_PER_HOUR`. `PairActivations` records successful
+volume, and limiter failures feed the existing rejection alarm. Add separate
+activation-volume or spend alarms only after beta traffic establishes useful
+thresholds.
+
 ## Scaling decision
 
 Keep API Gateway, Lambda, and DynamoDB while they meet the SLO. Start a measured

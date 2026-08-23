@@ -61,3 +61,5 @@ jobs:
         run: |
           make companion-app-check
           make controller-check
+          make controller-ios-build
+          make companion-release-check

@@ -25,6 +25,29 @@ func TestStandaloneRequiresExplicitFileStorageOptIn(t *testing.T) {
 	}
 }
 
+func TestNativeLoggerWritesJSON(t *testing.T) {
+	var output bytes.Buffer
+	newNativeLogger(&output).Info(
+		"control operation completed",
+		"operation", "resolve.page.edit",
+		"outcome", "ok",
+		"duration", 12*time.Millisecond,
+	)
+	var record struct {
+		Message   string `json:"msg"`
+		Operation string `json:"operation"`
+		Outcome   string `json:"outcome"`
+		Duration  int64  `json:"duration"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Message != "control operation completed" || record.Operation != "resolve.page.edit" ||
+		record.Outcome != "ok" || record.Duration != int64(12*time.Millisecond) {
+		t.Fatalf("native log record = %#v", record)
+	}
+}
+
 func TestNativeStartupFailureIsSanitized(t *testing.T) {
 	parent, keepalive := io.Pipe()
 	readiness, output := io.Pipe()

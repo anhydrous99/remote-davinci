@@ -103,8 +103,9 @@ type RevokeEndpointResult struct {
 }
 
 type CommitPairResult struct {
-	Pair Pair
-	Link *Link
+	Pair         Pair
+	Link         *Link
+	ActivatedNow bool
 }
 
 type ServiceError struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strconv"
 
 	"github.com/anhydrous99/remote-davinci/services/rendezvous-relay/internal/relay"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -21,12 +22,17 @@ func main() {
 		slog.Error("TABLE_NAME is required")
 		os.Exit(1)
 	}
+	pairActivationLimit, err := pairActivationsPerSourceHour()
+	if err != nil {
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
 	configuration, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		slog.Error("load AWS configuration", "error", err)
 		os.Exit(1)
 	}
-	store := relay.NewDynamoStore(tableName, dynamodb.NewFromConfig(configuration))
+	store := relay.NewDynamoStore(tableName, dynamodb.NewFromConfig(configuration), pairActivationLimit)
 	management := apigatewaymanagementapi.NewFromConfig(configuration)
 	managementEndpoint := func(event relay.WebSocketEvent) (string, error) {
 		if event.RequestContext.DomainName == "" || event.RequestContext.Stage == "" {
@@ -63,4 +69,17 @@ func main() {
 		return err
 	}
 	lambda.Start(relay.NewHandler(relay.HandlerDependencies{Store: store, Post: post, Drop: drop}).Handle)
+}
+
+func pairActivationsPerSourceHour() (int64, error) {
+	const name = "PAIR_ACTIVATIONS_PER_SOURCE_PER_HOUR"
+	raw := os.Getenv(name)
+	if raw == "" {
+		return 10, nil
+	}
+	limit, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || limit < 1 || limit > 10_000 {
+		return 0, errors.New(name + " must be an integer from 1 through 10000")
+	}
+	return limit, nil
 }

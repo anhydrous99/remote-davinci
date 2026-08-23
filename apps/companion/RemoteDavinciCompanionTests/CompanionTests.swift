@@ -96,6 +96,54 @@ final class CompanionTests: XCTestCase {
         }
     }
 
+    func testHelperOperationDiagnosticsAllowOnlySanitizedFields() {
+        let valid = Data(#"{"time":"2026-08-22T00:00:00Z","level":"INFO","msg":"control operation completed","operation":"resolve.page.edit","outcome":"ok","duration":1250000,"secret":"must-not-escape"}"#.utf8)
+        XCTAssertEqual(
+            HelperOperationDiagnostics.parse(valid),
+            HelperOperationDiagnostic(
+                operation: "resolve.page.edit",
+                outcome: "ok",
+                durationNanoseconds: 1_250_000
+            )
+        )
+
+        let rejected = [
+            #"{"msg":"companion stopped","operation":"resolve.page.edit","outcome":"ok","duration":1}"#,
+            #"{"msg":"control operation completed","operation":"future.operation","outcome":"ok","duration":1}"#,
+            #"{"msg":"control operation completed","operation":"resolve.page.edit","outcome":"secret.failure","duration":1}"#,
+            #"{"msg":"control operation completed","operation":"resolve.page.edit","outcome":"ok","duration":-1}"#,
+            #"{"msg":"control operation completed","operation":"resolve.page.edit","outcome":"ok","duration":10000000001}"#,
+            #"not json: bearer rd1.secret"#,
+        ]
+        for line in rejected {
+            XCTAssertNil(HelperOperationDiagnostics.parse(Data(line.utf8)), line)
+        }
+    }
+
+    func testHelperStderrBufferBoundsAndReassemblesLines() {
+        let valid = #"{"msg":"control operation completed","operation":"host.volume.toggle-mute","outcome":"host.mute-unsupported","duration":5000000}"#
+        var buffer = HelperStderrBuffer()
+
+        XCTAssertTrue(buffer.consume(Data(valid.prefix(20).utf8)).isEmpty)
+        XCTAssertEqual(buffer.bufferedByteCount, 20)
+        XCTAssertEqual(
+            buffer.consume(Data((valid.dropFirst(20) + "\n").utf8)),
+            [HelperOperationDiagnostic(
+                operation: "host.volume.toggle-mute",
+                outcome: "host.mute-unsupported",
+                durationNanoseconds: 5_000_000
+            )]
+        )
+
+        XCTAssertTrue(buffer.consume(Data(repeating: 0x41, count: HelperOperationDiagnostics.maximumLineBytes + 1)).isEmpty)
+        XCTAssertEqual(buffer.bufferedByteCount, 0)
+        XCTAssertEqual(
+            buffer.consume(Data(("\n" + valid + "\n").utf8)).count,
+            1,
+            "an oversized line must be dropped without hiding the next bounded record"
+        )
+    }
+
     func testStateAndEnrollmentModelsMatchHelperJSON() throws {
         let reply = EnrollmentReply(
             v: 1,

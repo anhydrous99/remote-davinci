@@ -695,7 +695,7 @@ func (attempt *pairingAttempt) finishWithError(err error) {
 func pairingStatus(phase string) string {
 	switch phase {
 	case pairingShowingQR:
-		return "Waiting for iPhone or iPad to scan QR code"
+		return "Waiting for iPhone or iPad to scan or paste pairing code"
 	case pairingHandshaking:
 		return "Controller found; securing pairing"
 	case pairingAwaitingApproval:
@@ -703,7 +703,7 @@ func pairingStatus(phase string) string {
 	case pairingCommitting:
 		return "Finishing secure pairing"
 	case pairingExpired:
-		return "Pairing QR code expired"
+		return "Pairing code expired"
 	case pairingCancelled:
 		return "Pairing cancelled"
 	case pairingRejected:
