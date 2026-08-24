@@ -39,6 +39,8 @@ jobs:
           npm --prefix infra/cdk ci --ignore-scripts
       - name: Run repository checks
         run: make check
+      - name: Run Go race detector
+        run: go test -race -count=1 ./...
       - name: Audit Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
       - name: Audit npm dependencies
@@ -61,3 +63,6 @@ jobs:
         run: |
           make companion-app-check
           make controller-check
+          make controller-ios-tests
+          make controller-ios-build
+          make companion-release-check

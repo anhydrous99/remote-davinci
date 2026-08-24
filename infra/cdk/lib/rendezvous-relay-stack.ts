@@ -23,6 +23,9 @@ export interface RendezvousRelayStackProps extends StackProps {
   readonly environment: 'dev' | 'prod';
   readonly accessLogs?: boolean;
   readonly alarmTopicArn?: string;
+  readonly lambdaMemory?: 128 | 256 | 512;
+  readonly pairActivationsPerSourceHour?: number;
+  readonly performanceMode?: boolean;
 }
 
 export class RendezvousRelayStack extends Stack {
@@ -30,7 +33,26 @@ export class RendezvousRelayStack extends Stack {
     super(scope, id, props);
 
     const production = props.environment === 'prod';
+    const performanceMode = props.performanceMode ?? false;
+    if (production && performanceMode) {
+      throw new Error('performanceMode is available only for dev');
+    }
     const accessLogging = props.accessLogs ?? true;
+    const lambdaMemory = props.lambdaMemory ?? 256;
+    if (lambdaMemory !== 128 && lambdaMemory !== 256 && lambdaMemory !== 512) {
+      throw new Error('lambdaMemory must be 128, 256, or 512');
+    }
+    const pairActivationsPerSourceHour =
+      props.pairActivationsPerSourceHour ?? 10;
+    if (
+      !Number.isSafeInteger(pairActivationsPerSourceHour) ||
+      pairActivationsPerSourceHour < 1 ||
+      pairActivationsPerSourceHour > 10_000
+    ) {
+      throw new Error(
+        'pairActivationsPerSourceHour must be an integer from 1 through 10000',
+      );
+    }
     const relayRejectionsNamespace = `RemoteDavinci/${props.environment}`;
     const removalPolicy = production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY;
     const alarmTopicArn = props.alarmTopicArn;
@@ -101,12 +123,17 @@ export class RendezvousRelayStack extends Stack {
 
     const lambdaDefaults = {
       architecture: lambda.Architecture.ARM_64,
-      environment: { TABLE_NAME: table.tableName },
+      environment: {
+        PAIR_ACTIVATIONS_PER_SOURCE_PER_HOUR: String(
+          pairActivationsPerSourceHour,
+        ),
+        TABLE_NAME: table.tableName,
+      },
       loggingFormat: lambda.LoggingFormat.JSON,
-      memorySize: 256,
+      memorySize: lambdaMemory,
       ...(production
         ? {
-            applicationLogLevelV2: lambda.ApplicationLogLevel.WARN,
+            applicationLogLevelV2: lambda.ApplicationLogLevel.INFO,
             systemLogLevelV2: lambda.SystemLogLevel.WARN,
           }
         : {}),
@@ -142,6 +169,18 @@ export class RendezvousRelayStack extends Stack {
       ),
       logGroup: relayLogs,
       metricName: 'RelayRejections',
+      metricNamespace: relayRejectionsNamespace,
+      metricValue: '1',
+    });
+    new logs.MetricFilter(this, 'PairActivationsMetric', {
+      defaultValue: 0,
+      filterPattern: logs.FilterPattern.stringValue(
+        '$.action',
+        '=',
+        'pair.activate',
+      ),
+      logGroup: relayLogs,
+      metricName: 'PairActivations',
       metricNamespace: relayRejectionsNamespace,
       metricValue: '1',
     });
@@ -209,6 +248,7 @@ export class RendezvousRelayStack extends Stack {
         destinationArn: accessLogs.logGroupArn,
         format: JSON.stringify({
           error: '$context.error.message',
+          integrationLatency: '$context.integrationLatency',
           requestId: '$context.requestId',
           routeKey: '$context.routeKey',
           status: '$context.status',
@@ -232,8 +272,8 @@ export class RendezvousRelayStack extends Stack {
       '$disconnect': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
       'pair.frame': routeSettings(production ? 500 : 50, production ? 1_000 : 100),
       'session.frame': routeSettings(
-        production ? 4_000 : 50,
-        production ? 5_000 : 100,
+        production || performanceMode ? 4_000 : 50,
+        production || performanceMode ? 5_000 : 100,
       ),
     };
 

@@ -3,6 +3,10 @@
 Accountless rendezvous and live encrypted relay for an iPhone/iPad controller
 and a macOS DaVinci Resolve companion.
 
+The repository currently provides source builds. Signed/notarized Mac and
+TestFlight candidates must complete [`docs/release-checklist.md`](docs/release-checklist.md)
+before they are described as customer releases.
+
 ## Run the Mac companion and iPhone app
 
 For normal use, start only the **Remote DaVinci Companion** app on the Mac. It
@@ -74,7 +78,7 @@ enrolled.
 
 ### 4. Pair the controller
 
-1. On iOS, keep or edit **Device label**, then tap **Scan Mac QR Code**.
+1. On iOS, keep or edit **Device label**, then tap **Scan or Paste Pairing Code**.
 2. Allow camera access and scan the one-time code shown by the Mac companion.
 3. When both devices show the controller security fingerprint, verify that the
    values match, review the controller label and eight requested controls, and
@@ -89,23 +93,22 @@ and never receives the PSK. The apps authenticate the exchange with
 `Noise_NNpsk0_25519_ChaChaPoly_SHA256`; approval grants only the eight fixed V1
 controls.
 
-If the camera is unavailable, expand **Advanced Manual Enrollment** on iOS and
-**Manual enrollment (advanced)** on the Mac. Transfer both JSON documents
-directly between the unlocked devices, such as with AirDrop or Universal
-Clipboard. This fallback is for one trusted operator, not remote onboarding.
+If the camera is unavailable, click **Copy Pairing Code** on the Mac, open the
+scanner on iOS, and paste the code. The same one-time expiry, relay admission,
+Noise handshake, fingerprint comparison, and Mac approval still apply.
 
 ### 5. Control the Mac
 
-Tap **Done**, then select the Media, Cut, Edit, Fusion, Color, Fairlight, or
-Deliver tab. The tab body is intentionally blank: selecting the tab itself asks
-Resolve to open that page.
-Changing to one of those pages inside Resolve updates the selected iOS tab.
+Tap **Done**, then select Media, Cut, Edit, Fusion, Color, Fairlight, or Deliver
+from the page grid. Selecting a page asks Resolve to open it. Changing to one of
+those pages inside Resolve updates the selected iOS page.
 Existing QR pairings retain their original grant; pair again once to approve
 the newly added page controls.
 
-Mac mute remains under **Settings > Host control**. Controls stay disabled until
-the secure session is ready. Backgrounding the iOS app intentionally
-disconnects it; tap **Connect** again after returning.
+Connection recovery and Mac mute are available on the main screen. Controls stay
+disabled until the secure session is ready. An enrolled controller connects on
+launch and resumes automatically after backgrounding with a fresh session; it
+never replays an interrupted command.
 
 ### Troubleshooting
 
@@ -114,8 +117,8 @@ disconnects it; tap **Connect** again after returning.
 | The Mac build says Go is required | Confirm `go version` works in Terminal, then rebuild the companion. |
 | Mac shows **Server stopped** or a startup error | Unlock the login Keychain and click **Retry Server**. If it reports a missing helper, rebuild the companion. |
 | Physical-device build will not sign | Select your team, enable automatic signing, and use a unique bundle identifier. |
-| **Connect** is disabled | Finish QR pairing or import the advanced manual response so the status is **Enrolled**. |
-| Camera access is unavailable | Enable it in Settings, paste a decoded pairing code, or use advanced manual enrollment. |
+| Controls are disabled | Finish pairing and wait for **Connected / Ready**. |
+| Camera access is unavailable | Enable it in Settings, or click **Copy Pairing Code** on the Mac and paste it into the iOS scanner. |
 | The QR code expired or pairing was rejected | Generate a fresh code on the Mac, scan it, and approve that attempt. |
 | iOS stays at **Waiting for companion** | Keep the Mac companion running and confirm both apps were paired against the same relay. |
 | Page control reports `resolve.unavailable` | Run Resolve Studio from its standard installation, open a project, and set external scripting to **Local**. |
@@ -123,14 +126,15 @@ disconnects it; tap **Connect** again after returning.
 | Mute reports `host.mute-unsupported` | The current output device does not expose a macOS mute property. |
 | Pairing is unavailable for a new device | The Mac supports one controller. Revoke and reset the old pairing first. |
 
-Use **Revoke and Reset** on the Mac or **Revoke and Re-enroll** on iOS while the
-relay is reachable. The separately confirmed local-forget actions are emergency
-recovery only: they can leave the old relay identity active.
+Use **Revoke and Reset** on the Mac or **Revoke and Pair Again** on iOS while the
+relay is reachable, then generate a new Mac pairing code and scan or paste it.
+The separately confirmed local-forget actions are emergency recovery only: they
+can leave the old relay identity active.
 
 ### Use a custom relay
 
-The default quick start does not need this. Before pairing or creating a manual
-enrollment, open the companion project as well:
+The default quick start does not need this. Before pairing, open the companion
+project as well:
 
 ```sh
 open -a Xcode apps/companion/RemoteDavinciCompanion.xcodeproj
@@ -147,11 +151,18 @@ Keychain; changing it later requires revocation and pairing again.
 ## Documentation
 
 - [`protocol/README.md`](protocol/README.md): canonical wire protocol, trust
-  boundary, authenticated QR pairing, and advanced manual fallback.
+  boundary, authenticated QR pairing, and legacy manual wire compatibility.
 - [`docs/e2e-test-plan.md`](docs/e2e-test-plan.md): release-validation matrix for
   simulators, physical devices, AWS, Resolve, and host effects.
 - [`docs/capacity.md`](docs/capacity.md): relay quotas, load targets, and cost
   model.
+- [`docs/performance-results-template.md`](docs/performance-results-template.md):
+  blank release record plus executable latency, load, and Lambda-memory
+  measurement workflow; it contains no live result until a dated run fills it.
+- [`docs/improvement-roadmap.md`](docs/improvement-roadmap.md): implemented
+  customer-readiness work, acceptance targets, and remaining live gates.
+- [`docs/release-checklist.md`](docs/release-checklist.md): signing,
+  notarization, TestFlight, clean-machine, and rollback gates.
 - [`SECURITY.md`](SECURITY.md): private vulnerability-reporting process.
 
 ## Project layout
@@ -186,11 +197,25 @@ Xcode:
 ```sh
 make companion-app-check
 make controller-check
+make controller-ios-tests
+make controller-ios-build
+make companion-release-check
 ```
 
-`controller-check` is not an iOS simulator or physical-device test. The complete
-deployment, device, failure-path, host-effect, and cleanup matrix is in
-[`docs/e2e-test-plan.md`](docs/e2e-test-plan.md).
+`controller-check` runs fast Mac Catalyst tests. `controller-ios-tests` runs the
+same test target on one available iPhone and one iPad simulator.
+`controller-ios-build` compiles the real iOS-only paths in Release against the
+simulator SDK, while `companion-release-check` builds the unsigned Release
+configuration. None is a physical-device, signed-distribution, or live-service
+test. The complete deployment, device, failure-path, host-effect, and cleanup
+matrix is in [`docs/e2e-test-plan.md`](docs/e2e-test-plan.md).
+
+`go run ./cmd/relay-perf` is an explicitly gated disposable-stack load probe for
+the opaque relay hot path. `go run ./cmd/latency-summary` converts one duration
+per line into the nearest-rank percentiles used by the performance record. See
+[`docs/performance-results-template.md`](docs/performance-results-template.md)
+for the safety gates and exact commands; neither tool contains a live benchmark
+result.
 
 ## AWS infrastructure development
 
@@ -199,6 +224,10 @@ the development stack with `npm --prefix infra/cdk run synth`. It targets
 `us-east-1` by default; pass CDK context `region` to select another region.
 Deployment requires a CDK-bootstrapped AWS account and is intentionally not
 performed by the test suite.
+The optional `lambdaMemory` context accepts only `128`, `256`, or `512` MiB for
+the documented isolated-stack sweep and otherwise defaults to `256` MiB. The
+dev-only `performanceMode=true` context raises the `session.frame` route for
+that workload and is rejected for production.
 
 Production synthesis and deployment require an explicit account/region
 allowlist plus an existing SNS topic in that same account and region:

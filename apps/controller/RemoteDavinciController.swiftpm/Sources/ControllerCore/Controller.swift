@@ -1,6 +1,7 @@
 import Combine
 import CryptoKit
 import Foundation
+import Network
 import Security
 import UIKit
 
@@ -414,6 +415,7 @@ enum RelayConnectionError: LocalizedError, Equatable {
     case linkRevoked
     case linkRevocationCheckpointFailed(String)
     case sessionClosed
+    case pingTimedOut
 
     var errorDescription: String? {
         switch self {
@@ -422,6 +424,7 @@ enum RelayConnectionError: LocalizedError, Equatable {
         case let .linkRevocationCheckpointFailed(message):
             "The link was revoked, but its recovery checkpoint could not be saved: \(message)"
         case .sessionClosed: "The relay session was closed."
+        case .pingTimedOut: "The relay connection stopped responding."
         }
     }
 }
@@ -440,6 +443,8 @@ enum RelayRecoveryDisposition: Equatable {
 enum RelayLifecycle {
     static let sessionSetupTimeoutSeconds: Double = 15
     static let reconnectStabilitySeconds: Double = 30
+    static let pingIntervalSeconds: Double = 300
+    static let pingWatchdogSeconds: Double = 10
 
     static func reconnectDelaySeconds(attempt: Int, randomUnit: Double) -> Double {
         let ceiling = min(900, pow(2, Double(min(max(attempt, 0), 10))))
@@ -451,6 +456,14 @@ enum RelayLifecycle {
         afterStableSession stable: Bool
     ) -> Int {
         stable ? 0 : current
+    }
+
+    static func shouldWakeReconnect(
+        previousPathSatisfied: Bool?,
+        pathSatisfied: Bool,
+        hasPendingReconnect: Bool
+    ) -> Bool {
+        previousPathSatisfied == false && pathSatisfied && hasPendingReconnect
     }
 
     static func rotationDelaySeconds(randomUnit: Double) -> Double {
@@ -647,7 +660,8 @@ enum ResolvePageControl {
 
 @MainActor
 public final class ControllerModel: ObservableObject {
-    public static let operations = ResolvePage.allCases.map(\.operation) + ["host.volume.toggle-mute"]
+    public nonisolated static let operations = ResolvePage.allCases.map(\.operation) +
+        ["host.volume.toggle-mute"]
 
     @Published public var deviceLabel = UIDevice.current.name
     @Published public var enrollmentResponseJSON = ""
@@ -668,6 +682,7 @@ public final class ControllerModel: ObservableObject {
     @Published public private(set) var grantedPermissions = Set<String>()
     @Published public private(set) var selectedPage: ResolvePage = .edit
     @Published public private(set) var pendingPage: ResolvePage?
+    private(set) var isConnectionSuspended = false
 
     public var displayedPage: ResolvePage {
         ResolvePageControl.displayedPage(selected: selectedPage, pending: pendingPage)
@@ -692,6 +707,7 @@ public final class ControllerModel: ObservableObject {
     private var expiryTask: Task<Void, Never>?
     private var pairingTask: Task<Void, Never>?
     private var pairingAttemptID: UUID?
+    private var reconcileCancelledPairing = false
     private var activeEnrollment: ActiveEnrollment?
     private var sessionID: String?
     private var sessionOpenRequestID: String?
@@ -705,15 +721,26 @@ public final class ControllerModel: ObservableObject {
     private var lateResponses = LateResponseWindow()
     private var outerRequestIDs = LateResponseWindow()
     private var reconnectAttempt = 0
+    private var lastNetworkPathSatisfied: Bool?
     private var credentialStoreUnavailable = false
     private let keychainLoad: () throws -> StoredEnrollment?
+    private let pathMonitor: NWPathMonitor?
 
     public convenience init(relayURL: String? = nil) {
-        self.init(relayURL: relayURL, keychainLoad: KeychainStore.load)
+        self.init(
+            relayURL: relayURL,
+            keychainLoad: KeychainStore.load,
+            pathMonitor: NWPathMonitor()
+        )
     }
 
-    init(relayURL: String?, keychainLoad: @escaping () throws -> StoredEnrollment?) {
+    init(
+        relayURL: String?,
+        keychainLoad: @escaping () throws -> StoredEnrollment?,
+        pathMonitor: NWPathMonitor? = nil
+    ) {
         self.keychainLoad = keychainLoad
+        self.pathMonitor = pathMonitor
         do {
             enrollmentRelayURL = try Enrollment.deploymentRelayURL(relayURL)
         } catch {
@@ -722,17 +749,24 @@ public final class ControllerModel: ObservableObject {
             return
         }
 
+        startPathMonitor()
+
         do {
             guard let loaded = try keychainLoad() else { return }
-            _ = try restoreStoredEnrollment(loaded)
-            if shouldAutomaticallyReconcilePendingActivation {
-                Task { [weak self] in self?.connect() }
+            let active = try restoreStoredEnrollment(loaded)
+            if canConnect && (active || shouldAutomaticallyReconcilePendingActivation) {
+                isConnectionDesired = true
+                Task { [weak self] in await self?.connectNow() }
             }
         } catch {
             hasLocalEnrollment = true
             credentialStoreUnavailable = true
             enrollmentStatus = error.localizedDescription
         }
+    }
+
+    deinit {
+        pathMonitor?.cancel()
     }
 
     public func createEnrollmentRequest() {
@@ -816,7 +850,37 @@ public final class ControllerModel: ObservableObject {
 
     public func refreshCredentialStoreIfNeeded() {
         guard credentialStoreUnavailable else { return }
-        _ = adoptPairingCheckpointIfPresent(fallbackStatus: "Not enrolled", load: keychainLoad)
+        let active = adoptPairingCheckpointIfPresent(
+            fallbackStatus: "Not enrolled",
+            load: keychainLoad
+        )
+        if active || shouldAutomaticallyReconcilePendingActivation {
+            connect()
+        }
+    }
+
+    private func startPathMonitor() {
+        guard let pathMonitor else { return }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                self?.networkPathChanged(isSatisfied: satisfied)
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "RemoteDaVinci.NetworkPath"))
+    }
+
+    private func networkPathChanged(isSatisfied: Bool) {
+        let shouldWake = RelayLifecycle.shouldWakeReconnect(
+            previousPathSatisfied: lastNetworkPathSatisfied,
+            pathSatisfied: isSatisfied,
+            hasPendingReconnect: reconnectTask != nil
+        )
+        lastNetworkPathSatisfied = isSatisfied
+        guard shouldWake else { return }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        scheduleReconnect(immediately: true)
     }
 
     public func pair(inviteJSON: String) {
@@ -854,6 +918,7 @@ public final class ControllerModel: ObservableObject {
         stopMaintainingConnection(status: "Disconnected", feedback: "")
         let attemptID = UUID()
         pairingAttemptID = attemptID
+        reconcileCancelledPairing = false
         isPairing = true
         pairingStatus = PairingProgress.joining.status
         pairingFingerprint = ""
@@ -882,6 +947,7 @@ public final class ControllerModel: ObservableObject {
                 pairingStatus = "Paired"
                 pairingFingerprint = ""
                 pairingAttemptID = nil
+                reconcileCancelledPairing = false
                 pairingTask = nil
                 isPairing = false
                 connect()
@@ -891,20 +957,27 @@ public final class ControllerModel: ObservableObject {
                     ? "Pairing cancelled"
                     : error.localizedDescription
                 let activeWasSaved = adoptPairingCheckpointIfPresent(fallbackStatus: status)
+                let reconnectCancelledPairing = reconcileCancelledPairing
                 pairingStatus = activeWasSaved ? "Paired" : enrollmentStatus
                 pairingFingerprint = ""
                 pairingAttemptID = nil
+                reconcileCancelledPairing = false
                 pairingTask = nil
                 isPairing = false
-                if (activeWasSaved || hasPendingPairingActivation), !Task.isCancelled {
+                if Self.shouldReconnectAfterPairing(
+                    checkpointAvailable: activeWasSaved || hasPendingPairingActivation,
+                    taskCancelled: Task.isCancelled,
+                    reconcileCancelledPairing: reconnectCancelledPairing
+                ) {
                     connect()
                 }
             }
         }
     }
 
-    public func cancelPairing() {
+    public func cancelPairing(reconcilePendingActivation: Bool = false) {
         guard isPairing else { return }
+        reconcileCancelledPairing = reconcilePendingActivation
         pairingTask?.cancel()
         pairingStatus = "Cancelling pairing"
         pairingFingerprint = ""
@@ -915,11 +988,29 @@ public final class ControllerModel: ObservableObject {
         guard canConnect, !isConnectionDesired else { return }
         isConnectionDesired = true
         reconnectAttempt = 0
+        guard !isConnectionSuspended else { return }
         Task { await connectNow() }
     }
 
     public func disconnect() {
         stopMaintainingConnection(status: "Disconnected", feedback: "Disconnected")
+    }
+
+    public func suspendConnectionForBackground() {
+        isConnectionSuspended = true
+        guard isConnectionDesired else { return }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        teardownConnection(status: "Paused", feedback: "")
+    }
+
+    public func resumeConnectionAfterBackground() {
+        isConnectionSuspended = false
+        if isConnectionDesired {
+            Task { await connectNow() }
+        } else if shouldAutomaticallyReconcilePendingActivation {
+            connect()
+        }
     }
 
     public func requestPage(_ page: ResolvePage) {
@@ -938,7 +1029,7 @@ public final class ControllerModel: ObservableObject {
         guard isEnrolled, !isResetting, let storedEnrollment else { return }
         isResetting = true
         stopMaintainingConnection(status: "Revoking enrollment", feedback: "")
-        Task { await revokeAndCreateRequest(from: storedEnrollment) }
+        Task { await revokeAndClearEnrollment(from: storedEnrollment) }
     }
 
     public func forgetLocalEnrollmentAndReenroll() {
@@ -949,20 +1040,19 @@ public final class ControllerModel: ObservableObject {
         do {
             try KeychainStore.delete()
             clearLocalEnrollment()
-            try createReplacementRequest(status:
-                "Local credentials forgotten; new request ready. The prior remote identity may remain."
-            )
+            enrollmentStatus = "Ready to pair. The prior remote identity may remain."
+            connectionStatus = "Disconnected"
         } catch {
-            enrollmentStatus = hasLocalEnrollment
-                ? "Local forget failed: \(error.localizedDescription)"
-                : "Local credentials deleted; re-enrollment failed: \(error.localizedDescription)"
+            enrollmentStatus = "Local forget failed: \(error.localizedDescription)"
             connectionStatus = "Disconnected"
         }
         isResetting = false
     }
 
     private func connectNow() async {
-        guard isConnectionDesired, !isConnected, !isResetting else { return }
+        guard isConnectionDesired, !isConnectionSuspended, !isConnected, !isResetting else {
+            return
+        }
         guard let storedEnrollment else {
             isConnectionDesired = false
             connectionStatus = EnrollmentError.missingRequest.localizedDescription
@@ -1040,14 +1130,33 @@ public final class ControllerModel: ObservableObject {
     private func pingLoop(_ task: URLSessionWebSocketTask) async {
         do {
             while !Task.isCancelled, socket === task {
-                try await Task.sleep(for: .seconds(300))
+                try await Task.sleep(for: .seconds(RelayLifecycle.pingIntervalSeconds))
                 guard !Task.isCancelled, socket === task else { return }
-                try await sendPing(task)
+                try await sendPingWithWatchdog(task)
             }
         } catch {
             guard socket === task else { return }
             connectionFailed(task, error: error)
         }
+    }
+
+    private func sendPingWithWatchdog(_ task: URLSessionWebSocketTask) async throws {
+        let watchdog = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(RelayLifecycle.pingWatchdogSeconds))
+            } catch {
+                return
+            }
+            self?.pingTimedOut(task)
+        }
+        defer { watchdog.cancel() }
+        try await sendPing(task)
+    }
+
+    private func pingTimedOut(_ task: URLSessionWebSocketTask) {
+        guard socket === task else { return }
+        task.cancel(with: .goingAway, reason: nil)
+        connectionFailed(task, error: RelayConnectionError.pingTimedOut)
     }
 
     private func handleOuter(_ data: Data, on task: URLSessionWebSocketTask) async throws {
@@ -1240,13 +1349,22 @@ public final class ControllerModel: ObservableObject {
             sessionSetupTask?.cancel()
             sessionSetupTask = nil
             try finalizePendingActivation()
-            companionCapabilities = Set(capabilities)
+            let liveCapabilities = Set(capabilities)
+            let missingGrants = Self.missingGrantedOperations(
+                capabilities: liveCapabilities,
+                grantedPermissions: grantedPermissions
+            )
+            companionCapabilities = liveCapabilities
             isReady = true
             startReconnectStabilityInterval(for: task)
             connectionStatus = "Connected"
-            feedback = Self.operations.contains(where: companionCapabilities.contains)
-                ? "Ready"
-                : "Companion offers no supported controls"
+            if !missingGrants.isEmpty {
+                feedback = "New Mac controls are available. Pair again to approve them."
+            } else {
+                feedback = Self.operations.contains(where: companionCapabilities.contains)
+                    ? "Ready"
+                    : "Companion offers no supported controls"
+            }
             return
         }
 
@@ -1291,7 +1409,7 @@ public final class ControllerModel: ObservableObject {
                   let error = body["error"] as? [String: Any],
                   let code = error["code"] as? String
         {
-            feedback = "\(pendingCommand.operation) failed: \(code)"
+            feedback = Self.operationFailureMessage(operation: pendingCommand.operation, code: code)
         } else {
             throw ControllerProtocolError.invalidMessage
         }
@@ -1346,7 +1464,7 @@ public final class ControllerModel: ObservableObject {
         feedback = "\(pendingCommand.operation) expired"
     }
 
-    private func revokeAndCreateRequest(from stored: StoredEnrollment) async {
+    private func revokeAndClearEnrollment(from stored: StoredEnrollment) async {
         defer { isResetting = false }
 
         do {
@@ -1354,14 +1472,12 @@ public final class ControllerModel: ObservableObject {
             let endpointCleanupError = try await revokeRemoteEnrollment(active, stored: stored)
             try KeychainStore.delete()
             clearLocalEnrollment()
-            try createReplacementRequest(status: endpointCleanupError == nil
-                ? "Old endpoint revoked; new request ready"
-                : "Link revoked; endpoint cleanup unconfirmed; new request ready"
-            )
+            enrollmentStatus = endpointCleanupError == nil
+                ? "Enrollment revoked. Generate a new Mac pairing code, then scan or paste it."
+                : "Link revoked; endpoint cleanup unconfirmed. Generate a new Mac pairing code, then scan or paste it."
+            connectionStatus = "Disconnected"
         } catch {
-            enrollmentStatus = !hasLocalEnrollment
-                ? "Endpoint revoked; re-enrollment failed: \(error.localizedDescription)"
-                : "Reset failed: \(error.localizedDescription)"
+            enrollmentStatus = "Reset failed: \(error.localizedDescription)"
             connectionStatus = "Disconnected"
         }
     }
@@ -1487,29 +1603,6 @@ public final class ControllerModel: ObservableObject {
             enrollmentStatus = "Saved pairing credentials could not be restored: \(error.localizedDescription)"
             return false
         }
-    }
-
-    private func createReplacementRequest(status: String) throws {
-        guard let enrollmentRelayURL else { throw EnrollmentError.invalidRelay }
-        let (request, replacement) = try Self.replacementEnrollment(
-            deviceLabel: deviceLabel,
-            relayURL: enrollmentRelayURL
-        )
-        let requestJSON = try request.jsonString()
-        try KeychainStore.save(replacement)
-        storedEnrollment = replacement
-        hasLocalEnrollment = true
-        enrollmentRequestJSON = requestJSON
-        enrollmentStatus = status
-        connectionStatus = "Disconnected"
-        feedback = ""
-    }
-
-    nonisolated static func replacementEnrollment(
-        deviceLabel: String,
-        relayURL: String
-    ) throws -> (EnrollmentRequest, StoredEnrollment) {
-        try Enrollment.create(deviceLabel: deviceLabel, relayURL: relayURL)
     }
 
     private func persistLinkRevocationCheckpoint(linkID: String) throws {
@@ -1663,7 +1756,9 @@ public final class ControllerModel: ObservableObject {
     }
 
     private func scheduleReconnect(immediately: Bool = false) {
-        guard isConnectionDesired, !isResetting, reconnectTask == nil else { return }
+        guard isConnectionDesired, !isConnectionSuspended, !isResetting,
+              reconnectTask == nil
+        else { return }
         var delay: Double
         if immediately {
             delay = 0
@@ -1860,6 +1955,38 @@ public final class ControllerModel: ObservableObject {
         reconnectTask?.cancel()
         reconnectTask = nil
         teardownConnection(status: status, feedback: feedback)
+    }
+
+    nonisolated static func operationFailureMessage(operation: String, code: String) -> String {
+        switch code {
+        case "resolve.unavailable":
+            "Open DaVinci Resolve Studio, open a project, and enable Local scripting. (\(code))"
+        case "host.mute-unsupported":
+            "This Mac output device does not support mute. (\(code))"
+        case "operation.forbidden":
+            "This control was not approved. Pair again to update permissions. (\(code))"
+        case "operation.unsupported":
+            "Update the Mac companion or choose a supported control. (\(code))"
+        case "request.invalid":
+            "The Mac rejected a stale or invalid command. Check both device clocks and try again. (\(code))"
+        default:
+            "\(operation) failed: \(code)"
+        }
+    }
+
+    nonisolated static func missingGrantedOperations(
+        capabilities: Set<String>,
+        grantedPermissions: Set<String>
+    ) -> Set<String> {
+        capabilities.intersection(Self.operations).subtracting(grantedPermissions)
+    }
+
+    nonisolated static func shouldReconnectAfterPairing(
+        checkpointAvailable: Bool,
+        taskCancelled: Bool,
+        reconcileCancelledPairing: Bool
+    ) -> Bool {
+        checkpointAvailable && (!taskCancelled || reconcileCancelledPairing)
     }
 
     private func teardownConnection(status: String, feedback: String) {

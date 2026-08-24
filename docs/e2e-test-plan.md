@@ -69,11 +69,14 @@ make check
 go test -race -count=1 ./...
 make companion-app-check
 make controller-check
+make controller-ios-tests
+make controller-ios-build
+make companion-release-check
 ```
 
-Also run the controller test target with warnings as errors on one iPhone and
-one iPad simulator. Inspect each `.xcresult` summary and require zero failures,
-skips, or expected failures.
+`controller-ios-tests` selects one available iPhone and one iPad simulator and
+runs the controller tests with warnings as errors. Inspect each `.xcresult`
+summary and require zero failures, skips, or expected failures.
 
 Coverage required:
 
@@ -115,16 +118,17 @@ For both an iPhone and iPad simulator:
 1. Build normally for the simulator so the app receives an ad-hoc signature;
    do not use an unsigned build for Keychain launch validation.
 2. Uninstall any prior app, install the fresh product, and cold launch it.
-3. Verify the initial state says `Not enrolled`, shows **Scan Mac QR Code**, and
+3. Verify the initial state says `Not enrolled`, shows **Scan or Paste Pairing Code**, and
    leaves connection and host controls disabled.
 4. Because the simulator camera cannot prove scanning, exercise the paste-invite
    fallback with valid, malformed, expired, and wrong-relay invitations. Verify
    no pending credential is promoted before reciprocal activation.
 5. Verify the controller fingerprint remains visible while approval is pending
    and is cleared after approval, rejection, cancellation, or failure.
-6. Verify all seven page bodies are blank, then inspect portrait phone plus
-   portrait and landscape tablet layouts, Dynamic Type, tab VoiceOver labels,
-   locked tabs for unavailable grants, and destructive confirmation dialogs.
+6. Verify the connection card, seven-page adaptive grid, selected-page state,
+   main-screen mute control, and recovery actions on portrait phone plus
+   portrait and landscape tablet layouts. Check Dynamic Type, VoiceOver labels,
+   locked pages for unavailable grants, and destructive confirmation dialogs.
 7. Exercise explicit local-forget recovery with a deliberately invalid pending
    enrollment; verify it requires its own warning and confirmation.
 
@@ -145,6 +149,8 @@ Verify:
 - The WSS output performs a real HTTP 101 upgrade with pairing authorization.
 - Lambda is active, DynamoDB is active with `expiresAt` TTL enabled, and no
   alarm is in `ALARM`.
+- Metadata-only access logs include integration latency, route, status, and
+  request ID without message bodies or credentials.
 - Production stack resources and outputs did not change.
 
 Pass: the disposable endpoint is live and attributable to the current build,
@@ -157,8 +163,9 @@ Run only against the confirmed disposable URL:
 ```sh
 REMOTE_DAVINCI_E2E=1 \
 REMOTE_DAVINCI_E2E_DISPOSABLE=1 \
+REMOTE_DAVINCI_E2E_LATENCY_SAMPLES=20 \
 REMOTE_DAVINCI_RELAY_URL='wss://DISPOSABLE_HOST/v1' \
-go test -count=1 -run '^TestLiveRelayLifecycle$' ./internal/companion
+go test -v -count=1 -run '^TestLiveRelayLifecycle$' ./internal/companion
 ```
 
 The canary must prove:
@@ -167,9 +174,11 @@ The canary must prove:
 2. A controller-only session open returns `PEER_OFFLINE`.
 3. Both bearer sockets connect and receive one consistent session.
 4. Noise IK authenticates the stored static keys and exchanges encrypted hello.
-5. One encrypted page request executes exactly once and gets a correlated
-   encrypted response; one companion-originated page event traverses the same
-   opaque relay path in the reverse direction.
+5. Twenty sequential encrypted page requests execute exactly once and get
+   correlated encrypted responses. The output records nearest-rank p50, p95,
+   and p99 relay round-trip latency; the sample count may be set from 1 through
+   100. One companion-originated page event traverses the same opaque relay path
+   in the reverse direction.
 6. Frames arriving as sequence 2 then 1 drain in order within the bounded
    window.
 7. A closed session is not reused; an old encrypted frame sent to it returns
@@ -180,6 +189,121 @@ The canary must prove:
 
 Pass: all assertions succeed, cleanup succeeds, and no secret appears in test,
 Lambda, API, or terminal output.
+
+Run the activation-limiter canary separately on a fresh `RemoteDavinci-dev`
+stack, before any other pair activation. Destroy an older disposable stack per
+Phase 9 first; an existing hourly source bucket or link makes the exact counts
+below invalid. Deploy the fresh stack with the test-only limit of one:
+
+```sh
+AWS_REGION='us-east-1'
+npm --prefix infra/cdk run build
+./infra/cdk/node_modules/.bin/cdk deploy RemoteDavinci-dev \
+  --app 'node infra/cdk/dist/bin/remote-davinci.js' \
+  -c environment=dev \
+  -c region="$AWS_REGION" \
+  -c pairActivationsPerSourceHour=1
+
+RELAY_URL="$(aws cloudformation describe-stacks \
+  --region "$AWS_REGION" \
+  --stack-name RemoteDavinci-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='WebSocketUrl'].OutputValue | [0]" \
+  --output text)"
+CANARY_START_UTC="$(date -u +%Y-%m-%dT%H:%M:00Z)"
+CANARY_START_MS="$(( $(date -u +%s) * 1000 ))"
+REMOTE_DAVINCI_E2E=1 \
+REMOTE_DAVINCI_E2E_DISPOSABLE=1 \
+REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT=1 \
+REMOTE_DAVINCI_RELAY_URL="$RELAY_URL" \
+go test -v -count=1 -run '^TestLivePairActivationLimiter$' ./internal/companion
+CANARY_END_UTC="$(date -u +%Y-%m-%dT%H:%M:59Z)"
+CANARY_END_MS="$(( $(date -u +%s) * 1000 ))"
+```
+
+The first activation must succeed. The second must return `RATE_LIMITED`, an
+explicit non-retryable flag, and a positive `retryAfterMs` no greater than one
+hour. Both rejected bearer credentials must then fail upgrade with HTTP 401.
+Because the link and both endpoint writes share the limiter transaction, those
+two failures plus the fresh-stack counts below prove that the rejection did not
+create another activated link.
+
+Resolve the test resources without copying record contents:
+
+```sh
+RELAY_LOG_GROUP="$(aws cloudformation list-stack-resources \
+  --region "$AWS_REGION" \
+  --stack-name RemoteDavinci-dev \
+  --query "StackResourceSummaries[?ResourceType=='AWS::Logs::LogGroup' && contains(LogicalResourceId, 'RelayLogs')].PhysicalResourceId | [0]" \
+  --output text)"
+STATE_TABLE="$(aws cloudformation list-stack-resources \
+  --region "$AWS_REGION" \
+  --stack-name RemoteDavinci-dev \
+  --query "StackResourceSummaries[?ResourceType=='AWS::DynamoDB::Table'].PhysicalResourceId | [0]" \
+  --output text)"
+```
+
+After the metric filter has caught up, run these checks with the captured UTC
+window. Poll the same commands rather than widening the window to unrelated
+traffic:
+
+```sh
+aws cloudwatch get-metric-statistics \
+  --region "$AWS_REGION" \
+  --namespace RemoteDavinci/dev \
+  --metric-name PairActivations \
+  --statistics Sum \
+  --period 60 \
+  --start-time "$CANARY_START_UTC" \
+  --end-time "$CANARY_END_UTC" \
+  --query 'sum(Datapoints[].Sum)' \
+  --output text
+
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --filter-pattern '{ $.action = "pair.activate" }' \
+  --query 'length(events)' \
+  --output text
+
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --filter-pattern '{ $.msg = "message-rejected" && $.error = "RATE_LIMITED" }' \
+  --query 'length(events)' \
+  --output text
+
+aws dynamodb scan \
+  --region "$AWS_REGION" \
+  --table-name "$STATE_TABLE" \
+  --consistent-read \
+  --select COUNT \
+  --filter-expression '#kind = :kind' \
+  --expression-attribute-names '{"#kind":"kind"}' \
+  --expression-attribute-values '{":kind":{"S":"link"}}' \
+  --query Count \
+  --output text
+
+aws dynamodb scan \
+  --region "$AWS_REGION" \
+  --table-name "$STATE_TABLE" \
+  --consistent-read \
+  --select COUNT \
+  --filter-expression '#kind = :kind' \
+  --expression-attribute-names '{"#kind":"kind"}' \
+  --expression-attribute-values '{":kind":{"S":"endpoint"}}' \
+  --query Count \
+  --output text
+```
+
+The five outputs must be `1`, `1`, `1`, `1`, and `2`, respectively: one
+successful activation metric, one metadata-only activation event, one stable
+rate-limit rejection, one accepted link, and its two endpoints. The canary
+revokes that accepted link and both endpoints during cleanup, so the retained
+records are tombstones rather than usable credentials.
 
 ## Phase 5: native companion and loopback boundary
 
@@ -256,9 +380,9 @@ endpoints. For each device:
    persists it.
 4. Verify both sides report a secure session and matching peer, and that the
    controller connects automatically only after activation.
-5. Tap each page tab and use the host mute control once. Require remote actions
-   to remain unavailable while disconnected or handshaking, and page commands
-   to remain bounded to one in flight.
+5. Tap each page button in the grid and use the host mute control once. Require
+   remote actions to remain unavailable while disconnected or handshaking, and
+   page commands to remain bounded to one in flight.
 6. Confirm success, stable failure code, and unknown-result UI states are
    distinguishable.
 7. Background while scanning, authenticating, awaiting approval, and after
@@ -294,7 +418,7 @@ real suspension/network behavior, with zero replay or unauthorized execution.
    `resolve.page.changed` snapshot selects Cut in the app without asking Resolve
    to change pages.
 4. Tap Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver in the app. For
-   each tab, verify
+   each selection, verify
    `GetCurrentPage()` returns the matching lowercase page and the correlated
    success result contains that page.
 5. Select Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver inside
@@ -302,8 +426,8 @@ real suspension/network behavior, with zero replay or unauthorized execution.
    the app follows within two 500 ms polls plus relay latency (target under 1.5
    seconds on a healthy connection) and sends no echo request.
 6. If Resolve exposes the optional Photo page, select it and verify the app
-   retains its last supported tab and sends no corrective command. Return to a
-   supported page and verify synchronization resumes.
+   retains its last supported page selection and sends no corrective command.
+   Return to a supported page and verify synchronization resumes.
 7. Exercise rapid app and Resolve page changes. Verify one command remains in
    flight, the final state converges to Resolve, and no event/request loop or
    stale selection appears.
@@ -348,10 +472,37 @@ fresh session, and terminal revocation never reconnects indefinitely.
 Before teardown, inspect the disposable stack:
 
 - Lambda errors/throttles and API execution errors.
+- API Gateway integration-latency distribution for the canary routes.
 - DynamoDB throttles, TTL status, and only expected active/tombstoned records.
 - Sanitized logs for validation codes; search explicitly for bearer prefixes,
   enrollment/invitation field names, join tokens, PSKs, Noise material, and full
   payloads.
+
+For the activation-limiter window, the preceding `PairActivations` and live-log
+counts are required evidence. Also require this metadata-field search to return
+zero. Manually inspect the activation, rate-limit rejection, and cleanup
+lifecycle messages plus the two expected unauthorized-upgrade rejections in
+the same exact window. Confirm that every relay application event contains
+routing metadata only, never a request body or ciphertext:
+
+```sh
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --filter-pattern '?sourceKey ?credentialHash ?joinToken ?joinTokenHash ?psk ?noiseKey ?noisePublicKey ?noisePrivateKey ?"rd1." ?Authorization ?payload ?body' \
+  --query 'length(events)' \
+  --output text
+
+aws logs filter-log-events \
+  --region "$AWS_REGION" \
+  --log-group-name "$RELAY_LOG_GROUP" \
+  --start-time "$CANARY_START_MS" \
+  --end-time "$CANARY_END_MS" \
+  --query 'events[].message' \
+  --output text
+```
 
 Then:
 

@@ -100,9 +100,10 @@ The relay's `expiresAt` remains the authoritative five-minute deadline. Invite p
 
 ## Enrollment boundary
 
-The QR profile is the normal live onboarding path. The existing two-document
-manual bootstrap remains an advanced fallback while physical-device validation
-is pending. The PAKE/manual-code profile below is still deferred.
+The customer apps expose only QR scanning and pasted invites for live onboarding.
+The existing two-document manual bootstrap remains legacy wire compatibility for
+previously created enrollments and protocol testing; it is not a customer-facing
+path. The PAKE/manual-code profile below is still deferred.
 
 The QR controller requests from the current eight fixed operations
 (`resolve.page.media`, `resolve.page.cut`, `resolve.page.edit`,
@@ -207,9 +208,9 @@ snapshot and then emits only changes as
 a fresh snapshot; events are neither queued nor replayed.
 
 The controller treats a successful response or page event as authoritative.
-Receiving an event updates the selected tab without sending another request.
+Receiving an event updates the selected page without sending another request.
 Resolve pages outside Media, Cut, Edit, Fusion, Color, Fairlight, and Deliver
-produce no event, leave the last supported app tab selected, and are never
+produce no event, leave the last supported page selected, and are never
 changed by the controller merely to force synchronization.
 
 Raw keystrokes, arbitrary scripts, and direct Resolve network access are not protocol operations. The current companion accepts requests only after the enrolled controller completes Noise IK, then authorizes against both the fixed eight-operation allowlist and the stored pairing grant before dispatch. Within a session, duplicate request IDs return the cached response without executing twice.

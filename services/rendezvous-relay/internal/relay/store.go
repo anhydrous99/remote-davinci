@@ -14,10 +14,12 @@ import (
 )
 
 const (
-	meta                    = "META"
-	pairActivationsPerDay   = int64(10_000)
-	minuteRateWindowSeconds = int64(60)
-	dailyRateWindowSeconds  = int64(24 * 60 * 60)
+	meta                                = "META"
+	defaultPairActivationsPerSourceHour = int64(10)
+	pairActivationsPerDay               = int64(10_000)
+	minuteRateWindowSeconds             = int64(60)
+	hourlyRateWindowSeconds             = int64(60 * 60)
+	dailyRateWindowSeconds              = int64(24 * 60 * 60)
 )
 
 type Store interface {
@@ -29,7 +31,7 @@ type Store interface {
 	CreatePair(context.Context, Pair) error
 	PairByID(context.Context, string, int64) (Pair, error)
 	JoinPair(context.Context, string, string, PairSide, int64) (Pair, error)
-	CommitPair(context.Context, string, PairCommit, int64) (CommitPairResult, error)
+	CommitPair(context.Context, string, PairCommit, string, int64) (CommitPairResult, error)
 	CancelPair(context.Context, string, string, int64) (*Pair, error)
 	Link(context.Context, string) (*Link, error)
 	RevokeLink(context.Context, string, string, string, int64) (RevokeLinkResult, error)
@@ -47,12 +49,20 @@ type DynamoAPI interface {
 }
 
 type DynamoStore struct {
-	tableName string
-	db        DynamoAPI
+	tableName                    string
+	db                           DynamoAPI
+	pairActivationsPerSourceHour int64
 }
 
-func NewDynamoStore(tableName string, db DynamoAPI) *DynamoStore {
-	return &DynamoStore{tableName: tableName, db: db}
+func NewDynamoStore(tableName string, db DynamoAPI, sourceActivationLimits ...int64) *DynamoStore {
+	limit := defaultPairActivationsPerSourceHour
+	if len(sourceActivationLimits) == 1 {
+		limit = sourceActivationLimits[0]
+	}
+	if len(sourceActivationLimits) > 1 || limit < 1 || limit > pairActivationsPerDay {
+		panic("invalid per-source pair activation limit")
+	}
+	return &DynamoStore{tableName: tableName, db: db, pairActivationsPerSourceHour: limit}
 }
 
 func key(prefix, id string) map[string]types.AttributeValue {
@@ -601,7 +611,7 @@ func (s *DynamoStore) endpointWrite(endpoint Endpoint) (types.TransactWriteItem,
 	}}, nil
 }
 
-func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit PairCommit, now int64) (CommitPairResult, error) {
+func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit PairCommit, sourceKey string, now int64) (CommitPairResult, error) {
 	pair, err := s.PairByID(ctx, pairID, now)
 	if err != nil {
 		return CommitPairResult{}, err
@@ -668,6 +678,9 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 	if err != nil {
 		return CommitPairResult{}, err
 	}
+	if sourceKey == "" {
+		return CommitPairResult{}, errors.New("pair activation source key is required")
+	}
 	endpoints := []Endpoint{
 		{EndpointID: first.Self.EndpointID, CredentialHash: first.Self.CredentialHash, Role: first.Self.Role, CreatedAt: now, UpdatedAt: now},
 		{EndpointID: second.Self.EndpointID, CredentialHash: second.Self.CredentialHash, Role: second.Self.Role, CreatedAt: now, UpdatedAt: now},
@@ -691,7 +704,13 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 	if err != nil {
 		return CommitPairResult{}, err
 	}
-	rateUpdate, retryAfter, err := s.rateLimitUpdate("global", "pair.activate", pairActivationsPerDay, dailyRateWindowSeconds, now)
+	sourceRateUpdate, sourceRetryAfter, err := s.rateLimitUpdate(
+		sourceKey, "pair.activate", s.pairActivationsPerSourceHour, hourlyRateWindowSeconds, now,
+	)
+	if err != nil {
+		return CommitPairResult{}, err
+	}
+	globalRateUpdate, globalRetryAfter, err := s.rateLimitUpdate("global", "pair.activate", pairActivationsPerDay, dailyRateWindowSeconds, now)
 	if err != nil {
 		return CommitPairResult{}, err
 	}
@@ -705,11 +724,17 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 		{Put: &types.Put{TableName: aws.String(s.tableName), Item: linkItem, ConditionExpression: aws.String("attribute_not_exists(pk)")}},
 	}
 	operations = append(operations, endpointWrites...)
-	rateIndex := len(operations)
-	operations = append(operations, types.TransactWriteItem{Update: rateUpdate})
+	sourceRateIndex := len(operations)
+	operations = append(operations, types.TransactWriteItem{Update: sourceRateUpdate})
+	globalRateIndex := len(operations)
+	operations = append(operations, types.TransactWriteItem{Update: globalRateUpdate})
 	_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: operations})
-	if transactionConditionalFailureAt(err, rateIndex) {
-		return CommitPairResult{}, &ServiceError{Code: protocol.RateLimited, Retryable: true, RetryAfterMS: &retryAfter}
+	// A quota cancellation proves the atomic activation did not occur, so clients can discard staged credentials.
+	if transactionConditionalFailureAt(err, sourceRateIndex) {
+		return CommitPairResult{}, &ServiceError{Code: protocol.RateLimited, RetryAfterMS: &sourceRetryAfter}
+	}
+	if transactionConditionalFailureAt(err, globalRateIndex) {
+		return CommitPairResult{}, &ServiceError{Code: protocol.RateLimited, RetryAfterMS: &globalRetryAfter}
 	}
 	if conditionalFailure(err) {
 		return CommitPairResult{}, retryableError(protocol.Conflict)
@@ -723,7 +748,7 @@ func (s *DynamoStore) CommitPair(ctx context.Context, pairID string, commit Pair
 		pair.CommitB = &commit
 	}
 	pair.Status = "ACTIVE"
-	return CommitPairResult{Pair: pair, Link: &link}, nil
+	return CommitPairResult{Pair: pair, Link: &link, ActivatedNow: true}, nil
 }
 
 func (s *DynamoStore) CancelPair(ctx context.Context, pairID, connectionID string, now int64) (*Pair, error) {
@@ -916,7 +941,7 @@ func (s *DynamoStore) RevokeEndpoint(ctx context.Context, endpointID, connection
 		}
 		revoke := types.TransactWriteItem{Update: &types.Update{
 			TableName: aws.String(s.tableName), Key: key("ENDPOINT", endpointID),
-			UpdateExpression:          aws.String("SET revokedAt = :now, updatedAt = :now REMOVE connectionId, activeSessionId"),
+			UpdateExpression:          aws.String("SET revokedAt = :now, updatedAt = :now REMOVE connectionId, activeSessionId, credentialHash"),
 			ConditionExpression:       aws.String(condition),
 			ExpressionAttributeValues: expressionValues,
 		}}
@@ -924,6 +949,7 @@ func (s *DynamoStore) RevokeEndpoint(ctx context.Context, endpointID, connection
 			TableName: aws.String(s.tableName), Key: key("CONNECTION", connectionID),
 		}}
 		result := RevokeEndpointResult{Endpoint: *endpoint}
+		result.Endpoint.CredentialHash = ""
 		if endpoint.ActiveSessionID == "" {
 			_, err = s.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{revoke, deleteConnection}})
 			if conditionalFailure(err) {

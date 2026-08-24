@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -20,9 +22,11 @@ import (
 )
 
 const (
-	liveReorderWindow   = protocol.MaxRelayReorderFrames
-	liveReorderBytes    = protocol.MaxRelayReorderBytes
-	liveProductionOptIn = "I_ACCEPT_PROVISIONING_MAY_LEAVE_PRODUCTION_IDENTITIES"
+	liveReorderWindow         = protocol.MaxRelayReorderFrames
+	liveReorderBytes          = protocol.MaxRelayReorderBytes
+	liveProductionOptIn       = "I_ACCEPT_PROVISIONING_MAY_LEAVE_PRODUCTION_IDENTITIES"
+	liveDefaultLatencySamples = 20
+	liveMaxLatencySamples     = 100
 )
 
 func TestLiveCanaryTargetGuard(t *testing.T) {
@@ -68,6 +72,44 @@ func TestLiveFrameCollectorAllowsOnlyBoundedReordering(t *testing.T) {
 	}
 }
 
+func TestLiveLatencyPercentileUsesNearestRank(t *testing.T) {
+	samples := make([]time.Duration, 20)
+	for index := range samples {
+		samples[index] = time.Duration(20-index) * time.Millisecond
+	}
+	for percentile, want := range map[int]time.Duration{50: 10 * time.Millisecond, 95: 19 * time.Millisecond, 99: 20 * time.Millisecond} {
+		if got := liveLatencyPercentile(samples, percentile); got != want {
+			t.Fatalf("p%d = %v, want %v", percentile, got, want)
+		}
+	}
+	if samples[0] != 20*time.Millisecond || liveLatencyPercentile(nil, 50) != 0 {
+		t.Fatal("percentile helper mutated input or accepted empty samples")
+	}
+}
+
+func TestLiveLatencySampleCountValidation(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  int
+		ok    bool
+	}{
+		{"", liveDefaultLatencySamples, true},
+		{"1", 1, true},
+		{strconv.Itoa(liveMaxLatencySamples), liveMaxLatencySamples, true},
+		{"0", 0, false},
+		{strconv.Itoa(liveMaxLatencySamples + 1), 0, false},
+		{"many", 0, false},
+	} {
+		got, err := liveLatencySampleCount(test.value)
+		if got != test.want || (err == nil) != test.ok {
+			t.Fatalf("sample count %q = %d, error = %v; want %d, valid = %v", test.value, got, err, test.want, test.ok)
+		}
+	}
+	if liveCanaryTimeout(liveMaxLatencySamples) <= liveCanaryTimeout(liveDefaultLatencySamples) {
+		t.Fatal("live canary timeout does not scale with latency sample count")
+	}
+}
+
 func TestLiveRelayLifecycle(t *testing.T) {
 	if os.Getenv("REMOTE_DAVINCI_E2E") != "1" {
 		t.Skip("set REMOTE_DAVINCI_E2E=1 to run the destructive, self-cleaning live relay canary")
@@ -86,8 +128,12 @@ func TestLiveRelayLifecycle(t *testing.T) {
 	if _, err := relayURL(relay); err != nil {
 		t.Fatal(err)
 	}
+	latencySampleCount, err := liveLatencySampleCount(os.Getenv("REMOTE_DAVINCI_E2E_LATENCY_SAMPLES"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), liveCanaryTimeout(latencySampleCount))
 	defer cancel()
 	controllerID, err := randomUUID()
 	if err != nil {
@@ -158,12 +204,19 @@ func TestLiveRelayLifecycle(t *testing.T) {
 	}
 	executions := 0
 	var closedSessionRequest []byte
-	if err := exerciseLiveNoiseSession(ctx, config, enrollment, controllerKey, controller, companion, firstSession, true, &executions, &closedSessionRequest); err != nil {
+	latencies := make([]time.Duration, 0, latencySampleCount)
+	if err := exerciseLiveNoiseSession(ctx, config, enrollment, controllerKey, controller, companion, firstSession, latencySampleCount, &latencies, &executions, &closedSessionRequest); err != nil {
 		t.Fatal(err)
 	}
-	if executions != 1 {
-		t.Fatalf("no-op execution count = %d, want 1", executions)
+	if executions != latencySampleCount || len(latencies) != latencySampleCount {
+		t.Fatalf("no-op executions = %d, latency samples = %d, want %d each", executions, len(latencies), latencySampleCount)
 	}
+	t.Logf("live encrypted no-op control RTT: samples=%d method=nearest-rank p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f",
+		len(latencies),
+		float64(liveLatencyPercentile(latencies, 50))/float64(time.Millisecond),
+		float64(liveLatencyPercentile(latencies, 95))/float64(time.Millisecond),
+		float64(liveLatencyPercentile(latencies, 99))/float64(time.Millisecond),
+	)
 
 	var closed struct {
 		Closed bool `json:"closed"`
@@ -185,7 +238,7 @@ func TestLiveRelayLifecycle(t *testing.T) {
 	if secondSession == firstSession {
 		t.Fatal("relay reused a closed session ID")
 	}
-	if err := exerciseLiveNoiseSession(ctx, config, enrollment, controllerKey, controller, companion, secondSession, false, &executions, nil); err != nil {
+	if err := exerciseLiveNoiseSession(ctx, config, enrollment, controllerKey, controller, companion, secondSession, 0, nil, &executions, nil); err != nil {
 		t.Fatal(err)
 	}
 	beforeReplay := executions
@@ -195,7 +248,7 @@ func TestLiveRelayLifecycle(t *testing.T) {
 	if executions != beforeReplay {
 		t.Fatalf("closed-session replay executed: count changed from %d to %d", beforeReplay, executions)
 	}
-	if executions != 1 {
+	if executions != latencySampleCount {
 		t.Fatalf("closed-session request replayed; execution count = %d", executions)
 	}
 
@@ -211,6 +264,95 @@ func TestLiveRelayLifecycle(t *testing.T) {
 	}
 	if err := requireUnauthorized(ctx, relay, companionAuth); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLivePairActivationLimiter(t *testing.T) {
+	if os.Getenv("REMOTE_DAVINCI_E2E") != "1" {
+		t.Skip("set REMOTE_DAVINCI_E2E=1 to run the destructive, self-cleaning live relay canary")
+	}
+	if os.Getenv("REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT") == "" {
+		t.Skip("set REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT=1 after deploying a fresh disposable stack with that limit")
+	}
+	if os.Getenv("REMOTE_DAVINCI_E2E_ACTIVATION_LIMIT") != "1" ||
+		os.Getenv("REMOTE_DAVINCI_E2E_DISPOSABLE") != "1" ||
+		os.Getenv("REMOTE_DAVINCI_E2E_ALLOW_PRODUCTION") != "" {
+		t.Fatal("activation limiter canary requires a disposable stack configured with a per-source limit of exactly 1")
+	}
+	relay := os.Getenv("REMOTE_DAVINCI_RELAY_URL")
+	if relay == "" {
+		t.Fatal("REMOTE_DAVINCI_RELAY_URL is required")
+	}
+	if err := liveCanaryTargetError(relay, "1", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	newEnrollment := func(label string) (EnrollmentRequest, string, error) {
+		endpointID, err := randomUUID()
+		if err != nil {
+			return EnrollmentRequest{}, "", err
+		}
+		secret, err := random32()
+		if err != nil {
+			return EnrollmentRequest{}, "", err
+		}
+		key, err := noise.DH25519.GenerateKeypair(rand.Reader)
+		if err != nil {
+			return EnrollmentRequest{}, "", err
+		}
+		digest := sha256.Sum256(secret)
+		return EnrollmentRequest{
+			V: 1, ControllerEndpointID: endpointID,
+			ControllerCredentialHash: base64.RawURLEncoding.EncodeToString(digest[:]),
+			ControllerNoiseKey:       base64.RawURLEncoding.EncodeToString(key.Public),
+			DeviceLabel:              label,
+		}, bearerAuthorization(endpointID, base64.RawURLEncoding.EncodeToString(secret)), nil
+	}
+	cleanup := func(config Config, controllerAuth string) {
+		if config.V != 1 {
+			return
+		}
+		companionAuth := bearerAuthorization(config.EndpointID, config.Secret)
+		t.Cleanup(func() {
+			cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			if err := revokeLiveIdentities(cleanupContext, relay, config.LinkID, controllerAuth, companionAuth); err != nil {
+				t.Errorf("activation limiter canary cleanup: %v", err)
+			}
+		})
+	}
+
+	acceptedRequest, acceptedControllerAuth, err := newEnrollment("Accepted activation canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, _, err := Provision(ctx, relay, acceptedRequest)
+	cleanup(accepted, acceptedControllerAuth)
+	if err != nil {
+		t.Fatalf("first pair activation: %v", err)
+	}
+
+	rejectedRequest, rejectedControllerAuth, err := newEnrollment("Rejected activation canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected, _, err := Provision(ctx, relay, rejectedRequest)
+	// Provision returns the generated identity after the final commit is sent, so
+	// clean it up even when a lost response makes activation uncertain.
+	cleanup(rejected, rejectedControllerAuth)
+	var failure *relayResponseError
+	if !errors.As(err, &failure) || failure.code != protocol.RateLimited ||
+		failure.retryable == nil || *failure.retryable || failure.retryAfter == nil ||
+		*failure.retryAfter < 1 || *failure.retryAfter > 3_600_000 {
+		t.Fatalf("second pair activation error = %#v, want stable nonretryable %s", failure, protocol.RateLimited)
+	}
+	if err := requireUnauthorized(ctx, relay, rejectedControllerAuth); err != nil {
+		t.Fatalf("rate-limited controller endpoint was activated: %v", err)
+	}
+	if err := requireUnauthorized(ctx, relay, bearerAuthorization(rejected.EndpointID, rejected.Secret)); err != nil {
+		t.Fatalf("rate-limited companion endpoint was activated: %v", err)
 	}
 }
 
@@ -391,7 +533,8 @@ func exerciseLiveNoiseSession(
 	controllerKey noise.DHKey,
 	controller, companion *livePeer,
 	sessionID string,
-	sendRequest bool,
+	requestSamples int,
+	latencies *[]time.Duration,
 	executions *int,
 	capturedRequest *[]byte,
 ) error {
@@ -511,74 +654,82 @@ func exerciseLiveNoiseSession(
 	if err != nil || !ready || len(packets) != 0 {
 		return errors.New("companion rejected the controller hello")
 	}
-	if !sendRequest {
+	if requestSamples == 0 {
 		return nil
 	}
 
-	requestID, err := randomUUID()
-	if err != nil {
-		return err
+	for sample := range requestSamples {
+		sequence := int64(3 + sample)
+		requestID, err := randomUUID()
+		if err != nil {
+			return err
+		}
+		now := time.Now().UnixMilli()
+		request, err := liveControlMessageWithID("request", requestID, protocol.ControlRequestBody{
+			Operation: "resolve.page.edit", Args: map[string]any{}, SentAt: now, ExpiresAt: now + 15_000,
+		})
+		if err != nil {
+			return err
+		}
+		encryptedRequest, err := controllerSend.Encrypt(nil, nil, request)
+		if err != nil {
+			return err
+		}
+		if capturedRequest != nil && sample == 0 {
+			*capturedRequest = append((*capturedRequest)[:0], encryptedRequest...)
+		}
+		started := time.Now()
+		if err := sendLiveFrame(ctx, controller, sessionID, sequence, encryptedRequest); err != nil {
+			return err
+		}
+		frame, err = receiveLiveFrame(ctx, companion, sessionID, sequence)
+		if err != nil {
+			return err
+		}
+		packets, ready, err = host.receive(ctx, frame.Seq, frame.Payload)
+		if err != nil || !ready || len(packets) != 1 {
+			return errors.New("companion rejected the encrypted canary request")
+		}
+		if err := sendLiveFrame(ctx, companion, sessionID, sequence, packets[0]); err != nil {
+			return err
+		}
+		responseFrame, err = receiveLiveFrame(ctx, controller, sessionID, sequence)
+		if err != nil {
+			return err
+		}
+		responsePacket, err = decodeLivePacket(responseFrame.Payload)
+		if err != nil {
+			return err
+		}
+		plaintext, err := controllerReceive.Decrypt(nil, nil, responsePacket)
+		if err != nil {
+			return errors.New("controller failed to decrypt the canary response")
+		}
+		response, err := protocol.ParseControl(plaintext)
+		if err != nil || response.Type != "response" || response.ReplyTo != requestID {
+			return errors.New("companion sent an invalid canary response")
+		}
+		var body protocol.ControlSuccessBody
+		if response.DecodeBody(&body) != nil || !body.OK {
+			return errors.New("companion rejected the page canary")
+		}
+		result, ok := body.Result.(map[string]any)
+		if !ok || result["page"] != "edit" {
+			return errors.New("companion returned an invalid page result")
+		}
+		if latencies != nil {
+			*latencies = append(*latencies, time.Since(started))
+		}
 	}
-	now := time.Now().UnixMilli()
-	request, err := liveControlMessageWithID("request", requestID, protocol.ControlRequestBody{
-		Operation: "resolve.page.edit", Args: map[string]any{}, SentAt: now, ExpiresAt: now + 15_000,
-	})
-	if err != nil {
-		return err
-	}
-	encryptedRequest, err := controllerSend.Encrypt(nil, nil, request)
-	if err != nil {
-		return err
-	}
-	if capturedRequest != nil {
-		*capturedRequest = append((*capturedRequest)[:0], encryptedRequest...)
-	}
-	if err := sendLiveFrame(ctx, controller, sessionID, 3, encryptedRequest); err != nil {
-		return err
-	}
-	frame, err = receiveLiveFrame(ctx, companion, sessionID, 3)
-	if err != nil {
-		return err
-	}
-	packets, ready, err = host.receive(ctx, frame.Seq, frame.Payload)
-	if err != nil || !ready || len(packets) != 1 {
-		return errors.New("companion rejected the encrypted canary request")
-	}
-	if err := sendLiveFrame(ctx, companion, sessionID, 3, packets[0]); err != nil {
-		return err
-	}
-	responseFrame, err = receiveLiveFrame(ctx, controller, sessionID, 3)
-	if err != nil {
-		return err
-	}
-	responsePacket, err = decodeLivePacket(responseFrame.Payload)
-	if err != nil {
-		return err
-	}
-	plaintext, err := controllerReceive.Decrypt(nil, nil, responsePacket)
-	if err != nil {
-		return errors.New("controller failed to decrypt the canary response")
-	}
-	response, err := protocol.ParseControl(plaintext)
-	if err != nil || response.Type != "response" || response.ReplyTo != requestID {
-		return errors.New("companion sent an invalid canary response")
-	}
-	var body protocol.ControlSuccessBody
-	if response.DecodeBody(&body) != nil || !body.OK {
-		return errors.New("companion rejected the page canary")
-	}
-	result, ok := body.Result.(map[string]any)
-	if !ok || result["page"] != "edit" {
-		return errors.New("companion returned an invalid page result")
-	}
+	eventSequence := int64(3 + requestSamples)
 	eventPacket, err := host.pageChangedEvent(resolvePageObservation{page: "color", observedAt: time.Now()})
 	if err != nil || eventPacket == nil {
 		return errors.New("companion failed to create the page event")
 	}
-	if err := sendLiveFrame(ctx, companion, sessionID, 4, eventPacket); err != nil {
+	if err := sendLiveFrame(ctx, companion, sessionID, eventSequence, eventPacket); err != nil {
 		return err
 	}
-	eventFrame, err := receiveLiveFrame(ctx, controller, sessionID, 4)
+	eventFrame, err := receiveLiveFrame(ctx, controller, sessionID, eventSequence)
 	if err != nil {
 		return err
 	}
@@ -586,7 +737,7 @@ func exerciseLiveNoiseSession(
 	if err != nil {
 		return err
 	}
-	plaintext, err = controllerReceive.Decrypt(nil, nil, eventPacket)
+	plaintext, err := controllerReceive.Decrypt(nil, nil, eventPacket)
 	if err != nil {
 		return errors.New("controller failed to decrypt the page event")
 	}
@@ -746,6 +897,31 @@ func liveCanaryTargetError(relay, disposable, production string) error {
 		return errors.New("the configured production relay requires the explicit production override")
 	}
 	return nil
+}
+
+func liveLatencySampleCount(value string) (int, error) {
+	if value == "" {
+		return liveDefaultLatencySamples, nil
+	}
+	count, err := strconv.Atoi(value)
+	if err != nil || count < 1 || count > liveMaxLatencySamples {
+		return 0, fmt.Errorf("REMOTE_DAVINCI_E2E_LATENCY_SAMPLES must be an integer from 1 to %d", liveMaxLatencySamples)
+	}
+	return count, nil
+}
+
+func liveCanaryTimeout(latencySamples int) time.Duration {
+	return 2*time.Minute + time.Duration(latencySamples)*2*time.Second
+}
+
+func liveLatencyPercentile(samples []time.Duration, percentile int) time.Duration {
+	if len(samples) == 0 || percentile < 1 || percentile > 100 {
+		return 0
+	}
+	ordered := slices.Clone(samples)
+	slices.Sort(ordered)
+	rank := (percentile*len(ordered) + 99) / 100
+	return ordered[rank-1]
 }
 
 func revokeLiveIdentities(ctx context.Context, relay, linkID, controllerAuth, companionAuth string) error {

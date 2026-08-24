@@ -36,6 +36,11 @@ disconnect routes alongside the frame limiter. Before load testing, size the
 regional Lambda concurrency quota from measured duration and other functions;
 the stack does not reserve it.
 
+The development stack normally keeps every route at 50 messages/s for safe
+testing. The explicitly selected, dev-only CDK context `performanceMode=true`
+raises only `session.frame` to the production-shaped 4,000/s rate and 5,000
+burst used by the isolated workload; production rejects that context.
+
 The [API Gateway WebSocket quota table](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-execution-service-websocket-limits-table.html)
 lists a 500-new-connections-per-second default, a two-hour connection duration,
 and a ten-minute idle timeout. Clients therefore reconnect after a randomized
@@ -67,14 +72,16 @@ Connection minutes  = C
 
 The following August 2026 example is a dated price snapshot, not a quote. Its
 reference workload is 1,000 pairs connected eight hours per day and 500
-control round trips per pair per day, over a 30-day month. At 256 MiB and a
-measured 30 ms average Lambda duration, that is 30 million one-way frames,
+control round trips per pair per day, over a 30-day month. At 256 MiB and an
+illustrative 30 ms average Lambda duration, that is 30 million one-way frames,
 60 million WebSocket messages, 30 million Lambda requests, 225,000 GB-seconds,
 60 million strong read units, 30 million write units, and 28.8 million
 connection-minutes. At that month's us-east-1 list prices, the components are
 approximately $60.00 for messages, $7.20 for connection-minutes, $6.00 for
 Lambda requests, $3.00 for Lambda compute, $7.50 for DynamoDB reads, and $18.75
-for DynamoDB writes: $102.45/month before the exclusions above.
+for DynamoDB writes: $102.45/month before the exclusions above. The 30 ms input
+is a modeling assumption, not a current live measurement; replace it with the
+dated memory-sweep result before using this estimate for a decision.
 
 The pre-redesign implementation used three WebSocket messages and six strong
 reads per frame, plus metered application-level keepalives, for an estimated
@@ -95,6 +102,19 @@ revocation is rejected; an already-read callback may still arrive later and is
 discarded by the receiver's local revocation gate. Relay rejection,
 Lambda/DynamoDB throttle, Lambda error, and API execution alarms all notify the
 required production SNS topic.
+
+For the public beta, a successful pair activation also increments an hourly
+bucket keyed by the SHA-256 source key already derived from an IPv4 address or
+IPv6 `/64`; raw source addresses are not stored in this bucket. The default is
+10 successful activations per source prefix per hour, in the same transaction
+as link activation, while the existing 10,000-activation daily global bucket
+remains an emergency circuit breaker. Operators may tune the provisional
+shared-NAT calibration from 1 through 10,000 with CDK context
+`pairActivationsPerSourceHour`; CDK passes the validated value to the Lambda as
+`PAIR_ACTIVATIONS_PER_SOURCE_PER_HOUR`. `PairActivations` records successful
+volume, and limiter failures feed the existing rejection alarm. Add separate
+activation-volume or spend alarms only after beta traffic establishes useful
+thresholds.
 
 ## Scaling decision
 
@@ -129,3 +149,23 @@ Record p50/p95/p99 duration, concurrency, throttles, errors, consumed table
 capacity, API message count, and tagged cost. Benchmark the relay at 128, 256,
 and 512 MiB; use the cheapest setting that meets the SLO, preferring lower
 memory when modeled costs are within 5%.
+
+The repository's gated `go run ./cmd/relay-perf` probe provisions disposable
+pairs through the normal relay protocol, keeps two authenticated sockets per
+pair, and sends opaque frames through both relay directions. It deliberately
+does not implement Noise or Resolve work: use the encrypted live canary for
+secure-session correctness and this probe only for relay load. The exact
+deployment, load, CloudWatch, cleanup, and percentile commands are in
+[`performance-results-template.md`](performance-results-template.md).
+
+The probe preserves the relay's five-creates-per-source-per-minute admission
+limit by spacing provisioning at least 12 seconds apart. A process is capped at
+60 pairs so admission spacing alone remains inside its 15-minute setup bound,
+and retained latency is capped at ten million samples. Its per-pair closed loop
+rejects a nonzero run that achieves less than 95% of its selected smoke rate.
+This catches regressions and supports the Lambda memory comparison, but it does
+not prove the 1,000 sustained or 2,000 peak round-trip beta targets. Those
+targets and the 200,000-socket connection envelope remain execution-only gates
+requiring quota approval, open-loop distributed load hosts, and an
+isolated-stack fixture/seeding plan. Do not weaken or bypass production pairing
+limits to manufacture that fleet.

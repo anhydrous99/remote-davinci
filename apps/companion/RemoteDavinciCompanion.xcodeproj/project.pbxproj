@@ -10,6 +10,7 @@
 		100000000000000000000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* App.swift */; };
 		100000000000000000000002 /* CompanionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* CompanionModel.swift */; };
 		100000000000000000000003 /* CompanionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000004 /* CompanionTests.swift */; };
+		100000000000000000000004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000007 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -29,6 +30,7 @@
 		200000000000000000000004 /* CompanionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionTests.swift; sourceTree = "<group>"; };
 		200000000000000000000005 /* Remote DaVinci Companion.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Remote DaVinci Companion.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		200000000000000000000006 /* RemoteDavinciCompanionTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RemoteDavinciCompanionTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		200000000000000000000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -64,6 +66,7 @@
 				200000000000000000000001 /* App.swift */,
 				200000000000000000000002 /* CompanionModel.swift */,
 				200000000000000000000003 /* Info.plist */,
+				200000000000000000000007 /* Assets.xcassets */,
 			);
 			path = RemoteDavinciCompanion;
 			sourceTree = "<group>";
@@ -167,6 +170,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				100000000000000000000004 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -267,6 +271,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
@@ -291,6 +296,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;

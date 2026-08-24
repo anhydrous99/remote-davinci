@@ -27,6 +27,9 @@ type RelayStatus struct {
 
 var errEnrollmentTerminal = errors.New("enrollment is no longer authorized")
 
+// Require sustained authenticated relay uptime before resetting retry backoff.
+const relayReconnectStability = 30 * time.Second
+
 func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) error {
 	if err := config.validate(); err != nil {
 		return err
@@ -34,9 +37,20 @@ func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) erro
 	delay := time.Second
 	for ctx.Err() == nil {
 		update(RelayStatus{Message: "Connecting to relay…"})
-		connected := false
+		var connectedSince time.Time
+		hadStableConnection := false
 		err := runRelayConnection(ctx, config, func(status RelayStatus) {
-			connected = connected || status.Connected
+			now := time.Now()
+			if status.Connected {
+				if connectedSince.IsZero() {
+					connectedSince = now
+				}
+			} else {
+				hadStableConnection = relayConnectionHadStableUptime(
+					hadStableConnection, connectedSince, now,
+				)
+				connectedSince = time.Time{}
+			}
 			update(status)
 		})
 		if ctx.Err() != nil {
@@ -46,9 +60,10 @@ func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) erro
 			update(RelayStatus{Message: "Enrollment revoked or unauthorized; reset required"})
 			return err
 		}
-		if connected {
-			delay = time.Second
-		}
+		hadStableConnection = relayConnectionHadStableUptime(
+			hadStableConnection, connectedSince, time.Now(),
+		)
+		delay = resetRelayReconnectDelay(delay, hadStableConnection)
 		update(RelayStatus{Message: "Disconnected; retrying…"})
 		if err := fullJitterSleep(ctx, delay); err != nil {
 			return nil
@@ -62,6 +77,17 @@ func RunRelay(ctx context.Context, config Config, update func(RelayStatus)) erro
 		_ = err // The GUI intentionally gets a sanitized status, never credentials or frames.
 	}
 	return nil
+}
+
+func relayConnectionHadStableUptime(alreadyStable bool, connectedSince, observedAt time.Time) bool {
+	return alreadyStable || !connectedSince.IsZero() && observedAt.Sub(connectedSince) >= relayReconnectStability
+}
+
+func resetRelayReconnectDelay(delay time.Duration, hadStableConnection bool) time.Duration {
+	if hadStableConnection {
+		return time.Second
+	}
+	return delay
 }
 
 func fullJitterSleep(ctx context.Context, maximum time.Duration) error {

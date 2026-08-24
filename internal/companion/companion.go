@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -273,10 +274,28 @@ func (failure *relayUpgradeError) Error() string {
 type relayResponseError struct {
 	requestType string
 	code        protocol.ErrorCode
+	retryable   *bool
+	retryAfter  *int64
 }
 
 func (failure *relayResponseError) Error() string {
 	return fmt.Sprintf("relay rejected %s: %s", failure.requestType, failure.code)
+}
+
+func relayResponseFailure(envelope protocol.ServerEnvelope, requestType string) *relayResponseError {
+	var body struct {
+		Code         protocol.ErrorCode `json:"code"`
+		Retryable    *bool              `json:"retryable"`
+		RetryAfterMS *int64             `json:"retryAfterMs"`
+	}
+	_ = envelope.DecodeBody(&body)
+	if body.Code == "" {
+		body.Code = protocol.Internal
+	}
+	return &relayResponseError{
+		requestType: requestType, code: body.Code,
+		retryable: body.Retryable, retryAfter: body.RetryAfterMS,
+	}
 }
 
 var errConfigPersistence = errors.New("could not persist companion credentials")
@@ -327,14 +346,7 @@ func (peer *relayPeer) request(ctx context.Context, messageType string, body any
 			continue
 		}
 		if envelope.Type == "error" {
-			var failure struct {
-				Code string `json:"code"`
-			}
-			_ = envelope.DecodeBody(&failure)
-			if failure.Code == "" {
-				failure.Code = string(protocol.Internal)
-			}
-			return &relayResponseError{requestType: messageType, code: protocol.ErrorCode(failure.Code)}
+			return relayResponseFailure(envelope, messageType)
 		}
 		var success struct {
 			RequestType string          `json:"requestType"`
@@ -553,7 +565,23 @@ func ExecuteOperation(ctx context.Context, operation string) (map[string]any, er
 	})
 }
 
-func executeOperation(ctx context.Context, operation string, output commandOutput) (map[string]any, error) {
+func executeOperation(ctx context.Context, operation string, output commandOutput) (result map[string]any, err error) {
+	started := time.Now()
+	defer func() {
+		outcome := "ok"
+		var failure *operationError
+		if err != nil {
+			outcome = "operation.failed"
+			if errors.As(err, &failure) {
+				outcome = failure.code
+			}
+		}
+		slog.InfoContext(ctx, "control operation completed",
+			"operation", operation,
+			"outcome", outcome,
+			"duration", time.Since(started),
+		)
+	}()
 	commandContext, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if page, ok := resolvePageForOperation(operation); ok {
@@ -791,7 +819,9 @@ func (processor *controlProcessor) handle(ctx context.Context, plaintext []byte)
 		if !processor.allowed[body.Operation] {
 			return processor.response(envelope.ID, nil, &operationError{code: "operation.forbidden"})
 		}
-		result, executeErr := processor.execute(ctx, body.Operation)
+		requestContext, cancel := context.WithDeadline(ctx, time.UnixMilli(body.ExpiresAt))
+		defer cancel()
+		result, executeErr := processor.execute(requestContext, body.Operation)
 		return processor.response(envelope.ID, result, executeErr)
 	default:
 		return nil, false, errors.New("unexpected control message")

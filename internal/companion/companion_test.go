@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -49,6 +50,23 @@ func TestRelayURLRequiresCanonicalForm(t *testing.T) {
 		if _, err := relayURL(value); err == nil {
 			t.Fatalf("noncanonical relay URL %q accepted", value)
 		}
+	}
+}
+
+func TestRelayResponseFailurePreservesRateLimitMetadata(t *testing.T) {
+	envelope, err := protocol.ParseServer([]byte(`{
+		"protocol":"remote-davinci.rendezvous","v":1,"type":"error",
+		"id":"10000000-0000-4000-8000-000000000001",
+		"replyTo":"10000000-0000-4000-8000-000000000002",
+		"body":{"code":"RATE_LIMITED","retryable":false,"retryAfterMs":1234}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := relayResponseFailure(envelope, "pair.commit")
+	if failure.code != protocol.RateLimited || failure.retryable == nil || *failure.retryable ||
+		failure.retryAfter == nil || *failure.retryAfter != 1234 {
+		t.Fatalf("failure = %#v", failure)
 	}
 }
 
@@ -144,6 +162,89 @@ func TestControlProcessorValidatesAndDeduplicates(t *testing.T) {
 	})
 	if _, _, err := processor.handle(context.Background(), overLimit); err == nil || len(processor.cache) != 256 {
 		t.Fatalf("request limit error = %v, cache size = %d", err, len(processor.cache))
+	}
+}
+
+func TestControlProcessorPropagatesAbsoluteExpiryToCommand(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	expiresAt := now.Add(2 * time.Second)
+	processor := newControlProcessor(func(ctx context.Context, operation string) (map[string]any, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || !deadline.Equal(expiresAt) {
+			t.Fatalf("execution deadline = %v, present = %v, want %v", deadline, ok, expiresAt)
+		}
+		return executeOperation(ctx, operation, func(commandContext context.Context, _ string, _ ...string) ([]byte, error) {
+			deadline, ok := commandContext.Deadline()
+			if !ok || !deadline.Equal(expiresAt) {
+				t.Fatalf("command deadline = %v, present = %v, want %v", deadline, ok, expiresAt)
+			}
+			return []byte("edit\n"), nil
+		})
+	})
+	processor.now = func() time.Time { return now }
+	hello := controlMessage(t, "hello", "20000000-0000-4000-8000-000000000010", map[string]any{
+		"role": "controller", "capabilities": []string{"resolve.page.edit"}, "appVersion": "0.1.0",
+	})
+	if _, _, err := processor.handle(t.Context(), hello); err != nil {
+		t.Fatal(err)
+	}
+	request := controlMessage(t, "request", "20000000-0000-4000-8000-000000000011", map[string]any{
+		"operation": "resolve.page.edit", "args": map[string]any{},
+		"sentAt": now.UnixMilli(), "expiresAt": expiresAt.UnixMilli(),
+	})
+	if _, send, err := processor.handle(t.Context(), request); err != nil || !send {
+		t.Fatalf("request send = %v, error = %v", send, err)
+	}
+}
+
+func TestOperationDiagnosticsAreTimedAndRedacted(t *testing.T) {
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	const sensitive = "secret subprocess detail"
+	if _, err := executeOperation(t.Context(), "resolve.page.edit", func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New(sensitive)
+	}); err == nil {
+		t.Fatal("failed operation returned no error")
+	}
+	logged := output.String()
+	for _, field := range []string{`"msg":"control operation completed"`, `"operation":"resolve.page.edit"`, `"outcome":"resolve.unavailable"`, `"duration":`} {
+		if !strings.Contains(logged, field) {
+			t.Fatalf("diagnostic missing %s: %s", field, logged)
+		}
+	}
+	if strings.Contains(logged, sensitive) {
+		t.Fatalf("diagnostic leaked subprocess error: %s", logged)
+	}
+}
+
+func TestRelayReconnectDelayResetsAfterStableConnectedUptime(t *testing.T) {
+	started := time.Unix(1_000, 0)
+	const backedOff = 8 * time.Second
+	for _, test := range []struct {
+		name      string
+		wasStable bool
+		want      time.Duration
+	}{
+		{"never stable", false, backedOff},
+		{"stable relay connection", true, time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := resetRelayReconnectDelay(backedOff, test.wasStable); got != test.want {
+				t.Fatalf("reconnect delay = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	stable := relayConnectionHadStableUptime(false, started, started.Add(relayReconnectStability))
+	stable = relayConnectionHadStableUptime(stable, time.Time{}, started.Add(time.Hour))
+	if got := resetRelayReconnectDelay(backedOff, stable); got != time.Second {
+		t.Fatalf("reconnect delay after sustained connection = %v, want 1s", got)
+	}
+	if relayConnectionHadStableUptime(false, started, started.Add(relayReconnectStability-time.Nanosecond)) {
+		t.Fatal("brief connection marked stable")
 	}
 }
 
@@ -959,6 +1060,50 @@ func TestGUIUsesOneTimeBrowserBootstrapAndLaunchScopedToken(t *testing.T) {
 	first.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("authorized API status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRelayWakeAPIRequiresConfiguredAuthenticatedEmptyRequest(t *testing.T) {
+	configured := validTestConfig(t)
+	parent, cancelParent := context.WithCancel(t.Context())
+	cancelParent()
+	cancelled := false
+	app := &App{
+		ctx: parent, config: &configured, uiToken: "test-token",
+		cancel: func() { cancelled = true }, status: RelayStatus{Connected: true},
+	}
+	defer app.Close()
+
+	request := func(target *App, token, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:7314/api/relay/wake", strings.NewReader(body))
+		req.Header.Set(uiTokenHeader, token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:7314")
+		response := httptest.NewRecorder()
+		target.Handler().ServeHTTP(response, req)
+		return response
+	}
+
+	if response := request(app, "", `{}`); response.Code != http.StatusForbidden || cancelled {
+		t.Fatalf("unauthorized wake status = %d, cancelled = %v", response.Code, cancelled)
+	}
+	if response := request(app, app.uiToken, `{"extra":true}`); response.Code != http.StatusBadRequest || cancelled {
+		t.Fatalf("invalid wake status = %d, cancelled = %v", response.Code, cancelled)
+	}
+	unconfigured := &App{ctx: parent, uiToken: app.uiToken}
+	if response := request(unconfigured, unconfigured.uiToken, `{}`); response.Code != http.StatusConflict {
+		t.Fatalf("unconfigured wake status = %d, want %d", response.Code, http.StatusConflict)
+	}
+	revokedConfig := configured
+	revokedConfig.LinkRevoked = true
+	revoked := &App{ctx: parent, config: &revokedConfig, uiToken: app.uiToken}
+	if response := request(revoked, revoked.uiToken, `{}`); response.Code != http.StatusConflict {
+		t.Fatalf("revoked wake status = %d, want %d", response.Code, http.StatusConflict)
+	}
+
+	response := request(app, app.uiToken, `{}`)
+	if response.Code != http.StatusOK || !cancelled || app.state().Status != "Connecting to relay…" || !strings.Contains(response.Body.String(), `"woken":true`) {
+		t.Fatalf("wake status = %d, cancelled = %v, relay = %q, body = %s", response.Code, cancelled, app.state().Status, response.Body.String())
 	}
 }
 

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import RemoteDavinciCompanion
@@ -54,6 +55,34 @@ final class CompanionTests: XCTestCase {
         XCTAssertEqual(CompanionModel.shared.hostStatus, "Server stopped")
     }
 
+    func testNetworkReturnWakesOnlyConfiguredRelayAfterUnsatisfiedPath() {
+        XCTAssertTrue(CompanionModel.shouldWakeRelay(
+            previousPathSatisfied: false,
+            pathSatisfied: true,
+            configured: true
+        ))
+        XCTAssertFalse(CompanionModel.shouldWakeRelay(
+            previousPathSatisfied: nil,
+            pathSatisfied: true,
+            configured: true
+        ))
+        XCTAssertFalse(CompanionModel.shouldWakeRelay(
+            previousPathSatisfied: true,
+            pathSatisfied: true,
+            configured: true
+        ))
+        XCTAssertFalse(CompanionModel.shouldWakeRelay(
+            previousPathSatisfied: false,
+            pathSatisfied: true,
+            configured: false
+        ))
+        XCTAssertFalse(CompanionModel.shouldWakeRelay(
+            previousPathSatisfied: false,
+            pathSatisfied: false,
+            configured: true
+        ))
+    }
+
     func testReadinessAcceptsOnlyCanonicalNumericLoopbackURL() throws {
         let line = Data(#"{"v":1,"version":"0.1.0","url":"http://127.0.0.1:43123/?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.utf8)
         guard case let .ready(connection) = try ReadinessValidator.parse(line) else {
@@ -96,6 +125,54 @@ final class CompanionTests: XCTestCase {
         }
     }
 
+    func testHelperOperationDiagnosticsAllowOnlySanitizedFields() {
+        let valid = Data(#"{"time":"2026-08-22T00:00:00Z","level":"INFO","msg":"control operation completed","operation":"resolve.page.edit","outcome":"ok","duration":1250000,"secret":"must-not-escape"}"#.utf8)
+        XCTAssertEqual(
+            HelperOperationDiagnostics.parse(valid),
+            HelperOperationDiagnostic(
+                operation: "resolve.page.edit",
+                outcome: "ok",
+                durationNanoseconds: 1_250_000
+            )
+        )
+
+        let rejected = [
+            #"{"msg":"companion stopped","operation":"resolve.page.edit","outcome":"ok","duration":1}"#,
+            #"{"msg":"control operation completed","operation":"future.operation","outcome":"ok","duration":1}"#,
+            #"{"msg":"control operation completed","operation":"resolve.page.edit","outcome":"secret.failure","duration":1}"#,
+            #"{"msg":"control operation completed","operation":"resolve.page.edit","outcome":"ok","duration":-1}"#,
+            #"{"msg":"control operation completed","operation":"resolve.page.edit","outcome":"ok","duration":10000000001}"#,
+            #"not json: bearer rd1.secret"#,
+        ]
+        for line in rejected {
+            XCTAssertNil(HelperOperationDiagnostics.parse(Data(line.utf8)), line)
+        }
+    }
+
+    func testHelperStderrBufferBoundsAndReassemblesLines() {
+        let valid = #"{"msg":"control operation completed","operation":"host.volume.toggle-mute","outcome":"host.mute-unsupported","duration":5000000}"#
+        var buffer = HelperStderrBuffer()
+
+        XCTAssertTrue(buffer.consume(Data(valid.prefix(20).utf8)).isEmpty)
+        XCTAssertEqual(buffer.bufferedByteCount, 20)
+        XCTAssertEqual(
+            buffer.consume(Data((valid.dropFirst(20) + "\n").utf8)),
+            [HelperOperationDiagnostic(
+                operation: "host.volume.toggle-mute",
+                outcome: "host.mute-unsupported",
+                durationNanoseconds: 5_000_000
+            )]
+        )
+
+        XCTAssertTrue(buffer.consume(Data(repeating: 0x41, count: HelperOperationDiagnostics.maximumLineBytes + 1)).isEmpty)
+        XCTAssertEqual(buffer.bufferedByteCount, 0)
+        XCTAssertEqual(
+            buffer.consume(Data(("\n" + valid + "\n").utf8)).count,
+            1,
+            "an oversized line must be dropped without hiding the next bounded record"
+        )
+    }
+
     func testStateAndEnrollmentModelsMatchHelperJSON() throws {
         let reply = EnrollmentReply(
             v: 1,
@@ -134,6 +211,43 @@ final class CompanionTests: XCTestCase {
         let payload = try invite.qrPayload()
         XCTAssertEqual(try JSONDecoder().decode(PairingInvite.self, from: Data(payload.utf8)), invite)
         XCTAssertNotNil(QRCodeRenderer.image(for: payload))
+    }
+
+    @MainActor
+    func testModelLifecycleClearsOnlyItsUnchangedCopiedPairingInvite() throws {
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("dev.remote-davinci.tests.\(UUID().uuidString)")
+        )
+        let model = CompanionModel.shared
+        defer {
+            model.stop()
+            pasteboard.clearContents()
+        }
+        model.stop()
+        let invite = PairingInvite(
+            protocolName: "remote-davinci.pairing-invite",
+            v: 1,
+            relayURL: "wss://relay.example/v1",
+            pairID: "11111111-1111-4111-8111-111111111111",
+            creatorSideID: "22222222-2222-4222-8222-222222222222",
+            linkID: "33333333-3333-4333-8333-333333333333",
+            joinToken: token,
+            psk: token,
+            expiresAt: 1_800_000_000
+        )
+
+        XCTAssertTrue(try model.copyPairingInvite(invite, to: pasteboard))
+        XCTAssertEqual(model.copiedPairingInviteID, invite.pairID)
+        model.stop()
+        XCTAssertNil(pasteboard.string(forType: .string))
+        XCTAssertNil(model.copiedPairingInviteID)
+
+        XCTAssertTrue(try model.copyPairingInvite(invite, to: pasteboard))
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString("customer clipboard", forType: .string))
+        model.stop()
+        XCTAssertEqual(pasteboard.string(forType: .string), "customer clipboard")
+        XCTAssertNil(model.copiedPairingInviteID)
     }
 
     func testPairingStateMatchesHelperJSON() throws {

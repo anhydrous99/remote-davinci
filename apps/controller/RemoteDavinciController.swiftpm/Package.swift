@@ -20,6 +20,7 @@ let package = Package(
             teamIdentifier: "GJ226AMM25",
             displayVersion: "0.1.0",
             bundleVersion: "1",
+            appIcon: .asset("AppIcon"),
             supportedDeviceFamilies: [
                 .phone,
                 .pad

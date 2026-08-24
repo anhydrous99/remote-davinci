@@ -15,16 +15,12 @@ struct RemoteDavinciControllerApp: App {
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .background {
                         if model.isPairing {
-                            model.cancelPairing()
+                            model.cancelPairing(reconcilePendingActivation: true)
                         }
-                        if model.isConnectionDesired {
-                            model.disconnect()
-                        }
+                        model.suspendConnectionForBackground()
                     } else if phase == .active {
                         model.refreshCredentialStoreIfNeeded()
-                        if model.shouldAutomaticallyReconcilePendingActivation {
-                            model.connect()
-                        }
+                        model.resumeConnectionAfterBackground()
                     }
                 }
         }
@@ -35,52 +31,115 @@ struct ControllerView: View {
     @ObservedObject var model: ControllerModel
     @State private var showingSettings = false
 
-    private var pageSelection: Binding<ResolvePage> {
-        Binding(
-            get: { model.displayedPage },
-            set: { model.requestPage($0) }
-        )
+    private var connectionSymbol: String {
+        if model.isReady { return "checkmark.circle.fill" }
+        if model.isConnectionDesired { return "arrow.triangle.2.circlepath" }
+        return "wifi.slash"
+    }
+
+    private var connectionAction: String {
+        if model.isConnectionDesired { return "Disconnect" }
+        if model.canConnect { return "Connect" }
+        return "Pair"
     }
 
     var body: some View {
         NavigationStack {
-            TabView(selection: pageSelection) {
-                ForEach(ResolvePage.allCases, id: \.self) { page in
-                    let available = model.isPageAvailable(page)
-                    Color.clear
-                        .accessibilityElement()
-                        .accessibilityLabel("\(page.rawValue.capitalized) page")
-                        .accessibilityHint(available
-                            ? "Opens this page in DaVinci Resolve on the Mac"
-                            : "This page is not granted by the enrolled companion"
-                        )
-                        .tabItem {
-                            Label(
-                                page.rawValue.capitalized,
-                                systemImage: available ? page.systemImage : "lock.fill"
-                            )
+            ScrollView {
+                VStack(spacing: 16) {
+                    HStack(spacing: 12) {
+                        Label(model.connectionStatus, systemImage: connectionSymbol)
+                            .foregroundStyle(model.isReady ? Color.green : Color.primary)
+                            .accessibilityLabel("Connection status: \(model.connectionStatus)")
+                        Spacer()
+                        Button(connectionAction) {
+                            if model.isConnectionDesired {
+                                model.disconnect()
+                            } else if model.canConnect {
+                                model.connect()
+                            } else {
+                                showingSettings = true
+                            }
                         }
-                        .tag(page)
+                        .buttonStyle(.bordered)
+                        .disabled(model.isResetting)
+                    }
+                    .padding(12)
+                    .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+
+                    Text("Resolve page")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 88), spacing: 8)],
+                        spacing: 8
+                    ) {
+                        ForEach(ResolvePage.allCases, id: \.self) { page in
+                            let available = model.isPageAvailable(page)
+                            let selected = model.isReady && model.displayedPage == page
+                            Button {
+                                model.requestPage(page)
+                            } label: {
+                                VStack(spacing: 4) {
+                                    Image(systemName: available ? page.systemImage : "lock.fill")
+                                    Text(page.rawValue.capitalized)
+                                        .font(.caption)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.center)
+                                }
+                                .frame(maxWidth: .infinity, minHeight: 48)
+                                .foregroundStyle(available ? Color.primary : Color.secondary)
+                                .background(
+                                    selected ? Color.accentColor.opacity(0.16) : Color.secondary.opacity(0.06),
+                                    in: RoundedRectangle(cornerRadius: 10)
+                                )
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(selected ? Color.accentColor : Color.clear)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("\(page.rawValue.capitalized) page")
+                            .accessibilityHint(
+                                !model.isReady
+                                    ? "Connect to the Mac to use this page"
+                                    : available
+                                        ? "Opens this page in DaVinci Resolve on the Mac"
+                                        : "This page is not granted by the enrolled companion"
+                            )
+                            .accessibilityAddTraits(selected ? .isSelected : [])
+                            .disabled(!model.canSend(page.operation))
+                        }
+                    }
+
+                    if let page = model.pendingPage {
+                        ProgressView("Opening \(page.rawValue.capitalized)…")
+                            .accessibilityLabel(
+                                "Opening \(page.rawValue.capitalized) page in DaVinci Resolve"
+                            )
+                    }
+
+                    Button {
+                        model.toggleHostMute()
+                    } label: {
+                        Label("Toggle Mac Mute", systemImage: "speaker.slash.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!model.canSend("host.volume.toggle-mute"))
+                    .accessibilityHint("Mutes or unmutes the enrolled Mac")
+
+                    if !model.feedback.isEmpty {
+                        Text(model.feedback)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .accessibilityLabel("Command status: \(model.feedback)")
+                    }
                 }
+                .frame(maxWidth: .infinity)
             }
-            .disabled(!model.isReady || model.pendingPage != nil)
-            .overlay {
-                if let page = model.pendingPage {
-                    ProgressView("Opening \(page.rawValue.capitalized)…")
-                        .accessibilityLabel(
-                            "Opening \(page.rawValue.capitalized) page in DaVinci Resolve"
-                        )
-                }
-            }
-            .safeAreaInset(edge: .bottom) {
-                if !model.feedback.isEmpty {
-                    Text(model.feedback)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal)
-                        .accessibilityLabel("Command status: \(model.feedback)")
-                }
-            }
+            .padding()
             .navigationTitle("Remote DaVinci")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -89,7 +148,7 @@ struct ControllerView: View {
                     } label: {
                         Label("Settings", systemImage: "gearshape")
                     }
-                    .accessibilityHint("Opens enrollment, connection, and host controls")
+                    .accessibilityHint("Opens enrollment and connection settings")
                 }
             }
         }
@@ -161,58 +220,26 @@ private struct ControllerSettingsView: View {
                         Button {
                             showingPairingScanner = true
                         } label: {
-                            Label("Scan Mac QR Code", systemImage: "qrcode.viewfinder")
+                            Label("Scan or Paste Pairing Code", systemImage: "qrcode.viewfinder")
                         }
                         .buttonStyle(.borderedProminent)
-                        .accessibilityHint("Opens the camera to scan the pairing code on your Mac")
+                        .accessibilityHint("Opens camera scanning and pasted-code pairing options")
                     }
 
                     Text(model.enrollmentStatus)
                         .foregroundStyle(model.isEnrolled ? .green : .secondary)
                         .accessibilityLabel("Enrollment status: \(model.enrollmentStatus)")
 
-                    if !model.isEnrolled, !model.hasPendingPairingActivation {
-                        DisclosureGroup("Advanced Manual Enrollment") {
-                            if !model.hasLocalEnrollment {
-                                Button("Create Enrollment Request") {
-                                    model.createEnrollmentRequest()
-                                }
-                            }
-
-                            if !model.enrollmentRequestJSON.isEmpty {
-                                Text(model.enrollmentRequestJSON)
-                                    .font(.caption.monospaced())
-                                    .textSelection(.enabled)
-                                    .accessibilityLabel("Enrollment request JSON")
-
-                                ShareLink("Share Enrollment Request", item: model.enrollmentRequestJSON)
-
-                                Text("Paste the response from the trusted Mac companion:")
-                                    .font(.caption)
-                                TextEditor(text: $model.enrollmentResponseJSON)
-                                    .font(.caption.monospaced())
-                                    .frame(minHeight: 110)
-                                    .accessibilityLabel("Enrollment response JSON")
-
-                                Button("Import Enrollment Response") {
-                                    model.importEnrollmentResponse()
-                                }
-                                .disabled(model.enrollmentResponseJSON.isEmpty)
-                            }
-                        }
-                        .disabled(model.isPairing)
-                    }
-
                     if model.isEnrolled {
-                        Button("Revoke and Re-enroll", role: .destructive) {
+                        Button("Revoke and Pair Again", role: .destructive) {
                             showingReenrollConfirmation = true
                         }
                         .disabled(model.isResetting)
-                        .accessibilityHint("Revokes this controller and creates fresh enrollment credentials")
+                        .accessibilityHint("Revokes this controller and returns to pairing")
                     }
 
                     if model.hasLocalEnrollment {
-                        Button("Forget Local Credentials and Re-enroll", role: .destructive) {
+                        Button("Forget Local Credentials and Pair Again", role: .destructive) {
                             showingLocalForgetConfirmation = true
                         }
                         .disabled(model.isResetting)
@@ -238,20 +265,6 @@ private struct ControllerSettingsView: View {
                         .accessibilityLabel("Connection status: \(model.connectionStatus)")
                 }
 
-                Section("Host control") {
-                    Button("Toggle Host Volume Mute") {
-                        model.toggleHostMute()
-                    }
-                    .disabled(!model.canSend("host.volume.toggle-mute"))
-                    .accessibilityLabel("Toggle Mac volume mute")
-                    .accessibilityHint("Mutes or unmutes the enrolled Mac")
-
-                    if !model.feedback.isEmpty {
-                        Text(model.feedback)
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("Command status: \(model.feedback)")
-                    }
-                }
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -267,7 +280,7 @@ private struct ControllerSettingsView: View {
                 isPresented: $showingReenrollConfirmation,
                 titleVisibility: .visible
             ) {
-                Button("Revoke and Re-enroll", role: .destructive) {
+                Button("Revoke and Pair Again", role: .destructive) {
                     model.revokeAndReenroll()
                 }
                 Button("Cancel", role: .cancel) {}
@@ -279,12 +292,14 @@ private struct ControllerSettingsView: View {
                 isPresented: $showingLocalForgetConfirmation,
                 titleVisibility: .visible
             ) {
-                Button("Forget Locally and Re-enroll", role: .destructive) {
+                Button("Forget Locally and Pair Again", role: .destructive) {
                     model.forgetLocalEnrollmentAndReenroll()
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("The old remote identity may remain active. Use this only when remote revocation cannot complete.")
+                Text(
+                    "The old remote identity may remain active. Use this only when remote revocation cannot complete."
+                )
             }
             .sheet(isPresented: $showingPairingScanner) {
                 PairingScannerSheet(model: model)
