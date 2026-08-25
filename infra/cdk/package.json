@@ -12,7 +12,7 @@
     "synth": "npm run build && cdk synth --app 'node dist/bin/remote-davinci.js'"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.265.0",
+    "aws-cdk-lib": "^2.266.0",
     "constructs": "^10.4.2"
   },
   "devDependencies": {
